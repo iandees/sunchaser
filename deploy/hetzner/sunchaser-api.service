@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 EnvironmentFile=/etc/sunchaser.env
-Environment=SUNCHASER_CATALOG_REFRESH=30 SUNCHASER_PORT=8080 SUNCHASER_HOST=127.0.0.1
+Environment=HOME=/root SUNCHASER_CATALOG_REFRESH=30 SUNCHASER_PORT=8080 SUNCHASER_HOST=127.0.0.1
 WorkingDirectory=/data/sunchaser
 ExecStart=/bin/sh -c 'SUNCHASER_CATALOG=$LAKE/catalog.ducklake exec /root/.local/bin/uv run python src/server.py'
 Restart=always
