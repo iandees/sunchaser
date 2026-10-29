@@ -14,6 +14,24 @@ Planet sizes come from a **measured sizing run** (`docs/planet.md`, `results/siz
 planet totals, plus three regional full-history lakes scaled up. Times are still scaled from
 4 cores (marked ≈); write the real ones back here after the first run.
 
+**Rehearsals on the box** (Hetzner auction server, 12 threads, 125 GB RAM, 2 × 954 GB NVMe as RAID0, Ubuntu 24.04), local disk, no `--dense-index`, `--group-rows 100000000`:
+
+| | Minnesota | Germany | Ratio |
+|---|---|---|---|
+| History PBF (Geofabrik) | 0.49 GB | 12.4 GB | 25× |
+| `osm-extract --history` | 1 min 43 s | 41 min 52 s | 24× |
+| `build_lake.py --consume` | 1 min 46 s | 40 min 56 s | 23× |
+| `build_areas.py --full` | 5 s | 21 s | n/a |
+| Lake on disk (Parquet + Lance) | 3.3 GB | 57 GB (37 + 20) | 17× |
+| Peak extra disk during the run | not measured | 64 GB (94 GB used, 30 GB before) | n/a |
+| Peak RSS, extract / build | not measured | 67.5 GB / 109.8 GB | n/a |
+
+Times scale linearly with the input size. Germany's build peaked at 110 GB of the box's 125 GB RAM with `--group-rows 100000000`, which leaves little headroom. A lower `--group-rows` (50 M) should reduce it, but that has not been measured.
+
+Minnesota was then published to R2 (the lake copied in 4 min 39 s) and kept current by the updater service: one batch of 14–30 minutely diffs takes 340–570 s, about 12 s per diff with areas and Lance maintenance, which is faster than real time.
+
+Cross-check against the sizing run: scaling Germany's 57 GB lake by the ratio of PBF sizes (13×) gives ≈ 750 GB, below the sizing run's 1.1–1.2 TB for the planet, so lake size apparently does not scale linearly with the history file; plan with the sizing run's figure. Times did scale linearly: ≈ 9 h for the extract and ≈ 9 h for the build on this box's 12 threads, against the sizing run's 20–30 h and 15–25 h scaled from 4 cores. Not measured on either side: whether build RAM stays bounded as the input grows (Germany used 110 GB of 125 GB), and how a planet-wide updater keeps up: a planet lake applies every edit (≈ 5,000 changes per minute diff worldwide), where Minnesota's regional filter applies a few dozen. Run the updater on Germany before trusting it on the planet.
+
 ## What goes where
 
 ```
@@ -48,7 +66,7 @@ Full-history planet, peak local disk (from the sizing run, `docs/planet.md`):
 
 1. **Bucket:** in the Cloudflare dashboard, R2 → Create bucket `osm-lake`. Set the location hint to **Eastern Europe (EEUR)** for a Hetzner box in Helsinki, or to wherever the compute runs.
 2. **Token:** R2 → Manage API tokens → create a token with **Object Read & Write** on that bucket only. Note the access key id, the secret, and the account id.
-3. **Lifecycle rules:** expire `lake/catalogs/` after 30 days (per-commit catalog copies, kept for rollback), and abort incomplete multipart uploads after 1 day.
+3. **Lifecycle rules:** abort incomplete multipart uploads after 1 day. (The updater's `--keep-versions N` prunes its own `lake/catalogs/` copies; see section 6.)
 
 R2 supports the conditional PUTs (`If-Match`, `If-None-Match`) that the catalog and the writer lease rely on.
 
@@ -67,22 +85,35 @@ LAKE=s3://osm-lake/lake
 ## 2. The Hetzner box
 
 1. **Order it** from the server auction, which bills hourly. Choose at least 64 GB RAM (128 GB is better: the node timeline index is ≈ 110 GB and benefits from page cache), NVMe disks, and a recent CPU if you can; core count is the build's speed. Order it with the rescue system.
-2. **Install Ubuntu 24.04 with RAID0.** Hetzner's `installimage` defaults to RAID1, which halves the space. In the rescue system run `installimage`, choose Ubuntu 24.04, and set:
+2. **Install Ubuntu 24.04 with RAID0.** Hetzner's `installimage` defaults to RAID1, which halves the space. In the rescue system, write the config to `/root/sunchaser.conf` (not `/autosetup`: a failed run deletes it):
 
    ```
+   DRIVE1 /dev/nvme0n1
+   DRIVE2 /dev/nvme1n1
    SWRAID 1
    SWRAIDLEVEL 0
+   HOSTNAME sunchaser
+   BOOTLOADER grub
    PART /boot ext3 1G
    PART /     ext4 100G
    PART /data xfs  all
+   IMAGE /root/.oldroot/nfs/images/Ubuntu-2404-noble-amd64-base.tar.zst
    ```
+
+   `installimage` isn't on the rescue system's `PATH`, and the image is a `.tar.zst`. Run it by its full path, then reboot:
+
+   ```bash
+   TERM=xterm /root/.oldroot/nfs/install/installimage -a -c /root/sunchaser.conf
+   ```
+
+   The installed system has new SSH host keys: run `ssh-keygen -R <ip>` on your side before reconnecting. `/boot` becomes RAID1 whatever `SWRAIDLEVEL` says; that's fine.
 
    The build doesn't need redundancy: if a disk dies, rebuild. The lake lives in R2.
 
 3. **Packages and tools**, as root after reboot:
 
    ```bash
-   apt-get update && apt-get install -y build-essential git curl osmium-tool
+   apt-get update && apt-get install -y build-essential git curl osmium-tool tmux rclone
    ```
 
    ```bash
@@ -101,6 +132,8 @@ LAKE=s3://osm-lake/lake
    uv sync --locked
    ```
 
+   DuckDB's `ducklake`, `httpfs` and `spatial` extensions are installed on first use (`lakeconn.load`), so the first build or API start on a fresh box downloads them.
+
    ```bash
    cargo build --release --manifest-path rust/osm-extract/Cargo.toml
    ```
@@ -114,6 +147,14 @@ Run the long steps inside `tmux` so an SSH drop doesn't kill them.
 ## 3. Sizing pass (optional, about 1.5 h)
 
 `deploy/hetzner/sizing.sh /data/sizing` streams the planet once, and cuts and builds three regional history lakes under `tools/measure.py`. It then writes a planet estimate. A run from a 4-core container is committed in `results/sizing/`. Re-run it on the box to see its own speed: the times depend on the box, the sizes don't.
+
+### Regional rehearsal (optional)
+
+Geofabrik offers full-history country extracts (`.osh.pbf`) to logged-in OSM users, at `https://osm-internal.download.geofabrik.de/<region>-internal.osh.pbf` (for example `north-america/us/minnesota-internal.osh.pbf`). Log in at that site in a browser and copy the `gf_download_oauth` cookie value; pass it to `curl -H "Cookie: gf_download_oauth=\"...\""`. Treat it as a credential: keep it in a mode-600 file, not in the repo or a shell history.
+
+The header of these files has no replication timestamp, and the build stops with an error unless you pass `--osm-base` (without it the updater would have nowhere to start). Take the newest object's time (`osmium fileinfo -e -g data.timestamp.last FILE`) and round up to the next hour boundary (Geofabrik cuts its extracts at 00:00 UTC); both rehearsals used `--osm-base 2026-10-19T00:00:00Z` style values.
+
+Run steps 4–6 on a country without `--dense-index` to time the box itself, then compare the extract and build times, the peak disk use (`df` during the extract) and the lake size with the table at the top.
 
 ## 4. Extract, streaming the planet (≈ 20–30 h on 6 cores)
 
@@ -177,10 +218,13 @@ After=network-online.target
 
 [Service]
 EnvironmentFile=/etc/sunchaser.env
+Environment=HOME=/root
+LimitNOFILE=65536
 WorkingDirectory=/data/sunchaser
-ExecStart=/root/.local/bin/uv run python src/updater.py job --loop --catalog-url ${LAKE}/catalog.ducklake --workdir /data/updater --max-seconds 300 --compact-every 3600 --keep-versions
+ExecStart=/root/.local/bin/uv run python src/updater.py job --loop --catalog-url ${LAKE}/catalog.ducklake --workdir /data/updater --max-seconds 300 --compact-every 3600
 Restart=always
 RestartSec=30
+TimeoutStopSec=600
 
 [Install]
 WantedBy=multi-user.target
@@ -194,7 +238,13 @@ mkdir -p /data/updater && systemctl daemon-reload && systemctl enable --now sunc
 journalctl -u sunchaser-updater -f
 ```
 
-**If the updater dies:** the lease expires after `--max-seconds` + 600 s and the restart takes it over. If the local catalog is ever lost, the next start downloads the committed one.
+- **`HOME`:** systemd units have none, and DuckDB needs it to find its extensions; without `Environment=HOME=/root` the service exits at once with "Can't find the home directory".
+- **`--keep-versions [N]`:** copies the whole catalog to `lake/catalogs/` after every commit (≈ 117 MiB each for Minnesota, a copy every 6 minutes) and keeps only the newest N (default 24). Without a limit that was ≈ 28 GB a day, so keep N small, and larger lakes have larger catalogs. Off in the sample unit.
+- **`--region`:** for a regional lake add `--region s,w,n,e` (the extract's bounding box, from `osmium fileinfo`), or the updater applies the whole planet's edits.
+
+**If the updater dies:** the lease expires after `--max-seconds` + 600 s and the restart takes it over. A normal `systemctl restart` or `stop` (SIGTERM) releases the lease, so the new process takes over at once (≈ 15 s measured). If it is killed instead (SIGKILL, power loss, or a stop that outlasts `TimeoutStopSec`), the new one exits ("another run holds the lease") and systemd retries every 30 s until the lease expires, up to ≈ 15 minutes with the default; the lake just falls behind for that time. The unit sets `TimeoutStopSec=600` so a stop during a long DuckDB call (a compaction) isn't cut short. If the local catalog is ever lost, the next start downloads the committed one.
+
+What the updater does each batch, checked on Minnesota: it copies the outgoing version of every modified or deleted element into `nodes_history` / `ways_history` (sampled: 2,000 of 2,000 modified nodes and ways, and all 2,000 deleted nodes), then commits. Hourly it flushes inlined rows to Parquet, merges small files, expires snapshots and deletes unreferenced files after a 1-hour grace period (every file in R2 was either live, superseded, or scheduled for deletion; none orphaned).
 
 ## 7. API
 
@@ -209,7 +259,7 @@ After=network-online.target
 
 [Service]
 EnvironmentFile=/etc/sunchaser.env
-Environment=SUNCHASER_CATALOG_REFRESH=30 SUNCHASER_PORT=8080 SUNCHASER_HOST=127.0.0.1
+Environment=HOME=/root SUNCHASER_CATALOG_REFRESH=30 SUNCHASER_PORT=8080 SUNCHASER_HOST=127.0.0.1
 WorkingDirectory=/data/sunchaser
 ExecStart=/bin/sh -c 'SUNCHASER_CATALOG=$LAKE/catalog.ducklake exec /root/.local/bin/uv run python src/server.py'
 Restart=always
@@ -227,6 +277,8 @@ overpass.example.org {
 ```
 
 Point Overpass Turbo at `https://overpass.example.org/api/`.
+
+**Slow queries:** set `SUNCHASER_LOG_QUERIES=1` in the unit's `Environment=` for one line per query (total time, setup time, KiB sent, outcome, the query), or `2` to add each SQL statement's time and the time spent fetching results and writing output. On Minnesota (lake in R2, box in Helsinki) a 25-element library query took 2.8 s warm and 11 s cold, almost all of it in that last bucket: setup was 0.02 s and the SQL statements under 1 s.
 
 **Moving off the big box after the build:** a Hetzner Cloud VPS is enough for the updater and a modest API. Run both services there with the same `/etc/sunchaser.env` (fresh `--workdir`), then cancel the auction server.
 
