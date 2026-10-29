@@ -217,14 +217,21 @@ def main():
     # geometry change); from a snapshot the version timestamp, as Overpass assumes without attic data
     vf = "valid_from" if src["history"] else "ts AS valid_from"
 
-    def fill(table, sort, select, sources, where="", append=False):
+    def fill(table, sort, select, sources, where="", append=False, threads=0):
         """Create lake.<table> from the first source and append the rest, each sorted by `sort`.
-        Sources are disjoint, increasing key ranges, so the table ends up globally sorted."""
+        Sources are disjoint, increasing key ranges, so the table ends up globally sorted.
+        threads=1 for rows with long member lists: a parallel sorted insert into DuckLake runs out of
+        memory on them (Berlin's relation history: 303 M members in 490 k rows, 4 threads, 10 GB),
+        while one thread spills and finishes."""
         t = time.time()
+        if threads:
+            con.sql(f"SET threads = {threads}")
         for i, source in enumerate(sources):
             sql = f"SELECT {select} FROM {source} {where} ORDER BY {sort}"
             con.sql(f"CREATE TABLE lake.{table} SORTED BY ({sort}) AS {sql}" if i == 0 and not append
                     else f"INSERT INTO lake.{table} BY NAME {sql}")
+        if threads:
+            con.sql("RESET threads")
         print(f"{'lake.' + table:<22} {time.time() - t:6.1f}s  ({len(sources)} groups)", flush=True)
 
     def consume(*subs):
@@ -266,7 +273,7 @@ def main():
     consume("ways")
 
     fill("relations", "qt_key31, id", f"""ov_key31(qt) AS qt_key31, ov_level(qt) AS qt_level, qt, id,
-         min_lat, max_lat, min_lon, max_lon, tags, members, {vf}""", src["r"])
+         min_lat, max_lat, min_lon, max_lon, tags, members, {vf}""", src["r"], threads=1)
     fill("relations_meta", "k, id", f"ov_key31(qt) AS k, id, {meta}", src["r"])
     fill("tag_postings", "type, kv, qt_key31, id", pcols, postings("r"), append=True)
     fill("member_parent_rels", "mtype, mid", "DISTINCT m.type AS mtype, m.ref AS mid, m.id AS rel_id",
@@ -296,7 +303,7 @@ def main():
              min_lat, max_lat, min_lon, max_lon, tags, nds, nd_lat, nd_lon, {hist}""", src["wh"], append=True)
         consume("ways_history")
         fill("relations_history", "qt_key31, valid_from", f"""ov_key31(qt) AS qt_key31, ov_level(qt) AS qt_level, qt,
-             id, min_lat, max_lat, min_lon, max_lon, tags, members, {hist}""", src["rh"], append=True)
+             id, min_lat, max_lat, min_lon, max_lon, tags, members, {hist}""", src["rh"], append=True, threads=1)
         consume("relations_history")
         # buckets are consecutive periods of change time: sorted one at a time, the log is in time order
         fill("changes", "ts, type, id", "ts, type, id, old_version, new_version, action, batch", src["changes"],
