@@ -8,6 +8,8 @@
 //!   locator/{n,w,r}.parquet        id, qt in id order (the PBF's order: no sort needed)
 //!   node_parent_ways/NNNN.parquet  node_id, way_id (distinct per way)
 //!   manifest.json
+//! With --history the input is a full-history file and the output also has nodes_history/,
+//! ways_history/, relations_history/ and changes/ (see history.rs).
 //! NNNN is a bucket of the table's sort key: the top --bucket-bits of qt for nodes, of the Overpass
 //! Uint31 order key31(qt) for ways and relations, and of the node id for node_parent_ways. Buckets
 //! are disjoint key ranges in key order, so each can be sorted on its own and appended.
@@ -21,6 +23,7 @@
 //! locations stored, then way and relation blocks are built in parallel. This relies on the PBF being
 //! sorted by type then id (checked), as planet files and extracts are.
 
+mod history;
 mod quadtile;
 
 use std::collections::BTreeMap;
@@ -561,6 +564,38 @@ fn parents_schema() -> Arc<Schema> {
 
 // ---- driver ---------------------------------------------------------------------
 
+/// ISO-8601 UTC for epoch seconds (civil-from-days, no date library needed).
+fn iso8601(secs: i64) -> String {
+    let (days, rem) = (secs.div_euclid(86400), secs.rem_euclid(86400));
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)
+}
+
+/// `"osm_base": ..., "sequence": ...` manifest fields from the PBF header's replication info, so the
+/// lake (and the updater) start where the file ends.
+fn header_fields(input: &Path) -> Result<String> {
+    let mut fields = String::new();
+    if let Some(blob) = BlobReader::from_path(input)?.next() {
+        if let Ok(BlobDecode::OsmHeader(h)) = blob?.decode() {
+            if let Some(ts) = h.osmosis_replication_timestamp() {
+                fields += &format!(", \"osm_base\": \"{}\"", iso8601(ts));
+            }
+            if let Some(seq) = h.osmosis_replication_sequence_number() {
+                fields += &format!(", \"sequence\": {seq}");
+            }
+        }
+    }
+    Ok(fields)
+}
+
 struct Args {
     input: PathBuf,
     out: PathBuf,
@@ -568,6 +603,7 @@ struct Args {
     dense: Option<PathBuf>,
     max_node_id: u64,
     max_way_id: u64,
+    history: bool,
 }
 
 fn parse_args() -> Result<Args> {
@@ -578,6 +614,7 @@ fn parse_args() -> Result<Args> {
         dense: None,
         max_node_id: 1 << 34,
         max_way_id: 1 << 31,
+        history: false,
     };
     let mut pos = Vec::new();
     let mut it = std::env::args().skip(1);
@@ -588,6 +625,7 @@ fn parse_args() -> Result<Args> {
             "--dense-index" => a.dense = Some(PathBuf::from(val("--dense-index")?)),
             "--max-node-id" => a.max_node_id = val("--max-node-id")?.parse()?,
             "--max-way-id" => a.max_way_id = val("--max-way-id")?.parse()?,
+            "--history" => a.history = true,
             _ if arg.starts_with("--") => bail!("unknown option {arg}"),
             _ => pos.push(arg),
         }
@@ -595,7 +633,7 @@ fn parse_args() -> Result<Args> {
     // every bucket of the four bucketed tables is an open file until the end: 4 << 12 at most
     if pos.len() != 2 || !(1..=12).contains(&a.bucket_bits) {
         bail!("usage: osm-extract <input.osm.pbf> <out-dir> [--bucket-bits 1..12 (8)] \
-               [--dense-index DIR [--max-node-id N] [--max-way-id N]]");
+               [--dense-index DIR [--max-node-id N] [--max-way-id N]] [--history]");
     }
     a.input = PathBuf::from(&pos[0]);
     a.out = PathBuf::from(&pos[1]);
@@ -604,6 +642,9 @@ fn parse_args() -> Result<Args> {
 
 fn main() -> Result<()> {
     let args = parse_args()?;
+    if args.history {
+        return history::run(&args);
+    }
     let out = &args.out;
     std::fs::create_dir_all(out)?;
     let t0 = Instant::now();
@@ -701,7 +742,8 @@ fn main() -> Result<()> {
     writeln!(
         m,
         "{{\"format\": 2, \"bucket_bits\": {bits}, \"node_id_shift\": {id_shift}, \"nodes\": {n_nodes}, \
-         \"ways\": {n_ways}, \"relations\": {n_rels}, \"node_parent_ways\": {n_parents}}}"
+         \"ways\": {n_ways}, \"relations\": {n_rels}, \"node_parent_ways\": {n_parents}{}}}",
+        header_fields(&args.input)?
     )?;
     println!(
         "nodes={n_nodes} ways={n_ways} relations={n_rels} node_parent_ways={n_parents} {:.1}s ({} threads)",

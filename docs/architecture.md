@@ -68,6 +68,15 @@ Keys:
 
 `output.py` renders `out` in Overpass's JSON, XML or CSV, with its field order and 7-decimal coordinates.
 
+## Full history
+
+`osm-extract --history` reads a full-history PBF (every version; deletions as `visible=false`) and writes the current tables, the `*_history` tables and the `changes` log, as if the updater had applied every change since the first version:
+- Each version is valid from its timestamp to the next version's; versions sharing a second collapse to the last.
+- A way gets a new row whenever a member node moves (`[date:]` needs its coordinates then).
+- A relation gets a new row only when what it stores changes (members, tags, key, bbox); every member move is still a `geometry` entry in `changes`, as Overpass reports it.
+- Node position and way geometry timelines are kept in RAM (extracts) or in id-indexed files (`--dense-index`, the planet).
+- The PBF header's replication timestamp becomes `state.osm_base`, so the updater continues from there.
+
 ## Updates
 
 The updater, per replication diff:
@@ -130,6 +139,7 @@ Catch-up uses hourly diffs (a planet day diff is about 100 MB, too much for one 
 | Fixed 24-hour window (both sides given the lake's edits) | 68/69 current-data queries; 13/13 history queries (`[date:]` incl. `out meta`/`geom`, `newer`, `changed`) vs Overpass with `--keep-attic` |
 | Object-storage catalog, updated only by scheduled jobs (24 h window) | 81/82 queries incl. 13/13 history; two overlapping jobs: one commits, the other is refused (412) and discarded |
 | Lance id store kept by jobs through 24 diffs and a compaction | pinned versions equal the lake tables row for row; 81/82 queries incl. 13/13 history with id fetches on Lance; a second concurrent job exits on the lease |
+| Full-history build (`osm-extract --history`) from a synthetic Berlin history file (snapshot + 24 h of the lake's diffs) | 81/82 queries incl. 13/13 history vs Overpass; identical to the incrementally updated lake on 32 `[date:]` queries (geometry, meta, bboxes, `newer`) at 8 times; RAM and disk timelines byte-identical |
 | Bucketed vs flat build | identical tables, files in key order (`osm-extract --bucket-bits 12`, 16 groups) |
 
 ## Known gaps

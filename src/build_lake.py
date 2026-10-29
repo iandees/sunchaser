@@ -99,8 +99,12 @@ def bucketed_sources(con, raw, manifest, group_rows):
         out.append(cur)
         return [f"read_parquet({g})" for g in out]
 
-    return {"n": groups("nodes"), "w": groups("ways"), "r": groups("relations"),
-            "parents": groups("node_parent_ways"), "locator": str(raw / "locator")}
+    src = {"n": groups("nodes"), "w": groups("ways"), "r": groups("relations"),
+           "parents": groups("node_parent_ways"), "locator": str(raw / "locator"), "history": False}
+    if manifest.get("history"):  # osm-extract --history: every version since the first
+        src.update(history=True, nh=groups("nodes_history"), wh=groups("ways_history"),
+                   rh=groups("relations_history"), changes=groups("changes"))
+    return src
 
 
 def stage_flat(con, raw, step):
@@ -161,8 +165,9 @@ def main():
     ap.add_argument("--catalog", help="DuckLake catalog (sqlite:..., postgres:..., or a .ducklake file); "
                                       "default <lake>/osm.ducklake or $SUNCHASER_CATALOG")
     ap.add_argument("--data-path", help="where Parquet goes (s3://bucket/prefix/ for S3/R2); default <lake>/data")
-    ap.add_argument("--osm-base", default="", help="timestamp of the source data (state.osm_base)")
-    ap.add_argument("--sequence", default="", help="minutely replication sequence of the source data")
+    ap.add_argument("--osm-base", default="", help="timestamp of the source data (state.osm_base); default: "
+                                                   "the PBF header's replication timestamp (bucketed input)")
+    ap.add_argument("--sequence", default="", help="replication sequence of the source data (default: from the header)")
     ap.add_argument("--row-group", type=int, default=16384)
     ap.add_argument("--target-file-mb", type=int, default=64)
     ap.add_argument("--lance", metavar="BASE", help="also build the Lance id store here (e.g. s3://bucket/lake/lance)")
@@ -193,10 +198,16 @@ def main():
 
     manifest = raw / "manifest.json"
     if manifest.exists():
-        src = bucketed_sources(con, raw, json.loads(manifest.read_text()), args.group_rows)
+        man = json.loads(manifest.read_text())
+        args.osm_base = args.osm_base or man.get("osm_base", "")
+        args.sequence = args.sequence or str(man.get("sequence", ""))
+        src = bucketed_sources(con, raw, man, args.group_rows)
     else:
         stage_flat(con, raw, step)
-        src = {k: [k] for k in ("n", "w", "r")} | {"locator": None, "parents": None}
+        src = {k: [k] for k in ("n", "w", "r")} | {"locator": None, "parents": None, "history": False}
+    # current rows' valid_from: from a history extract the start of the row's last state (version or
+    # geometry change); from a snapshot the version timestamp, as Overpass assumes without attic data
+    vf = "valid_from" if src["history"] else "ts AS valid_from"
 
     def fill(table, sort, select, sources, where=""):
         """Create lake.<table> from the first source and append the rest, each sorted by `sort`.
@@ -211,15 +222,15 @@ def main():
     # Layout mirrors Overpass: element skeletons apart from metadata (*_meta files), and tagged
     # nodes apart from untagged way vertices (Overpass reads tags_local before any skeleton).
     meta = "version, ts, changeset, uid, \"user\""
-    fill("nodes_tagged", "qt, id", "qt, id, lat, lon, tags, ts AS valid_from", src["n"], "WHERE cardinality(tags) > 0")
-    fill("nodes_untagged", "qt, id", "qt, id, lat, lon, tags, ts AS valid_from", src["n"], "WHERE cardinality(tags) = 0")
+    fill("nodes_tagged", "qt, id", f"qt, id, lat, lon, tags, {vf}", src["n"], "WHERE cardinality(tags) > 0")
+    fill("nodes_untagged", "qt, id", f"qt, id, lat, lon, tags, {vf}", src["n"], "WHERE cardinality(tags) = 0")
     step("lake.nodes (view)", """
         CREATE VIEW lake.nodes AS
         SELECT * FROM lake.nodes_tagged UNION ALL SELECT * FROM lake.nodes_untagged""")
-    fill("ways", "qt_key31, id", """ov_key31(qt) AS qt_key31, ov_level(qt) AS qt_level, qt, id,
-         min_lat, max_lat, min_lon, max_lon, tags, nds, nd_lat, nd_lon, ts AS valid_from""", src["w"])
-    fill("relations", "qt_key31, id", """ov_key31(qt) AS qt_key31, ov_level(qt) AS qt_level, qt, id,
-         min_lat, max_lat, min_lon, max_lon, tags, members, ts AS valid_from""", src["r"])
+    fill("ways", "qt_key31, id", f"""ov_key31(qt) AS qt_key31, ov_level(qt) AS qt_level, qt, id,
+         min_lat, max_lat, min_lon, max_lon, tags, nds, nd_lat, nd_lon, {vf}""", src["w"])
+    fill("relations", "qt_key31, id", f"""ov_key31(qt) AS qt_key31, ov_level(qt) AS qt_level, qt, id,
+         min_lat, max_lat, min_lon, max_lon, tags, members, {vf}""", src["r"])
     # History (attic): versions the updater replaced, valid in [valid_from, valid_to). Current rows carry
     # valid_from: the version timestamp at build (what Overpass assumes without attic data), the change
     # time after an update (including geometry-only changes from moved nodes).
@@ -235,6 +246,20 @@ def main():
                  0::INT AS uid, ''::VARCHAR AS "user" FROM lake.relations r WHERE false;
         CREATE TABLE lake.changes (ts TIMESTAMPTZ, type VARCHAR, id BIGINT, old_version INT, new_version INT,
                                    action VARCHAR, batch BIGINT);""")
+    if src["history"]:
+        def append(table, sort, select, sources):
+            t = time.time()
+            for source in sources:
+                con.sql(f"INSERT INTO lake.{table} BY NAME SELECT {select} FROM {source} ORDER BY {sort}")
+            print(f"{'lake.' + table:<22} {time.time() - t:6.1f}s  ({len(sources)} groups)")
+        hist = f"valid_from, valid_to, {meta}"
+        append("nodes_history", "qt, valid_from", f"qt, id, lat, lon, tags, {hist}", src["nh"])
+        append("ways_history", "qt_key31, valid_from", f"""ov_key31(qt) AS qt_key31, ov_level(qt) AS qt_level, qt, id,
+               min_lat, max_lat, min_lon, max_lon, tags, nds, nd_lat, nd_lon, {hist}""", src["wh"])
+        append("relations_history", "qt_key31, valid_from", f"""ov_key31(qt) AS qt_key31, ov_level(qt) AS qt_level, qt,
+               id, min_lat, max_lat, min_lon, max_lon, tags, members, {hist}""", src["rh"])
+        # buckets are consecutive periods of change time: sorted one at a time, the log is in time order
+        append("changes", "ts, type, id", "ts, type, id, old_version, new_version, action, batch", src["changes"])
     fill("nodes_meta", "k, id", f"qt AS k, id, {meta}", src["n"])
     fill("ways_meta", "k, id", f"ov_key31(qt) AS k, id, {meta}", src["w"])
     fill("relations_meta", "k, id", f"ov_key31(qt) AS k, id, {meta}", src["r"])
