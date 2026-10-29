@@ -1,0 +1,164 @@
+[
+ {
+  "ids": "5 ids",
+  "variant": "parquet/locator",
+  "phase": "cold",
+  "rows": 5,
+  "s": 0.415,
+  "req": 17,
+  "kib": 1740
+ },
+ {
+  "ids": "5 ids",
+  "variant": "parquet/locator",
+  "phase": "warm",
+  "rows": 5,
+  "s": 0.152,
+  "req": 0,
+  "kib": 0
+ },
+ {
+  "ids": "5 ids",
+  "variant": "lance/nodes_by_id",
+  "phase": "cold",
+  "rows": 5,
+  "s": 0.307,
+  "req": 47,
+  "kib": 536
+ },
+ {
+  "ids": "5 ids",
+  "variant": "lance/nodes_by_id",
+  "phase": "warm",
+  "rows": 5,
+  "s": 0.04,
+  "req": 15,
+  "kib": 54
+ },
+ {
+  "ids": "5 ids",
+  "variant": "lance/nodes_by_qt",
+  "phase": "cold",
+  "rows": 5,
+  "s": 0.299,
+  "req": 43,
+  "kib": 616
+ },
+ {
+  "ids": "5 ids",
+  "variant": "lance/nodes_by_qt",
+  "phase": "warm",
+  "rows": 5,
+  "s": 0.038,
+  "req": 11,
+  "kib": 106
+ },
+ {
+  "ids": "street (208)",
+  "variant": "parquet/locator",
+  "phase": "cold",
+  "rows": 208,
+  "s": 1.275,
+  "req": 166,
+  "kib": 6911
+ },
+ {
+  "ids": "street (208)",
+  "variant": "parquet/locator",
+  "phase": "warm",
+  "rows": 208,
+  "s": 0.468,
+  "req": 0,
+  "kib": 0
+ },
+ {
+  "ids": "street (208)",
+  "variant": "lance/nodes_by_id",
+  "phase": "cold",
+  "rows": 208,
+  "s": 0.645,
+  "req": 391,
+  "kib": 7075
+ },
+ {
+  "ids": "street (208)",
+  "variant": "lance/nodes_by_id",
+  "phase": "warm",
+  "rows": 208,
+  "s": 0.14,
+  "req": 180,
+  "kib": 2510
+ },
+ {
+  "ids": "street (208)",
+  "variant": "lance/nodes_by_qt",
+  "phase": "cold",
+  "rows": 208,
+  "s": 0.513,
+  "req": 197,
+  "kib": 4739
+ },
+ {
+  "ids": "street (208)",
+  "variant": "lance/nodes_by_qt",
+  "phase": "warm",
+  "rows": 208,
+  "s": 0.045,
+  "req": 18,
+  "kib": 763
+ },
+ {
+  "ids": "subway (8957)",
+  "variant": "parquet/locator",
+  "phase": "cold",
+  "rows": 8957,
+  "s": 3.676,
+  "req": 841,
+  "kib": 42248
+ },
+ {
+  "ids": "subway (8957)",
+  "variant": "parquet/locator",
+  "phase": "warm",
+  "rows": 8957,
+  "s": 0.997,
+  "req": 0,
+  "kib": 0
+ },
+ {
+  "ids": "subway (8957)",
+  "variant": "lance/nodes_by_id",
+  "phase": "cold",
+  "rows": 8957,
+  "s": 1.181,
+  "req": 996,
+  "kib": 66076
+ },
+ {
+  "ids": "subway (8957)",
+  "variant": "lance/nodes_by_id",
+  "phase": "warm",
+  "rows": 8957,
+  "s": 0.407,
+  "req": 530,
+  "kib": 35534
+ },
+ {
+  "ids": "subway (8957)",
+  "variant": "lance/nodes_by_qt",
+  "phase": "cold",
+  "rows": 8957,
+  "s": 1.022,
+  "req": 601,
+  "kib": 54582
+ },
+ {
+  "ids": "subway (8957)",
+  "variant": "lance/nodes_by_qt",
+  "phase": "warm",
+  "rows": 8957,
+  "s": 0.156,
+  "req": 144,
+  "kib": 22127
+ }
+]

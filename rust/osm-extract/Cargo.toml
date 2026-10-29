@@ -1,0 +1,11 @@
+[package]
+name = "osm-extract"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+arrow = { version = "60.1.0", default-features = false }
+osmpbf = "0.3.8"
+parquet = { version = "60.1.0", default-features = false, features = ["arrow", "zstd"] }
+rayon = "1.12.0"
