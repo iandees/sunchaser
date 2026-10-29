@@ -13,6 +13,8 @@ Environment:
 """
 import os
 
+import duckdb
+
 
 def env(name, default=None):
     return os.environ.get(f"SUNCHASER_{name}", default)
@@ -34,15 +36,25 @@ def configure_s3(con):
     con.sql(f"CREATE OR REPLACE SECRET lake_s3 (TYPE s3, {body}, USE_SSL {env('S3_USE_SSL', 'true')})")
 
 
+def load(con, *extensions):
+    """LOAD DuckDB extensions, installing any that aren't on this machine yet (a fresh box has none)."""
+    for ext in extensions:
+        try:
+            con.sql(f"LOAD {ext}")
+        except duckdb.IOException:
+            con.sql(f"INSTALL {ext}")
+            con.sql(f"LOAD {ext}")
+
+
 def attach(con, catalog=None, data_path=None, read_only=False, override_data_path=False):
     """ATTACH the lake as `lake`. Loads the extensions the catalog and data path need."""
     catalog = catalog or env("CATALOG", "data/lake/osm.ducklake")
     data_path = data_path if data_path is not None else env("DATA_PATH")
-    con.sql("LOAD ducklake; LOAD httpfs")
+    load(con, "ducklake", "httpfs")
     if catalog.startswith("sqlite:"):
-        con.sql("LOAD sqlite")
+        load(con, "sqlite")
     elif catalog.startswith("postgres:"):
-        con.sql("LOAD postgres")
+        load(con, "postgres")
     configure_s3(con)
     opts = []
     if read_only:

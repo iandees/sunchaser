@@ -43,7 +43,7 @@ def _has_areas(con):
 def build(con, full=False):
     """Bring lake.areas up to date; returns the number of relations processed."""
     t = time.time()
-    con.sql("LOAD spatial")
+    lakeconn.load(con, "spatial")
     batch = _state(con, "batch")
     done = _state(con, "areas_batch")
     incremental = not full and _has_areas(con) and done is not None and batch is not None
