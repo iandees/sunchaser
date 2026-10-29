@@ -1,0 +1,104 @@
+"""A DuckLake catalog kept on object storage: no always-on database.
+
+The authoritative catalog is a DuckDB-format DuckLake file stored next to the data, e.g.
+s3://bucket/lake/catalog.ducklake. Readers ATTACH it directly (read-only, over httpfs) and reopen
+it when its ETag changes. The single writer is a scheduled job (updater.py job): it downloads the
+catalog, applies whatever is pending, and uploads it with a conditional PUT on the ETag it
+downloaded (If-Match; If-None-Match: * for the first upload). If another job got there first, the
+PUT fails with 412 and the work is discarded: the catalog never forks, and Parquet files the loser
+wrote are unreferenced orphans that compaction removes. Between jobs nothing runs.
+
+AWS S3 and Cloudflare R2 both support conditional PUTs. Credentials: lakeconn's SUNCHASER_S3_*.
+
+  python src/objcatalog.py put local.ducklake s3://bucket/lake/catalog.ducklake   # first upload
+  python src/objcatalog.py get s3://bucket/lake/catalog.ducklake local.ducklake
+"""
+import os
+import pathlib
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import lakeconn  # noqa: E402
+
+
+class Conflict(Exception):
+    """The catalog changed since it was downloaded (another writer committed)."""
+
+
+def _client():
+    import boto3
+    from botocore.config import Config
+    env = lakeconn.env
+    endpoint = env("S3_ENDPOINT")
+    if endpoint and not endpoint.startswith("http"):
+        endpoint = ("https://" if env("S3_USE_SSL", "true") == "true" else "http://") + endpoint
+    style = "path" if env("S3_URL_STYLE", "path" if endpoint else "virtual") == "path" else "virtual"
+    return boto3.client("s3", endpoint_url=endpoint, aws_access_key_id=env("S3_KEY_ID") or None,
+                        aws_secret_access_key=env("S3_SECRET") or None,
+                        region_name=env("S3_REGION") or None, config=Config(s3={"addressing_style": style}))
+
+
+def _split(url):
+    if not url.startswith("s3://"):
+        raise ValueError(f"not an s3:// URL: {url}")
+    bucket, _, key = url[5:].partition("/")
+    return bucket, key
+
+
+def head(url):
+    """ETag of the catalog, or None if it doesn't exist."""
+    from botocore.exceptions import ClientError
+    bucket, key = _split(url)
+    try:
+        return _client().head_object(Bucket=bucket, Key=key)["ETag"]
+    except ClientError as e:
+        if e.response["Error"]["Code"] in ("404", "NoSuchKey", "NotFound"):
+            return None
+        raise
+
+
+def fetch(url, local):
+    """Download the catalog; returns its ETag (the token for the conditional upload)."""
+    bucket, key = _split(url)
+    r = _client().get_object(Bucket=bucket, Key=key)
+    tmp = f"{local}.part"
+    with open(tmp, "wb") as f:
+        for chunk in iter(lambda: r["Body"].read(1 << 20), b""):
+            f.write(chunk)
+    os.replace(tmp, local)
+    return r["ETag"]
+
+
+def push(local, url, etag):
+    """Upload the catalog if it is still the version `etag` (None: only if it doesn't exist yet).
+    Returns the new ETag; raises Conflict if another writer committed in between."""
+    from botocore.exceptions import ClientError
+    bucket, key = _split(url)
+    cond = {"IfMatch": etag} if etag else {"IfNoneMatch": "*"}
+    with open(local, "rb") as f:
+        try:
+            return _client().put_object(Bucket=bucket, Key=key, Body=f, **cond)["ETag"]
+        except ClientError as e:
+            if e.response["Error"]["Code"] in ("PreconditionFailed", "412", "ConditionalRequestConflict"):
+                raise Conflict(f"{url} changed since it was read (another writer committed)") from e
+            raise
+
+
+def copy(url, dest_url):
+    """Server-side copy, e.g. to keep a versioned history of catalogs for rollback."""
+    bucket, key = _split(url)
+    dbucket, dkey = _split(dest_url)
+    _client().copy_object(Bucket=dbucket, Key=dkey, CopySource={"Bucket": bucket, "Key": key})
+
+
+def main():
+    if len(sys.argv) != 4 or sys.argv[1] not in ("get", "put"):
+        sys.exit(__doc__)
+    if sys.argv[1] == "get":
+        print(fetch(sys.argv[2], sys.argv[3]))
+    else:
+        print(push(sys.argv[2], sys.argv[3], head(sys.argv[3])))
+
+
+if __name__ == "__main__":
+    main()

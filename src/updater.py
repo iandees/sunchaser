@@ -17,6 +17,7 @@ DuckLake transaction, so API readers see either the whole diff or none of it. Pe
      node_parent_ways, member_parent_rels, then advance state.osm_base / state.sequence
 """
 import argparse
+import os
 import pathlib
 import sys
 import time
@@ -518,11 +519,15 @@ class Updater:
                      WHERE id IN ({changed_rels})) m""")
 
 
-def compact(con):
-    """Periodic maintenance: inlined rows -> sorted Parquet, small files merged, old snapshots dropped."""
+def compact(con, grace=3600):
+    """Periodic maintenance: inlined rows -> sorted Parquet, small files merged, old snapshots dropped.
+    Files are deleted only `grace` seconds after they stop being referenced, so readers still on an
+    older catalog (or a frozen copy) keep working; orphans from discarded job runs go the same way."""
     for q in ("CALL ducklake_flush_inlined_data('lake')", "CALL ducklake_merge_adjacent_files('lake')",
-              "CALL ducklake_rewrite_data_files('lake')", "CALL ducklake_expire_snapshots('lake', older_than => now() - INTERVAL 1 HOUR)",
-              "CALL ducklake_cleanup_old_files('lake', older_than => now() - INTERVAL 1 HOUR)"):
+              "CALL ducklake_rewrite_data_files('lake')",
+              f"CALL ducklake_expire_snapshots('lake', older_than => now() - INTERVAL {int(grace)} SECOND)",
+              f"CALL ducklake_cleanup_old_files('lake', older_than => now() - INTERVAL {int(grace)} SECOND)",
+              f"CALL ducklake_delete_orphaned_files('lake', older_than => now() - INTERVAL {int(grace)} SECOND)"):
         t = time.time()
         try:
             con.sql(q)
@@ -573,9 +578,11 @@ def apply_with_retry(up, blob, ts, sequence, attempts=5):
             time.sleep(2 ** i)
 
 
-def follow(up, once=False, poll=30, kinds=("hour", "minute"), maintenance=None, until=None):
+def follow(up, once=False, poll=30, kinds=("hour", "minute"), maintenance=None, until=None, deadline=None):
     """Catch up with coarse diffs (hourly by default: a planet day diff is ~100 MB, too much to hold
-    in one batch), then minute diffs; then poll the minutely feed."""
+    in one batch), then minute diffs; then poll the minutely feed. Returns the number of diffs applied.
+    `deadline` (epoch seconds) ends a scheduled job's run between diffs."""
+    applied = 0
     base = up.sql("SELECT value FROM lake.state WHERE key = 'osm_base'").fetchall()[0][0]
     for kind in kinds:
         start, start_ts = find_seq(kind, base)
@@ -588,8 +595,11 @@ def follow(up, once=False, poll=30, kinds=("hour", "minute"), maintenance=None, 
         while seq <= cur:
             s, ts = state_of(kind, seq)
             if until is not None and ts > until:
-                return  # reached the requested point (tests replay a fixed window, not up to now)
+                return applied  # reached the requested point (tests replay a fixed window, not up to now)
+            if deadline is not None and time.time() > deadline:
+                return applied  # the next job continues from state.osm_base
             stats = apply_with_retry(up, osc(kind, seq), ts, f"{kind}/{seq}")
+            applied += 1
             print(f"{kind}/{seq} -> {ts} {stats}", flush=True)
             if maintenance is not None:
                 maintenance.tick()
@@ -602,12 +612,54 @@ def follow(up, once=False, poll=30, kinds=("hour", "minute"), maintenance=None, 
                         break
                     time.sleep(poll)
         if once and kind == "minute":
-            return
+            return applied
+    return applied
+
+
+def job(args):
+    """One scheduled run against a catalog on object storage (src/objcatalog.py): download it,
+    apply pending diffs until caught up or out of time, update areas, compact when due, and upload
+    it conditionally. Nothing runs between jobs, so the deployment scales to zero."""
+    import tempfile
+    import build_areas
+    import objcatalog
+    t0 = time.time()
+    with tempfile.TemporaryDirectory(dir=args.workdir) as tmp:
+        local = os.path.join(tmp, "catalog.ducklake")
+        etag = objcatalog.fetch(args.catalog_url, local)
+        con = duckdb.connect()
+        lakeconn.attach(con, catalog=local, data_path="")  # the catalog knows its data path
+        region = tuple(map(float, args.region.split(","))) if args.region else None
+        up = Updater(con, region)
+        n = follow(up, once=True, until=args.until, deadline=t0 + args.max_seconds)
+        if n and args.areas_every:
+            build_areas.build(con)
+        state = dict(con.sql("SELECT key, value FROM lake.state").fetchall())
+        last = float(state.get("compacted_at", "0"))
+        if args.compact_every and time.time() - last >= args.compact_every:
+            compact(con, grace=args.file_grace)
+            con.sql("DELETE FROM lake.state WHERE key = 'compacted_at'")
+            con.sql(f"INSERT INTO lake.state VALUES ('compacted_at', '{time.time():.0f}')")
+        elif not n:
+            print(f"job: nothing new at {state.get('osm_base')}", flush=True)
+            return 0
+        con.sql("DETACH lake")
+        con.close()
+        try:
+            objcatalog.push(local, args.catalog_url, etag)
+        except objcatalog.Conflict as e:
+            print(f"job: {e}; discarding this run", flush=True)
+            return 2
+        if args.keep_versions:
+            objcatalog.copy(args.catalog_url, args.catalog_url.rsplit("/", 1)[0]
+                            + f"/catalogs/{state.get('osm_base', 'unknown').replace(':', '')}.ducklake")
+    print(f"job: {n} diffs to {state.get('osm_base')}, committed in {time.time() - t0:.0f}s", flush=True)
+    return 0
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["run", "apply", "compact", "publish"])
+    ap.add_argument("cmd", choices=["run", "job", "apply", "compact", "publish"])
     ap.add_argument("files", nargs="*")
     ap.add_argument("--region", help="s,w,n,e: keep a regional extract consistent (omit for a planet lake)")
     ap.add_argument("--once", action="store_true", help="catch up and exit instead of following")
@@ -616,7 +668,14 @@ def main():
     ap.add_argument("--compact-every", type=int, default=3600, help="seconds between compactions (0: never)")
     ap.add_argument("--publish-to", help="publish a frozen catalog here (e.g. s3://bucket/lake/catalog.ducklake)")
     ap.add_argument("--publish-every", type=int, default=300, help="seconds between frozen-catalog publications")
+    ap.add_argument("--catalog-url", help="job: the catalog on object storage (s3://bucket/lake/catalog.ducklake)")
+    ap.add_argument("--max-seconds", type=float, default=240, help="job: stop applying diffs after this long")
+    ap.add_argument("--keep-versions", action="store_true", help="job: also copy each committed catalog to catalogs/")
+    ap.add_argument("--file-grace", type=int, default=3600, help="seconds before unreferenced files are deleted")
+    ap.add_argument("--workdir", help="job: local scratch for the catalog (default: system temp)")
     args = ap.parse_args()
+    if args.cmd == "job":
+        sys.exit(job(args))
     con = duckdb.connect()
     lakeconn.attach(con)
     if args.cmd == "compact":

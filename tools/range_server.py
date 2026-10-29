@@ -26,6 +26,15 @@ from xml.sax.saxutils import escape
 
 LOCK = threading.Lock()
 STATS = {"requests": 0, "bytes": 0, "by_file": {}}
+PUT_LOCK = threading.Lock()
+
+
+def file_etag(path):
+    """Changes whenever the object is replaced (S3 ETags are content hashes; any unique value works)."""
+    st = os.stat(path)
+    return f'"{st.st_mtime_ns:x}-{st.st_size:x}-{st.st_ino:x}"'
+
+
 CONFIG = {"latency_ms": 0.0}
 
 
@@ -153,13 +162,20 @@ class Handler(SimpleHTTPRequestHandler):
                 f.write(data)
             return self._reply(200, headers=[("ETag", etag)])
         path = self._local()
-        if self.headers.get("If-None-Match") == "*" and os.path.exists(path):
-            return self._reply(412, b"<Error><Code>PreconditionFailed</Code></Error>")
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = f"{path}.{uuid.uuid4().hex}.tmp"
         with open(tmp, "wb") as f:
             f.write(data)
-        os.replace(tmp, path)  # atomic, like an S3 object PUT
+        with PUT_LOCK:  # conditional writes: check and replace atomically, like S3
+            if self.headers.get("If-None-Match") == "*" and os.path.exists(path):
+                os.remove(tmp)
+                return self._reply(412, b"<Error><Code>PreconditionFailed</Code></Error>")
+            want = self.headers.get("If-Match")
+            if want is not None and (not os.path.exists(path) or file_etag(path) != want):
+                os.remove(tmp)
+                return self._reply(412, b"<Error><Code>PreconditionFailed</Code></Error>")
+            os.replace(tmp, path)  # atomic, like an S3 object PUT
+            etag = file_etag(path)
         self._reply(200, headers=[("ETag", etag)])
 
     def do_POST(self):
@@ -227,6 +243,7 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Content-Length", str(size))
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Last-Modified", self.date_time_string(int(os.path.getmtime(path))))
+        self.send_header("ETag", file_etag(path))
         self.end_headers()
 
     def do_GET(self):
@@ -254,6 +271,7 @@ class Handler(SimpleHTTPRequestHandler):
         if rng:
             self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
         self.send_header("Last-Modified", self.date_time_string(int(os.path.getmtime(path))))
+        self.send_header("ETag", file_etag(path))
         self.end_headers()
         with open(path, "rb") as f:
             f.seek(start)

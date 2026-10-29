@@ -8,28 +8,27 @@ now and why.
 ```
             OSMF replication (minute/hour diffs)
                           │
-                ┌─────────▼──────────┐   single writer
-                │  src/updater.py    │── areas rebuild, compaction, frozen-catalog publish
-                └─────────┬──────────┘
-          catalog commits │ Parquet PUTs
+            ┌─────────────▼──────────────┐  the only writer: a scheduled job (or a long-running
+            │  src/updater.py job        │  process); diffs, incremental areas, compaction
+            └─────────────┬──────────────┘
+   GET catalog, PUT Parquet, conditional PUT catalog (If-Match)
    ┌──────────────────────▼──────────────────────────────────┐
-   │ DuckLake                                                │
-   │  catalog: SQLite (WAL) / Postgres   data: S3 / R2       │
-   │  frozen catalog: s3://…/catalog.ducklake (published)    │
+   │ Object storage (S3 / R2), nothing else                  │
+   │  s3://…/lake/catalog.ducklake   DuckLake catalog (DuckDB file)
+   │  s3://…/lake/data/…             Parquet                 │
    └──────────────────────┬──────────────────────────────────┘
-                          │ read-only (live catalog or frozen file)
+                          │ read-only; reopen when the catalog's ETag changes
                 ┌─────────▼──────────┐
                 │  src/server.py     │  /api/interpreter  ← Overpass Turbo, scripts
-                │  ql → engine → out │
+                │  ql → engine → out │  any number, stateless, can scale to zero
                 └────────────────────┘
 ```
 
 | Component | Role |
 |---|---|
-| **Updater** | The only writer, like Overpass's `update_database`. Each replication diff is one DuckLake transaction. Readers see whole diffs or nothing. |
-| **Live catalog** | SQLite (WAL) on the writer's host, or Postgres for multi-host readers. Small updates stay inlined in the catalog until a flush. |
-| **Frozen catalog** | A DuckDB-format `.ducklake` the updater publishes to the bucket every few minutes. Servers anywhere can read the lake with nothing but object storage, and reload when the published object changes. |
-| **Server** | Stateless. One DuckDB cursor per request. `[timeout:N]` interrupts the query. |
+| **Updater** | The only writer, like Overpass's `update_database`. Each replication diff is one DuckLake transaction. Run as `updater.py job` on a schedule, e.g. every minute: download the catalog, apply what's pending, update areas incrementally, compact when due, upload with a conditional PUT. |
+| **Catalog** | A DuckDB-format DuckLake file stored in the bucket (`src/objcatalog.py`), so no database server is needed. The conditional PUT (If-Match on the downloaded ETag) means overlapping runs can't fork it: the later one is refused and discarded, and the Parquet files it wrote are orphans that compaction deletes after a grace period. SQLite (single host) and Postgres catalogs still work for always-on deployments. |
+| **Server** | Read-only and stateless. Attaches the catalog object directly and reopens it when its ETag changes (`SUNCHASER_CATALOG_REFRESH`). One DuckDB cursor per request; `[timeout:N]` interrupts the query; responses stream. |
 
 ## Data layout (one DuckLake schema)
 
@@ -83,37 +82,40 @@ Catch-up uses hourly diffs (a planet day diff is about 100 MB, too much for one 
 - **`compact`:** flush inlined rows to sorted Parquet, merge small files, expire snapshots.
 - **`publish.py`:** the frozen catalog.
 
-## Deployment on R2 / S3
+## Deployment on R2 / S3 (scale to zero)
 
 1. Create a bucket and an API token (R2: Object Read & Write).
 2. Set the environment variables. See `deploy/local.env` for the local stand-in. For R2:
    - `SUNCHASER_S3_ENDPOINT=<account>.r2.cloudflarestorage.com`
    - `SUNCHASER_S3_REGION=auto`
    - `SUNCHASER_S3_USE_SSL=true`
-3. Build once from a planet or extract PBF:
+3. Build once into a local catalog file with the data on S3, then upload the catalog:
 
    ```bash
    rust/osm-extract/target/release/osm-extract planet.osm.pbf raw
    ```
 
    ```bash
-   python src/build_lake.py --raw raw --osm-base <pbf timestamp>
+   python src/build_lake.py --raw raw --catalog catalog.ducklake --data-path s3://bucket/lake/data/ --osm-base <pbf timestamp>
    ```
 
    ```bash
-   python src/build_areas.py
+   SUNCHASER_CATALOG=catalog.ducklake python src/build_areas.py
    ```
-
-4. Run the updater (one host):
 
    ```bash
-   python src/updater.py run --publish-to s3://bucket/lake/catalog.ducklake
+   python src/objcatalog.py put catalog.ducklake s3://bucket/lake/catalog.ducklake
    ```
 
-5. Run any number of API servers:
-   - Same host: point them at the live SQLite catalog for minutely freshness.
-   - Elsewhere: use `SUNCHASER_CATALOG=s3://bucket/lake/catalog.ducklake` for freshness of a few minutes and no catalog database.
-   - For minutely freshness across hosts, use a Postgres catalog.
+4. Schedule the updater, for example every minute (cron, EventBridge, Cloud Scheduler). A run that finds nothing new exits without writing:
+
+   ```bash
+   python src/updater.py job --catalog-url s3://bucket/lake/catalog.ducklake --max-seconds 50
+   ```
+
+5. Run read-only API servers anywhere, with `SUNCHASER_CATALOG=s3://bucket/lake/catalog.ducklake`.
+
+`docs/aws.md` has the full AWS walkthrough for a planet build with full history.
 
 ## Validation
 
@@ -125,6 +127,7 @@ Catch-up uses hourly diffs (a planet day diff is about 100 MB, too much for one 
 | Engine regression (`tests/test_corpus.py`) | the indexed lake equals a brute-force evaluator on 24 queries |
 | After 5 days of replayed diffs | 66/69 non-area and 9/10 area-related queries identical; the differences come from the reference's state |
 | Fixed 24-hour window (both sides given the lake's edits) | 68/69 current-data queries; 13/13 history queries (`[date:]` incl. `out meta`/`geom`, `newer`, `changed`) vs Overpass with `--keep-attic` |
+| Object-storage catalog, updated only by scheduled jobs (24 h window) | 81/82 queries incl. 13/13 history; two overlapping jobs: one commits, the other is refused (412) and discarded |
 | Bucketed vs flat build | identical tables, files in key order (`osm-extract --bucket-bits 12`, 16 groups) |
 
 ## Known gaps
