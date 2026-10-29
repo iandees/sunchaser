@@ -19,11 +19,12 @@ that shaped it.
 
 | | |
 |---|---|
-| Differential test vs. a real Overpass (Berlin extract) | See `results/overpass_diff*.json`. At the extract snapshot: 57/58 element-identical. The one difference is Overpass's relation `out bb` when members are missing from an extract |
+| Differential test vs. a real Overpass (Berlin extract) | See `results/overpass_diff*.json`. At the extract snapshot: 57/58 element-identical. After 5 days of replayed diffs: 66/69 non-area and 9/10 area-related queries identical; the rest come from the reference's state (planet-wide diffs, missing extract members), not from the engine |
 | Overpass Turbo | The real overpass-turbo.eu loads and renders results from the service (`tools/turbo_check.js`, `results/turbo.png`) |
 | Live updates | The updater follows OSMF replication (hourly catch-up, then minutely) with the node → way → relation cascade. Readers stay consistent while it commits |
-| QL coverage | Settings `[out:json\|xml\|csv]`, `[timeout]`, `[bbox]`; `node/way/rel/nwr/nw/nr/wr/area`; tag filters incl. regex and `,i`; `(bbox)`, `(id:…)`, `(.set)`, `(w)`, `(r[:role])`, `(bn)`, `(bw)`, `(br)`, `(around:…)`, `(around.set:…)`, `(poly:…)`, `(area[.x])`, `(pivot[.x])`, `(if: …)` evaluators; unions, differences, named sets, `> >> < <<`, `foreach`, `map_to_area`, `is_in`; `out ids/skel/body/tags/meta/count` × `geom[(bbox)]/bb/center` × `asc/qt`, limit, `noids` |
-| Not yet | Attic queries (`[date]`, `[diff]`, `[adiff]`, `changed`, `newer`, `timeline`, `retro`), `make`/`convert`/`for`/`complete`/`compare`/`if` blocks, antimeridian-crossing boxes |
+| QL coverage | Settings `[out:json\|xml\|csv]`, `[timeout]`, `[maxsize]`, `[bbox]`, `[date]`; `(newer)`, `(changed)`; `node/way/rel/nwr/nw/nr/wr/area`; tag filters incl. regex and `,i`; `(bbox)`, `(id:…)`, `(.set)`, `(w)`, `(r[:role])`, `(bn)`, `(bw)`, `(br)`, `(around:…)`, `(around.set:…)`, `(poly:…)`, `(area[.x])`, `(pivot[.x])`, `(if: …)` evaluators; unions, differences, named sets, `> >> < <<`, `foreach`, `map_to_area`, `is_in`; `out ids/skel/body/tags/meta/count` × `geom[(bbox)]/bb/center` × `asc/qt`, limit, `noids` |
+| Planet scale | Streaming responses; bucketed Rust extract and bounded-memory lake build; plan and sizing in [`docs/planet.md`](docs/planet.md) |
+| Not yet | `[diff]`, `[adiff]`, `timeline`, `retro`; `make`/`convert`/`for`/`complete`/`compare`/`if` blocks; antimeridian-crossing boxes; incremental areas |
 
 ## Layout
 
@@ -37,8 +38,8 @@ that shaped it.
 | `src/publish.py` | Frozen DuckLake publishing: a read-only catalog file on S3/R2 for stateless readers |
 | `src/build_areas.py` | Overpass's area rules: `lake.areas` from multipolygon/boundary relations |
 | `src/evaluator.py` | `(if: …)` evaluator expressions |
-| `src/build_lake.py` | Raw Parquet → DuckLake tables with Overpass keys |
-| `src/extract.py`, `rust/osm-extract` | PBF → raw Parquet (Python reference / 23× faster Rust) |
+| `src/build_lake.py` | Raw Parquet → DuckLake tables with Overpass keys (bucketed input: sorted one key-range group at a time) |
+| `src/extract.py`, `rust/osm-extract` | PBF → raw Parquet. Python is the flat reference; Rust computes all keys and bboxes, writes key-range buckets, and has a dense mmap index for the planet |
 | `src/quadtile.py` | Exact port of Overpass's index math (fuzz-tested against the C++ header) |
 | `src/lakeconn.py` | Catalog and S3/R2 connection setup shared by all tools |
 | `tools/compare_overpass.py` | Differential test against `osm3s_query` |
@@ -61,6 +62,8 @@ cargo build --release --manifest-path rust/osm-extract/Cargo.toml
 ```bash
 rust/osm-extract/target/release/osm-extract region.osm.pbf data/raw
 ```
+
+For the planet, add `--bucket-bits 12 --dense-index /nvme/idx`. See [`docs/planet.md`](docs/planet.md).
 
 Configure storage. `deploy/local.env` targets the local test store; for R2, set
 `SUNCHASER_S3_ENDPOINT=<account>.r2.cloudflarestorage.com`, `SUNCHASER_S3_USE_SSL=true`,
@@ -102,3 +105,5 @@ for a city), then:
 ```bash
 .venv/bin/python -I tools/compare_overpass.py --db-dir /path/to/overpass-db
 ```
+
+For history queries, load the reference with `--keep-attic`, replay the lake's diffs over a fixed window, and compare with `--history`. The window is set with `updater.py run --once --until T`, and the reference is synced with `tools/sync_reference.py --keep-attic`.

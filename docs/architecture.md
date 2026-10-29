@@ -123,9 +123,19 @@ Catch-up uses hourly diffs (a planet day diff is about 100 MB, too much for one 
 | Overpass Turbo (`tools/turbo_check.js`) | loads and renders results from the service |
 | Index math (`tests/test_quadtile.py`) | bit-identical to Overpass's C++ |
 | Engine regression (`tests/test_corpus.py`) | the indexed lake equals a brute-force evaluator on 24 queries |
+| After 5 days of replayed diffs | 66/69 non-area and 9/10 area-related queries identical; the differences come from the reference's state |
+| Bucketed vs flat build | identical tables, files in key order (`osm-extract --bucket-bits 12`, 16 groups) |
 
 ## Known gaps
 
-- **Not implemented:** attic and history queries (`[date]`, `[diff]`, `[adiff]`, `changed`, `newer`, `timeline`, `retro`); evaluators (`if:`, `make`, `convert`, `foreach`, `for`, `complete`, `compare`); `out geom(bbox)` clipping; antimeridian-crossing bboxes; ways as areas (this Overpass version's rules build areas from relations only).
-- **Performance:** single queries are 0.3–3 s on a 4-core box against 0.1–2.4 s for local-disk Overpass. Much of the remaining cost is per-statement overhead and the amount of inlined (unflushed) data scanned. Lance as an id-lookup store (`results/NOTES.md`) is the main lever not yet wired into the live path.
+- **Not implemented:**
+  - `[diff]`, `[adiff]`, `timeline`, `retro`.
+  - `make`, `convert`, `for`, `complete`, `compare` and `if` blocks.
+  - Antimeridian-crossing bboxes.
+  - Ways as areas: this Overpass version's rules build areas from relations only.
+- **Performance:**
+  - Single queries take 0.3–3 s on a 4-core box, against 0.1–2.4 s for local-disk Overpass.
+  - Large outputs are bound by Python serialisation, at about 10 MB/s.
+  - Lance as an id-lookup store (`results/NOTES.md`) is not wired into the live path.
 - **Areas** are rebuilt in full, not incrementally.
+- **Planet scale:** see `docs/planet.md` for the build and update plan, and what is measured vs extrapolated.
