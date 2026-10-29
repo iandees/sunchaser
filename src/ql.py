@@ -416,10 +416,14 @@ class Parser:
                 o.mode = w
             elif w in ("geom", "bb", "center"):
                 o.geometry = w
-                if w == "geom" and self.peek() == "(":   # out geom(s,w,n,e): clipping not supported, ignored
+                if w == "geom" and self.peek() == "(":   # out geom(s,w,n,e): clip geometry to a bbox
                     self.expect("(")
-                    while not self.eat(")"):
-                        self.i += 1
+                    v = [float(self.number())]
+                    for _ in range(3):
+                        self.expect(",")
+                        v.append(float(self.number()))
+                    self.expect(")")
+                    o.clip = Bbox(*v)
             elif w in ("asc", "qt"):
                 o.order = w
             elif w == "noids":

@@ -74,3 +74,9 @@ QL_EVAL = [
     ("foreach_around", "[out:json];node[amenity=cafe](52.5160,13.3770,52.5175,13.3800);foreach->.c(node(around.c:30)[amenity=bench];out ids;);"),
 ]
 QL += QL_EVAL
+
+QL += [
+    ("out_geom_clip_ways", "[out:json];way[highway=primary](52.515,13.385,52.52,13.395);out geom(52.516,13.387,52.519,13.392);"),
+    ("out_geom_clip_rel", "[out:json];rel(7643526);out geom(52.512,13.35,52.516,13.36);"),
+    ("xml_geom_clip", "way[highway=primary](52.515,13.385,52.52,13.395);out geom(52.516,13.387,52.519,13.392);"),
+]

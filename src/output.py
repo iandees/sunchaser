@@ -35,6 +35,7 @@ class OutOptions:
     order: str = "asc"            # asc (by id) or qt (by quadtile index)
     limit: int | None = None
     noids: bool = False
+    clip: object = None           # out geom(s,w,n,e): engine.Bbox to clip geometry to
 
     def bits(self):
         b = MODES[self.mode] | GEOMS[self.geometry]
@@ -75,6 +76,73 @@ def bounds_of(coords):
     return min(lats), min(lons), max(lats), max(lons)
 
 
+def _inside(p, clip):
+    """Way_Bbox_Geometry_Store::matches_bbox (integer comparison like the node bbox filter)."""
+    s7, w7, n7, e7 = clip.ints()
+    return p[0] != NO_COORD and s7 <= p[0] <= n7 and w7 <= p[1] <= e7
+
+
+def _seg_hits(a, b, clip):
+    """Bbox_Double::intersects for west <= east, on Overpass-rounded coordinates."""
+    if a[0] == NO_COORD or b[0] == NO_COORD:
+        return False
+    s, n, w, e = clip.s, clip.n, clip.w, clip.e
+    flat, flon = (a[0] + 910000000) / 1e7 - 91.0, a[1] / 1e7
+    tlat, tlon = (b[0] + 910000000) / 1e7 - 91.0, b[1] / 1e7
+    if (flat < s and tlat < s) or (flat > n and tlat > n):
+        return False
+    df = (tlon - flon) * (s - flat) / (tlat - flat) if flat < s else (tlon - flon) * (n - flat) / (tlat - flat) if flat > n else 0
+    dt = (flon - tlon) * (s - tlat) / (flat - tlat) if tlat < s else (flon - tlon) * (n - tlat) / (flat - tlat) if tlat > n else 0
+    lo, hi = sorted((flon + df, tlon + dt))
+    return lo <= e and hi >= w
+
+
+def clip_way(coords, clip):
+    """Way_Bbox_Geometry_Store::get_geometry, loop quirks included: keep a vertex if it or a neighbour is
+    inside or an adjacent segment crosses the box; others become NO_COORD (printed as null)."""
+    res = list(coords)
+    n, i, last_dropped = len(res), 0, False
+    while i < n:
+        if i < n - 1 and _inside(coords[i + 1], clip):
+            i += 3  # the next and the following point are kept
+            last_dropped = False
+            continue
+        if not last_dropped:
+            if _inside(coords[i], clip):
+                i += 2
+                last_dropped = False
+                continue
+            if i > 0 and _inside(coords[i - 1], clip):
+                i += 1
+                last_dropped = False
+                continue
+        if i < n - 1 and _seg_hits(coords[i], coords[i + 1], clip):
+            i += 2
+            last_dropped = False
+            continue
+        if not last_dropped and i > 0 and _seg_hits(coords[i - 1], coords[i], clip):
+            i += 1
+            last_dropped = False
+            continue
+        res[i] = (NO_COORD, NO_COORD)
+        last_dropped = True
+        i += 1
+    return res
+
+
+def clip_member_way(coords, clip):
+    """Relation_Geometry_Store::get_geometry: a member-way vertex is dropped when it and both neighbours
+    are outside the box (no segment test)."""
+    res = list(coords)
+    if len(res) == 1:
+        return res if _inside(res[0], clip) else [(NO_COORD, NO_COORD)]
+    m = [_inside(p, clip) for p in coords]
+    for i in range(len(res)):
+        if not m[i] and (i == 0 or not m[i - 1]) and (i == len(res) - 1 or not m[i + 1]):
+            res[i] = (NO_COORD, NO_COORD)
+    return res
+
+
 def center_of(b):
     return (b[0] + b[2]) / 2, (b[1] + b[3]) / 2  # Bbox_Double::center_* for west <= east
 
@@ -87,6 +155,7 @@ class Document:
         self.callback = json_callback
         self.items = []        # dicts in a format-neutral shape
         self.with_areas = False
+        self.clip = None
         self.remarks = []
 
     # ---- collecting ------------------------------------------------------------
@@ -109,6 +178,7 @@ class Document:
                 continue
             meta = engine.meta(t, ids) if bits & META and t != "a" else {}
             keys = engine.sort_keys(t, ids) if opts.order == "qt" else None
+            self.clip = opts.clip
             for item in getattr(self, f"_items_{t}")(engine, set_name, bits, geo):
                 if meta:
                     item["meta"] = meta.get(item["id"])
@@ -146,6 +216,8 @@ class Document:
                 it["nodes"] = r["nds"]
             if need_geo:
                 coords = list(zip(r["nd_lat"], r["nd_lon"]))
+                if self.clip is not None and bits & GEOMETRY:
+                    coords = clip_way(coords, self.clip)
                 b = bounds_of(coords)
                 if b and bits & BOUNDS:
                     it["bounds"] = b
@@ -167,6 +239,9 @@ class Document:
                                                                  ["id", "lat", "lon"])}
             way_xy = {i: list(zip(a, b)) for i, a, b in e.elements_by_id(
                 "w", [m["ref"] for m in mem if m["type"] == "w"], ["id", "nd_lat", "nd_lon"])}
+            if self.clip is not None and bits & GEOMETRY:
+                node_xy = {i: p for i, p in node_xy.items() if _inside(p, self.clip)}
+                way_xy = {i: clip_member_way(c, self.clip) for i, c in way_xy.items()}
         for r in rows:
             it = {"type": "relation", "id": r["id"]}
             if geo:
