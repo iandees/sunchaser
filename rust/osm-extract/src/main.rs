@@ -639,13 +639,73 @@ fn header_fields() -> String {
     HEADER.get().cloned().unwrap_or_default()
 }
 
+/// Bytes read from the input so far, and its total size if known (a file's, or --input-size for a
+/// pipe), for the progress lines.
+static INPUT_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static INPUT_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+struct Counting<R>(R);
+
+impl<R: Read> Read for Counting<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.0.read(buf)?;
+        INPUT_BYTES.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(n)
+    }
+}
+
+/// Resident and peak memory of this process, as " | rss 12.3 GB (peak 14.0)" (Linux only).
+fn memory_note() -> String {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else { return String::new() };
+    let kb = |key: &str| {
+        status.lines().find(|l| l.starts_with(key)).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<f64>().ok())
+    };
+    match (kb("VmRSS:"), kb("VmHWM:")) {
+        (Some(r), Some(h)) => format!(" | rss {:.1} GB (peak {:.1})", r / 1e6, h / 1e6),
+        _ => String::new(),
+    }
+}
+
+/// One progress line on stderr every 30 s: input read, share and ETA when the size is known, rate,
+/// memory, and whatever counts the caller supplies. The long runs (a planet is hours) are otherwise silent.
+pub(crate) struct Progress {
+    t0: Instant,
+    last: Instant,
+}
+
+impl Progress {
+    pub(crate) fn new() -> Self {
+        Progress { t0: Instant::now(), last: Instant::now() }
+    }
+
+    pub(crate) fn tick(&mut self, counts: impl FnOnce() -> String) {
+        if self.last.elapsed().as_secs() < 30 {
+            return;
+        }
+        self.last = Instant::now();
+        let read = INPUT_BYTES.load(std::sync::atomic::Ordering::Relaxed) as f64;
+        let total = INPUT_TOTAL.load(std::sync::atomic::Ordering::Relaxed) as f64;
+        let secs = self.t0.elapsed().as_secs_f64();
+        let share = if total > 0.0 && read > 0.0 {
+            format!(" ({:.1}%, eta {:.0} min)", 100.0 * read / total, secs * (total - read).max(0.0) / read / 60.0)
+        } else {
+            String::new()
+        };
+        eprintln!("[{secs:>6.0}s] read {:.1} GB{share} at {:.0} MB/s{} | {}", read / 1e9, read / 1e6 / secs, memory_note(), counts());
+    }
+}
+
 /// The PBF from a file, or from stdin for `-` (e.g. piped from a download, so the file never has
 /// to be stored: the planet history is 164 GB).
 fn open_input(path: &Path) -> Result<BlobReader<Box<dyn Read + Send>>> {
     let r: Box<dyn Read + Send> = if path.as_os_str() == "-" {
-        Box::new(BufReader::with_capacity(16 << 20, std::io::stdin()))
+        Box::new(BufReader::with_capacity(16 << 20, Counting(std::io::stdin())))
     } else {
-        Box::new(BufReader::with_capacity(16 << 20, File::open(path).with_context(|| format!("open {}", path.display()))?))
+        let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
+        if INPUT_TOTAL.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            INPUT_TOTAL.store(f.metadata()?.len(), std::sync::atomic::Ordering::Relaxed);
+        }
+        Box::new(BufReader::with_capacity(16 << 20, Counting(f)))
     };
     Ok(BlobReader::new(r))
 }
@@ -683,6 +743,7 @@ fn parse_args() -> Result<Args> {
             "--max-way-id" => a.max_way_id = val("--max-way-id")?.parse()?,
             "--history" => a.history = true,
             "--writer-mem-mb" => WRITER_BUDGET.store(val("--writer-mem-mb")?.parse::<usize>()? << 20, std::sync::atomic::Ordering::Relaxed),
+            "--input-size" => INPUT_TOTAL.store(val("--input-size")?.parse()?, std::sync::atomic::Ordering::Relaxed),
             "--cut" => a.cuts.push(val("--cut")?),
             _ if arg.starts_with("--") => bail!("unknown option {arg}"),
             _ => pos.push(arg),
@@ -691,7 +752,7 @@ fn parse_args() -> Result<Args> {
     // every bucket of the four bucketed tables is an open file until the end: 4 << 12 at most
     if pos.len() != 2 || !(1..=12).contains(&a.bucket_bits) {
         bail!("usage: osm-extract <input.osm.pbf | - for stdin> <out-dir> [--bucket-bits 1..12 (8)] \
-               [--dense-index DIR [--max-node-id N] [--max-way-id N]] [--history [--cut name:s,w,n,e ...]] [--writer-mem-mb N (256, per table)]");
+               [--dense-index DIR [--max-node-id N] [--max-way-id N]] [--history [--cut name:s,w,n,e ...]] [--writer-mem-mb N (256, per table)] [--input-size BYTES (for % and ETA on stdin)]");
     }
     a.input = PathBuf::from(&pos[0]);
     a.out = PathBuf::from(&pos[1]);
@@ -739,6 +800,7 @@ fn main() -> Result<()> {
     let (mut n_nodes, mut n_ways, mut n_rels) = (0u64, 0u64, 0u64);
 
     let mut blobs = open_input(&args.input)?.peekable();
+    let mut progress = Progress::new();
     while blobs.peek().is_some() {
         let chunk: Vec<_> = blobs.by_ref().take(CHUNK_BLOBS).collect::<std::result::Result<_, _>>()?;
         let blocks: Vec<PrimitiveBlock> = chunk
@@ -795,6 +857,7 @@ fn main() -> Result<()> {
             n_rels += batch.num_rows() as u64;
         }
         wr.write_split(&batches, elem_bucket)?;
+        progress.tick(|| format!("nodes={n_nodes} ways={n_ways} relations={n_rels}"));
     }
     for w in loc_writers {
         w.close()?;

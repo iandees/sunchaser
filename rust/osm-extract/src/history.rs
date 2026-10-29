@@ -1002,6 +1002,7 @@ pub fn run(args: &Args) -> Result<()> {
     let dense = args.dense.as_deref().map(|d| (d, args.max_node_id, args.max_way_id));
     let mut p = Pipeline::new(&args.out, args.bucket_bits, dense)?;
     let mut blobs = crate::open_input(&args.input)?.peekable();
+    let mut progress = crate::Progress::new();
     loop {
         let chunk: Vec<_> = blobs.by_ref().take(CHUNK_BLOBS).collect::<std::result::Result<_, _>>()?;
         let last = chunk.is_empty() || blobs.peek().is_none();
@@ -1018,6 +1019,7 @@ pub fn run(args: &Args) -> Result<()> {
             })
             .collect::<std::result::Result<_, _>>()?;
         p.feed(decoded.into_iter().flatten().collect(), last)?;
+        progress.tick(|| format!("versions={} (current n={} w={} r={})", p.versions, p.counts[0], p.counts[1], p.counts[2]));
         if last {
             break;
         }
