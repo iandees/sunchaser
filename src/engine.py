@@ -274,13 +274,13 @@ class Engine:
             tbl = "lake.nodes_tagged"
         push, local = [], [f.sql() for f in filters]
         cols = ["id", "tags"]
-        if within:
-            local.append(f"id IN (SELECT id FROM {within} WHERE type = '{t}')")
+        for w in ([within] if isinstance(within, str) else (within or [])):
+            local.append(f"id IN (SELECT id FROM {w} WHERE type = '{t}')")
         if ids is not None:
             p, l = self._id_parts(t, sorted(set(ids))) if bbox is None else ([], [self._id_pred("id", sorted(set(ids)))])
             push += p
             local += l
-        lake_postings = self.mode == "lake" and self.plan.use_postings and ids is None and within is None
+        lake_postings = self.mode == "lake" and self.plan.use_postings and ids is None and not within
         drive = next((f for f in filters if f.postings_sql()), None) if lake_postings else None
         if bbox is not None:
             if t == "r":
@@ -437,12 +437,133 @@ class Engine:
             return self._up(s, closure=(op == "<<"))
         raise ValueError(op)
 
-    def _members(self, rel_set, mtype):
-        """Member refs of type mtype of the relations in rel_set (as an id list)."""
+    def _members(self, rel_set, mtype, role=None):
+        """Member refs of type mtype (optionally with this role) of the relations in rel_set."""
         rel_ids = self._ids_of(rel_set, "r")
+        if not rel_ids:
+            return []
+        role_pred = f" AND role = {sq(role)}" if role is not None else ""
         return self._materialize_ids(
             f"SELECT ref FROM (SELECT unnest(members, recursive := true) FROM {self.t['r']} "
-            f"WHERE {self._fetch_where('r', rel_ids)}) WHERE type = '{mtype}'")
+            f"WHERE {self._fetch_where('r', rel_ids)}) WHERE type = '{mtype}'{role_pred}")
+
+    # ---- around ----------------------------------------------------------------------
+
+    def around_ids(self, t, radius, pts=None, src=None, bbox=None, filters=()):
+        """Ids of type-t elements within `radius` metres of the points (or of the nodes / way
+        vertices of set `src`), like (around:...). Ways count if any segment is within range;
+        relations if any member node or member-way segment is. A way in `src` contributes its
+        vertices only (segment-to-segment distance is not implemented)."""
+        import math
+        if pts is None:
+            pts = [(a / 1e7, b / 1e7) for _, a, b in self.elements(src, "n", ["id", "lat", "lon"])]
+            for _, la, lo in self.elements(src, "w", ["id", "nd_lat", "nd_lon"]):
+                pts += [(a / 1e7, b / 1e7) for a, b in zip(la, lo) if a != -2147483648]
+        if not pts:
+            return []
+        dlat = radius / 111_000 * 1.01
+        groups = {}  # cluster points into ~1 km cells so each prefilter bbox stays small
+        for la, lo in pts:
+            groups.setdefault((round(la * 50), round(lo * 30)), []).append((la, lo))
+        found = set()
+        for cell_pts in groups.values():
+            s_ = min(p[0] for p in cell_pts) - dlat
+            n_ = max(p[0] for p in cell_pts) + dlat
+            dlon = dlat / max(0.01, math.cos(math.radians(max(abs(s_), abs(n_)))))
+            box = Bbox(s_, min(p[1] for p in cell_pts) - dlon, n_, max(p[1] for p in cell_pts) + dlon)
+            if bbox is not None:
+                box = Bbox(max(box.s, bbox.s), max(box.w, bbox.w), min(box.n, bbox.n), min(box.e, bbox.e))
+                if box.s > box.n or box.w > box.e:
+                    continue
+            cand = self._new(self._query_one(t, box, list(filters), None, None))
+            found |= self._within_distance(t, cand, cell_pts, radius)
+        return sorted(found)
+
+    def _within_distance(self, t, cand, pts, radius):
+        import math
+        R = 6371000.0  # Overpass uses a spherical earth for great-circle distances
+
+        def d_pt(a, b):
+            la1, lo1, la2, lo2 = map(math.radians, (a[0], a[1], b[0], b[1]))
+            h = math.sin((la2 - la1) / 2) ** 2 + math.cos(la1) * math.cos(la2) * math.sin((lo2 - lo1) / 2) ** 2
+            return 2 * R * math.asin(min(1.0, math.sqrt(h)))
+
+        def d_seg(p, a, b):
+            # local equirectangular projection around p (adequate at Overpass radii)
+            k = math.cos(math.radians(p[0]))
+            ax, ay = (a[1] - p[1]) * k, a[0] - p[0]
+            bx, by = (b[1] - p[1]) * k, b[0] - p[0]
+            dx, dy = bx - ax, by - ay
+            L = dx * dx + dy * dy
+            u = 0.0 if L == 0 else max(0.0, min(1.0, -(ax * dx + ay * dy) / L))
+            cx, cy = ax + u * dx, ay + u * dy
+            return d_pt(p, (p[0] + cy, p[1] + cx / k))
+
+        def line_near(coords):
+            coords = [(a / 1e7, b / 1e7) for a, b in coords if a != -2147483648]
+            if len(coords) == 1:
+                return any(d_pt(p, coords[0]) <= radius for p in pts)
+            return any(d_seg(p, coords[i], coords[i + 1]) <= radius
+                       for i in range(len(coords) - 1) for p in pts)
+
+        out = set()
+        if t == "n":
+            for i, la, lo in self.elements(cand, "n", ["id", "lat", "lon"]):
+                if any(d_pt(p, (la / 1e7, lo / 1e7)) <= radius for p in pts):
+                    out.add(i)
+        elif t == "w":
+            for i, la, lo in self.elements(cand, "w", ["id", "nd_lat", "nd_lon"]):
+                if line_near(zip(la, lo)):
+                    out.add(i)
+        else:
+            for i, members in self.elements(cand, "r", ["id", "members"]):
+                nodes = {m["ref"] for m in members if m["type"] == "n"}
+                ways = {m["ref"] for m in members if m["type"] == "w"}
+                hit = any(any(d_pt(p, (a / 1e7, b / 1e7)) <= radius for p in pts)
+                          for _, a, b in self.elements_by_id("n", nodes, ["id", "lat", "lon"]))
+                if not hit:
+                    hit = any(line_near(zip(a, b)) for _, a, b in self.elements_by_id("w", ways, ["id", "nd_lat", "nd_lon"]))
+                if hit:
+                    out.add(i)
+        return out
+
+    # ---- recurse filters for query statements: node(w), way(r), rel(bn), ... ----------
+
+    def way_node_ids(self, s):
+        """(w): nodes of the ways in s."""
+        way_ids = self._ids_of(s, "w")
+        if not way_ids:
+            return []
+        push, local = self._id_parts("w", way_ids)
+        return self._materialize_ids(self._scan("w", push, local, cols=("id", "nds"), select="unnest(nds)"))
+
+    def member_ids(self, s, mtype, role=None):
+        """(r) / (r:"role"): members of type mtype of the relations in s."""
+        return self._members(s, mtype, role)
+
+    def parent_way_ids(self, s):
+        """(bn) for ways: ways having a node of s."""
+        node_ids = self._ids_of(s, "n")
+        if not node_ids:
+            return []
+        if self.mode == "lake":
+            return self._materialize_ids(
+                f"SELECT way_id FROM lake.node_parent_ways WHERE {self._id_pred('node_id', node_ids)}")
+        return self._materialize_ids(
+            f"SELECT id FROM {self.t['w']} WHERE len(list_intersect(nds, [{','.join(map(str, node_ids))}])) > 0")
+
+    def parent_rel_ids(self, s, mtype, role=None):
+        """(bn) / (bw) / (br) for relations: relations having an element of type mtype of s as member."""
+        ids = self._ids_of(s, mtype)
+        if not ids:
+            return []
+        role_pred = f" AND role = {sq(role)}" if role is not None else ""
+        if self.mode == "lake" and role is None:
+            return self._materialize_ids(
+                f"SELECT rel_id FROM lake.member_parent_rels WHERE mtype = '{mtype}' AND {self._id_pred('mid', ids)}")
+        return self._materialize_ids(
+            f"SELECT id FROM (SELECT id, unnest(members, recursive := true) FROM {self.t['r']}) "
+            f"WHERE type = '{mtype}' AND ref IN ({','.join(map(str, ids))}){role_pred}")
 
     def _down(self, s, way_src):
         """add_nw_member_objects: member ways of s's relations; nodes of (s's ways + those member ways)
