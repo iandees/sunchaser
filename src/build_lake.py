@@ -164,7 +164,15 @@ def stage_flat(con, raw, step):
         FROM '{raw}/relations.parquet' r LEFT JOIN rel_idx x USING (id) LEFT JOIN mb USING (id)""")
 
 
+def peak_rss_gb():
+    """Peak resident memory of this process (DuckDB's memory included), in GB."""
+    import resource
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return peak / (1 << 30 if sys.platform == "darwin" else 1 << 20)  # bytes on macOS, KB on Linux
+
+
 def main():
+    sys.stdout.reconfigure(line_buffering=True)  # progress shows up in `| tee build.log` as it happens
     ap = argparse.ArgumentParser()
     ap.add_argument("--raw", default="data/raw")
     ap.add_argument("--lake", default="data/lake", help="local working dir (and default catalog/data location)")
@@ -202,7 +210,7 @@ def main():
     def step(name, sql):
         t = time.time()
         con.sql(sql)
-        print(f"{name:<22} {time.time() - t:6.1f}s")
+        print(f"{name:<22} {time.time() - t:6.1f}s  peak rss {peak_rss_gb():.1f} GB")
 
     manifest = raw / "manifest.json"
     if manifest.exists():
@@ -230,13 +238,19 @@ def main():
         t = time.time()
         if threads:
             con.sql(f"SET threads = {threads}")
+        last_report = t
         for i, source in enumerate(sources):
             sql = f"SELECT {select} FROM {source} {where} ORDER BY {sort}"
             con.sql(f"CREATE TABLE lake.{table} SORTED BY ({sort}) AS {sql}" if i == 0 and not append
                     else f"INSERT INTO lake.{table} BY NAME {sql}")
+            if len(sources) > 1 and i + 1 < len(sources) and time.time() - last_report >= 30:
+                last_report = time.time()  # a table of many groups takes hours at planet scale
+                print(f"  lake.{table}: group {i + 1}/{len(sources)} done, {last_report - t:.0f}s, "
+                      f"peak rss {peak_rss_gb():.1f} GB", flush=True)
         if threads:
             con.sql("RESET threads")
-        print(f"{'lake.' + table:<22} {time.time() - t:6.1f}s  ({len(sources)} groups)", flush=True)
+        print(f"{'lake.' + table:<22} {time.time() - t:6.1f}s  ({len(sources)} groups)  "
+              f"peak rss {peak_rss_gb():.1f} GB", flush=True)
 
     def consume(*subs):
         """--consume: raw buckets no later step reads are deleted, so the build's peak disk use
