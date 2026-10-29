@@ -696,8 +696,9 @@ def _commit(args, local, etag, state):
         print(f"job: {e}; discarding this run", flush=True)
         return None
     if args.keep_versions:
-        objcatalog.copy(args.catalog_url, args.catalog_url.rsplit("/", 1)[0]
-                        + f"/catalogs/{state.get('osm_base', 'unknown').replace(':', '')}.ducklake")
+        prefix = args.catalog_url.rsplit("/", 1)[0] + "/catalogs"
+        objcatalog.copy(args.catalog_url, prefix + f"/{state.get('osm_base', 'unknown').replace(':', '')}.ducklake")
+        objcatalog.prune(prefix, args.keep_versions)
     return new
 
 
@@ -756,7 +757,8 @@ def main():
     ap.add_argument("--publish-every", type=int, default=300, help="seconds between frozen-catalog publications")
     ap.add_argument("--catalog-url", help="job: the catalog on object storage (s3://bucket/lake/catalog.ducklake)")
     ap.add_argument("--max-seconds", type=float, default=240, help="job: stop applying diffs after this long")
-    ap.add_argument("--keep-versions", action="store_true", help="job: also copy each committed catalog to catalogs/")
+    ap.add_argument("--keep-versions", nargs="?", type=int, const=24, default=0, metavar="N",
+                    help="job: also copy each committed catalog to catalogs/, keeping the newest N (default 24)")
     ap.add_argument("--file-grace", type=int, default=3600, help="seconds before unreferenced files are deleted")
     ap.add_argument("--workdir", help="job: local scratch for the catalog (default: system temp)")
     ap.add_argument("--loop", action="store_true",

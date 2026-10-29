@@ -138,6 +138,19 @@ def copy(url, dest_url):
     _client().copy_object(Bucket=dbucket, Key=dkey, CopySource={"Bucket": bucket, "Key": key})
 
 
+def prune(prefix_url, keep):
+    """Delete all but the newest `keep` objects under a prefix (catalog copies are named by
+    timestamp, so name order is time order). Returns the number deleted."""
+    bucket, prefix = _split(prefix_url.rstrip("/") + "/")
+    s3 = _client()
+    keys = sorted(o["Key"] for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix)
+                  for o in page.get("Contents", []))
+    old = keys[:max(len(keys) - keep, 0)]
+    for i in range(0, len(old), 1000):
+        s3.delete_objects(Bucket=bucket, Delete={"Objects": [{"Key": k} for k in old[i:i + 1000]], "Quiet": True})
+    return len(old)
+
+
 def main():
     if len(sys.argv) != 4 or sys.argv[1] not in ("get", "put"):
         sys.exit(__doc__)
