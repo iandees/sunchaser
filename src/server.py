@@ -55,11 +55,19 @@ WORKERS = concurrent.futures.ThreadPoolExecutor(int(env("MAX_QUERIES", "16")))  
 
 
 def open_lake():
-    con = duckdb.connect()
-    con.sql("SET parquet_metadata_cache = true")
-    lakeconn.attach(con, read_only=True, override_data_path=bool(env("DATA_PATH")))
-    con.sql(SQL_MACROS)
-    return con
+    for attempt in range(5):
+        con = duckdb.connect()
+        con.sql("SET parquet_metadata_cache = true")
+        try:
+            lakeconn.attach(con, read_only=True, override_data_path=bool(env("DATA_PATH")))
+        except duckdb.HTTPException as e:
+            # the updater replaced the catalog while we were reading it (its ETag changed): read it again
+            if "ETag" not in str(e) or attempt == 4:
+                raise
+            time.sleep(1)
+            continue
+        con.sql(SQL_MACROS)
+        return con
 
 
 def remote_catalog():
