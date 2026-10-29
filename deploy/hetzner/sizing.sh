@@ -28,14 +28,14 @@ for r in $REGIONS; do
   [ -f "$raw/manifest.json" ] || { echo "missing $raw/manifest.json"; exit 1; }
   [ -f "$work/sizing.json" ] && continue
   rm -rf "$work"; mkdir -p "$work"
-  du -sb "$raw"/*/ | awk '{n=$2; sub(".*/","",n); sub("/$","",n); printf "%s %s\n", n, $1}' > "$work/raw_sizes.txt"
+  for d in "$raw"/*/; do echo "$(basename "$d") $(du -sbL "$d" | cut -f1)"; done > "$work/raw_sizes.txt"
   env -u SUNCHASER_CATALOG -u SUNCHASER_DATA_PATH uv run python -I tools/measure.py --label "build-$name" \
       --watch "$work" -- uv run python -I src/build_lake.py --raw "$raw" --lake "$work/tmp" \
       --catalog "$work/catalog.ducklake" --data-path "$work/lake/data/" --lance "$work/lake/lance" \
       --group-rows 50000000 2>&1 | tee "$work/build.log"
   SUNCHASER_CATALOG="$work/catalog.ducklake" uv run python -I tools/measure.py --label "areas-$name" \
       -- uv run python -I src/build_areas.py --full 2>&1 | tee "$work/areas.log"
-  du -sb "$work/lake/data" "$work/lake/lance" | awk '{print $2, $1}' > "$work/lake_sizes.txt"
+  for d in data lance; do echo "$d $(du -sb "$work/lake/$d" | cut -f1)"; done > "$work/lake_sizes.txt"
   python3 - "$work" "$raw" <<'PY'
 import json, sys, pathlib
 work, raw = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
