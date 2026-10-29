@@ -69,19 +69,39 @@ def fetch(url, local):
     return r["ETag"]
 
 
+def compact(src, dst):
+    """Rewrite a DuckDB-format catalog into a fresh file. DuckDB never gives freed blocks back, and
+    the updater's deletes and rewrites leave a catalog mostly empty space (Minnesota's was 121 MB
+    holding 14 MB); readers need only the live content. `src` must not be attached elsewhere."""
+    import duckdb
+    if os.path.exists(dst):
+        os.remove(dst)
+    con = duckdb.connect()
+    try:
+        con.sql(f"ATTACH '{src}' AS old (READ_ONLY)")
+        con.sql(f"ATTACH '{dst}' AS new")
+        con.sql("COPY FROM DATABASE old TO new")
+    finally:
+        con.close()
+
+
 def push(local, url, etag):
-    """Upload the catalog if it is still the version `etag` (None: only if it doesn't exist yet).
-    Returns the new ETag; raises Conflict if another writer committed in between."""
+    """Upload the catalog, compacted, if it is still the version `etag` (None: only if it doesn't
+    exist yet). Returns the new ETag; raises Conflict if another writer committed in between."""
+    import tempfile
     from botocore.exceptions import ClientError
     bucket, key = _split(url)
     cond = {"IfMatch": etag} if etag else {"IfNoneMatch": "*"}
-    with open(local, "rb") as f:
-        try:
-            return _client().put_object(Bucket=bucket, Key=key, Body=f, **cond)["ETag"]
-        except ClientError as e:
-            if e.response["Error"]["Code"] in ("PreconditionFailed", "412", "ConditionalRequestConflict"):
-                raise Conflict(f"{url} changed since it was read (another writer committed)") from e
-            raise
+    with tempfile.TemporaryDirectory(dir=os.path.dirname(os.path.abspath(local))) as tmp:
+        small = os.path.join(tmp, "catalog.ducklake")
+        compact(local, small)
+        with open(small, "rb") as f:
+            try:
+                return _client().put_object(Bucket=bucket, Key=key, Body=f, **cond)["ETag"]
+            except ClientError as e:
+                if e.response["Error"]["Code"] in ("PreconditionFailed", "412", "ConditionalRequestConflict"):
+                    raise Conflict(f"{url} changed since it was read (another writer committed)") from e
+                raise
 
 
 def acquire_lease(url, ttl):
