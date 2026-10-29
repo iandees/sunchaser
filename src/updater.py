@@ -16,8 +16,6 @@ DuckLake transaction, so API readers see either the whole diff or none of it. Pe
      node_parent_ways, member_parent_rels, then advance state.osm_base / state.sequence
 """
 import argparse
-import gzip
-import io
 import pathlib
 import sys
 import time
@@ -102,42 +100,27 @@ def find_seq(kind, ts):
 
 def read_osc(blobs):
     """Newest version of each element across the diffs: {(type, id): dict}."""
+    import tempfile
     latest = {}
     for blob in blobs:
-        data = gzip.decompress(blob) if blob[:2] == b"\x1f\x8b" else blob
-        reader = osmium.io.Reader(osmium.io.FileBuffer(data, "osc"))
-        for o in osmium.OsmFileIterator(reader) if hasattr(osmium, "OsmFileIterator") else _iter(reader):
-            t = "n" if o.is_node() else "w" if o.is_way() else "r"
-            rec = {"id": o.id, "deleted": o.deleted, "version": o.version, "ts": o.timestamp,
-                   "changeset": o.changeset, "uid": o.uid, "user": o.user,
-                   "tags": [(tg.k, tg.v) for tg in o.tags]}
-            if t == "n" and not o.deleted:
-                rec["lat"], rec["lon"] = o.location.y, o.location.x
-            elif t == "w":
-                rec["nds"] = [n.ref for n in o.nodes]
-            elif t == "r":
-                rec["members"] = [{"type": m.type, "ref": m.ref, "role": m.role} for m in o.members]
-            old = latest.get((t, o.id))
-            if old is None or old["version"] <= rec["version"]:
-                latest[(t, o.id)] = rec
-        reader.close()
+        with tempfile.NamedTemporaryFile(suffix=".osc.gz" if blob[:2] == b"\x1f\x8b" else ".osc") as f:
+            f.write(blob)
+            f.flush()
+            for o in osmium.FileProcessor(f.name):
+                t = "n" if o.is_node() else "w" if o.is_way() else "r"
+                rec = {"id": o.id, "deleted": o.deleted, "version": o.version, "ts": o.timestamp,
+                       "changeset": o.changeset, "uid": o.uid, "user": o.user,
+                       "tags": [(tg.k, tg.v) for tg in o.tags]}
+                if t == "n" and not o.deleted:
+                    rec["lat"], rec["lon"] = o.location.y, o.location.x
+                elif t == "w":
+                    rec["nds"] = [n.ref for n in o.nodes]
+                elif t == "r":
+                    rec["members"] = [{"type": m.type, "ref": m.ref, "role": m.role} for m in o.members]
+                old = latest.get((t, o.id))
+                if old is None or old["version"] <= rec["version"]:
+                    latest[(t, o.id)] = rec
     return latest
-
-
-def _iter(reader):
-    buf = []
-
-    class H(osmium.SimpleHandler):
-        def node(self, n):
-            buf.append(osmium.osm.mutable.Node(n))
-
-        def way(self, w):
-            buf.append(osmium.osm.mutable.Way(w))
-
-        def relation(self, r):
-            buf.append(osmium.osm.mutable.Relation(r))
-    osmium.apply(reader, H())
-    return buf
 
 
 # ---- applying ----------------------------------------------------------------------------
@@ -439,10 +422,11 @@ def compact(con):
             print(f"{q:<90} skipped: {str(e).splitlines()[0][:80]}")
 
 
-def follow(up, once=False, poll=30):
-    """Catch up with day, then hour, then minute diffs; then poll the minutely feed."""
+def follow(up, once=False, poll=30, kinds=("hour", "minute")):
+    """Catch up with coarse diffs (hourly by default: a planet day diff is ~100 MB, too much to hold
+    in one batch), then minute diffs; then poll the minutely feed."""
     base = up.sql("SELECT value FROM lake.state WHERE key = 'osm_base'").fetchall()[0][0]
-    for kind in ("day", "hour", "minute"):
+    for kind in kinds:
         start, start_ts = find_seq(kind, base)
         if start_ts != base and kind != "minute":
             continue  # the lake isn't aligned to this granularity; try a finer one
