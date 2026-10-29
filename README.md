@@ -11,16 +11,19 @@ storage (S3, Cloudflare R2, or anything S3-compatible), kept current by a minute
 - **Updates:** a single-writer updater applies OSM replication diffs with the node → way → relation
   cascade. Each diff is one DuckLake transaction, so readers see whole diffs only.
 
-See [`docs/design.md`](docs/design.md) for the design and [`results/NOTES.md`](results/NOTES.md)
-for the measurements that shaped it.
+See [`docs/architecture.md`](docs/architecture.md) for how it works, [`docs/design.md`](docs/design.md)
+for the original design exploration, and [`results/NOTES.md`](results/NOTES.md) for the measurements
+that shaped it.
 
 ## Status
 
 | | |
 |---|---|
-| Differential test vs. a real Overpass (Berlin extract, 58 requests) | 57/58 element-identical. The one difference is Overpass's relation `out bb` for members missing from an extract |
-| QL coverage | Settings `[out:json\|xml\|csv]`, `[timeout]`, `[bbox]`; `node/way/rel/nwr/nw/nr/wr`; tag filters incl. regex and `,i`; `(bbox)`, `(id:…)`, `(.set)`, `(w)`, `(r[:role])`, `(bn)`, `(bw)`, `(br)`, `(around:…)`, `(around.set:…)`; unions, differences, named sets, `> >> < <<`; `out ids/skel/body/tags/meta/count` × `geom/bb/center` × `asc/qt`, limit, `noids` |
-| Not yet | Areas (`area`, `(area)`, `map_to_area`, `is_in`), `poly`, attic queries (`[date]`, `[diff]`, `[adiff]`, `changed`, `newer`), evaluators (`if:`, `make`, `convert`, `foreach`) |
+| Differential test vs. a real Overpass (Berlin extract) | See `results/overpass_diff*.json`. At the extract snapshot: 57/58 element-identical. The one difference is Overpass's relation `out bb` when members are missing from an extract |
+| Overpass Turbo | The real overpass-turbo.eu loads and renders results from the service (`tools/turbo_check.js`, `results/turbo.png`) |
+| Live updates | The updater follows OSMF replication (hourly catch-up, then minutely) with the node → way → relation cascade. Readers stay consistent while it commits |
+| QL coverage | Settings `[out:json\|xml\|csv]`, `[timeout]`, `[bbox]`; `node/way/rel/nwr/nw/nr/wr/area`; tag filters incl. regex and `,i`; `(bbox)`, `(id:…)`, `(.set)`, `(w)`, `(r[:role])`, `(bn)`, `(bw)`, `(br)`, `(around:…)`, `(around.set:…)`, `(poly:…)`, `(area[.x])`, `(pivot[.x])`, `(if: …)` evaluators; unions, differences, named sets, `> >> < <<`, `foreach`, `map_to_area`, `is_in`; `out ids/skel/body/tags/meta/count` × `geom[(bbox)]/bb/center` × `asc/qt`, limit, `noids` |
+| Not yet | Attic queries (`[date]`, `[diff]`, `[adiff]`, `changed`, `newer`, `timeline`, `retro`), `make`/`convert`/`for`/`complete`/`compare`/`if` blocks, antimeridian-crossing boxes |
 
 ## Layout
 
@@ -30,7 +33,10 @@ for the measurements that shaped it.
 | `src/ql.py` | Overpass QL parser and executor |
 | `src/output.py` | `out` statement and the JSON/XML/CSV writers |
 | `src/engine.py` | Overpass statement semantics over DuckDB; DuckLake or Lance element access |
-| `src/updater.py` | Replication follower: catch-up then minutely; `compact` for maintenance |
+| `src/updater.py` | Replication follower: catch-up then minutely; areas rebuild, `compact`, frozen-catalog `publish` |
+| `src/publish.py` | Frozen DuckLake publishing: a read-only catalog file on S3/R2 for stateless readers |
+| `src/build_areas.py` | Overpass's area rules: `lake.areas` from multipolygon/boundary relations |
+| `src/evaluator.py` | `(if: …)` evaluator expressions |
 | `src/build_lake.py` | Raw Parquet → DuckLake tables with Overpass keys |
 | `src/extract.py`, `rust/osm-extract` | PBF → raw Parquet (Python reference / 23× faster Rust) |
 | `src/quadtile.py` | Exact port of Overpass's index math (fuzz-tested against the C++ header) |
