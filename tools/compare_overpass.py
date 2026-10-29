@@ -21,7 +21,7 @@ import duckdb  # noqa: E402
 import lakeconn  # noqa: E402
 import ql  # noqa: E402
 from engine import Engine  # noqa: E402
-from ql_corpus import QL  # noqa: E402
+from ql_corpus import QL, QL_HISTORY  # noqa: E402
 
 
 def norm(v):
@@ -116,13 +116,15 @@ def main():
     ap.add_argument("--db-dir", default="/home/user/overpass-db")
     ap.add_argument("--only", nargs="*")
     ap.add_argument("--out", default="results/overpass_diff.json")
+    ap.add_argument("--history", action="store_true",
+                    help="also run the attic queries (reference loaded with --keep-attic, same diffs replayed)")
     ap.add_argument("--global-bbox", help="s,w,n,e: inject [bbox:...] into every request (a regional lake "
                                           "compared with a reference holding planet-wide updates)")
     args = ap.parse_args()
     con = duckdb.connect()
     lakeconn.attach(con, read_only=True)
     rows, ok = [], 0
-    for name, query in QL:
+    for name, query in QL + (QL_HISTORY if args.history else []):
         if args.only and name not in args.only:
             continue
         if args.global_bbox and "[bbox:" not in query:
