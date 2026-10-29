@@ -25,7 +25,7 @@ use roaring::RoaringTreemap;
 use crate::Args;
 use crate::history::{Pipeline, Version, dense_version, node_version, rel_version, way_version};
 
-const CHUNK_BLOBS: usize = 256;
+const CHUNK_BLOBS: usize = 64;
 
 struct Region {
     name: String,

@@ -1,0 +1,4 @@
+# /etc/caddy/Caddyfile: TLS in front of the API. Replace the host name.
+overpass.example.org {
+    reverse_proxy 127.0.0.1:8080
+}

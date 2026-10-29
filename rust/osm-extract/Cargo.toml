@@ -7,6 +7,7 @@ edition = "2024"
 anyhow = "1.0.104"
 arrow = { version = "60.1.0", default-features = false }
 memmap2 = "0.9"
+mimalloc = "0.1.52"
 osmpbf = "0.3.8"
 parquet = { version = "60.1.0", default-features = false, features = ["arrow", "zstd"] }
 rayon = "1.12.0"

@@ -23,6 +23,11 @@
 //! locations stored, then way and relation blocks are built in parallel. This relies on the PBF being
 //! sorted by type then id (checked), as planet files and extracts are.
 
+// glibc's per-thread arenas fragment badly under parallel decoding of large blocks (RSS grew
+// without bound on the planet); mimalloc keeps it flat.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod cut;
 mod history;
 mod quadtile;
@@ -476,13 +481,18 @@ fn props() -> Result<WriterProperties> {
         .build())
 }
 
-/// One lazily created Parquet file per bucket; buckets are written in parallel.
+/// One lazily created Parquet file per bucket; buckets are written in parallel. Each open file
+/// buffers its current row group in memory, so with thousands of buckets the buffers, not the data,
+/// decide the memory use: past WRITER_BUDGET bytes per table the largest buffers are flushed early
+/// (smaller row groups in the raw files, bounded memory at any scale).
 struct Buckets {
     dir: PathBuf,
     schema: Arc<Schema>,
     writers: Vec<Mutex<Option<ArrowWriter<File>>>>,
     rows: Vec<Mutex<u64>>,
 }
+
+static WRITER_BUDGET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(256 << 20);
 
 impl Buckets {
     fn new(dir: PathBuf, schema: Arc<Schema>, n: usize) -> Result<Self> {
@@ -523,7 +533,35 @@ impl Buckets {
                 pieces.entry(b).or_default().push(piece);
             }
         }
-        pieces.into_par_iter().try_for_each(|(b, ps)| ps.iter().try_for_each(|p| self.write(b, p)))
+        pieces.into_par_iter().try_for_each(|(b, ps)| ps.iter().try_for_each(|p| self.write(b, p)))?;
+        self.limit_memory()
+    }
+
+    fn limit_memory(&self) -> Result<()> {
+        let budget = WRITER_BUDGET.load(std::sync::atomic::Ordering::Relaxed);
+        let mut sizes: Vec<(usize, usize)> = Vec::new();
+        let mut total = 0;
+        for (i, w) in self.writers.iter().enumerate() {
+            if let Some(w) = w.lock().unwrap().as_ref() {
+                let m = w.memory_size();
+                total += m;
+                if m > 0 {
+                    sizes.push((m, i));
+                }
+            }
+        }
+        if total <= budget {
+            return Ok(());
+        }
+        sizes.sort_unstable_by(|a, b| b.cmp(a));
+        for (m, i) in sizes {
+            if total <= budget / 2 {
+                break;
+            }
+            self.writers[i].lock().unwrap().as_mut().unwrap().flush()?;
+            total -= m;
+        }
+        Ok(())
     }
 
     /// Close all files; a table with no rows still gets one empty file so its schema is known.
@@ -644,6 +682,7 @@ fn parse_args() -> Result<Args> {
             "--max-node-id" => a.max_node_id = val("--max-node-id")?.parse()?,
             "--max-way-id" => a.max_way_id = val("--max-way-id")?.parse()?,
             "--history" => a.history = true,
+            "--writer-mem-mb" => WRITER_BUDGET.store(val("--writer-mem-mb")?.parse::<usize>()? << 20, std::sync::atomic::Ordering::Relaxed),
             "--cut" => a.cuts.push(val("--cut")?),
             _ if arg.starts_with("--") => bail!("unknown option {arg}"),
             _ => pos.push(arg),
@@ -652,7 +691,7 @@ fn parse_args() -> Result<Args> {
     // every bucket of the four bucketed tables is an open file until the end: 4 << 12 at most
     if pos.len() != 2 || !(1..=12).contains(&a.bucket_bits) {
         bail!("usage: osm-extract <input.osm.pbf | - for stdin> <out-dir> [--bucket-bits 1..12 (8)] \
-               [--dense-index DIR [--max-node-id N] [--max-way-id N]] [--history [--cut name:s,w,n,e ...]]");
+               [--dense-index DIR [--max-node-id N] [--max-way-id N]] [--history [--cut name:s,w,n,e ...]] [--writer-mem-mb N (256, per table)]");
     }
     a.input = PathBuf::from(&pos[0]);
     a.out = PathBuf::from(&pos[1]);
