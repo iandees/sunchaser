@@ -612,7 +612,7 @@ class Executor:
     def _area_set(self, ids):
         if not ids:
             return self.e._new("SELECT NULL::VARCHAR AS type, NULL::BIGINT AS id WHERE false")
-        return self.e._new(f"SELECT 'a' AS type, unnest([{','.join(map(str, ids))}]::BIGINT[]) AS id")
+        return self.e.id_set("a", ids)
 
     @staticmethod
     def _meet(ids, cand):

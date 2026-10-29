@@ -202,17 +202,30 @@ class Engine:
                 out.append([v, v + 1])
         return [tuple(r) for r in out]
 
+    def _ids_table(self, ids):
+        """Temp table of ids, loaded through Arrow: pasting tens of thousands of literals into SQL
+        costs about a second of parsing per statement."""
+        import pyarrow as pa
+        name = f"ids{next(self._ids)}"
+        self.con.register(f"{name}_arrow", pa.table({"id": pa.array(list(ids), type=pa.int64())}))
+        self._sql(f"CREATE OR REPLACE TEMP TABLE {name} AS SELECT id FROM {name}_arrow")
+        self.con.unregister(f"{name}_arrow")
+        return name
+
     def _id_pred(self, col, ids):
         """Exact membership via a hash semi-join on a temp table, plus coalesced ranges so the
         Parquet scan can skip row groups (a subquery alone only pushes down min/max)."""
         if not ids:
             return "false"
-        name = f"ids{next(self._ids)}"
-        self._sql(f"CREATE OR REPLACE TEMP TABLE {name} AS SELECT unnest([{','.join(map(str, ids))}]::BIGINT[]) AS id")
+        name = self._ids_table(ids)
         pred = f"{col} IN (SELECT id FROM {name})"
         if self.mode == "lake":
             pred = f"{self._ranges_sql(col, self._value_ranges(ids))} AND {pred}"
         return pred
+
+    def id_set(self, t, ids):
+        """A set table holding the given ids of type t."""
+        return self._new(f"SELECT '{t}' AS type, id FROM {self._ids_table(ids)}")
 
     def _materialize_ids(self, sql):
         """Run an id-producing query once; returns a sorted list of ids."""
@@ -495,8 +508,7 @@ class Engine:
             return [f"id IN ({','.join(map(str, ids))})"], []
         keycol = "qt" if t == "n" else "qt_key31"
         keys = [k >> 1 for k, _ in rows] if t == "n" else [k for k, _ in rows]
-        name = f"ids{next(self._ids)}"
-        self._sql(f"CREATE OR REPLACE TEMP TABLE {name} AS SELECT unnest([{','.join(map(str, ids))}]::BIGINT[]) AS id")
+        name = self._ids_table(ids)
         return [self._ranges_sql(keycol, self._value_ranges(keys))], [f"id IN (SELECT id FROM {name})"]
 
     def _locator_pred(self, t, ids, col=None):
@@ -724,7 +736,7 @@ class Engine:
                 if ids:
                     rel_ids |= set(self._materialize_ids(
                         f"SELECT rel_id FROM lake.member_parent_rels WHERE mtype = '{mt}' AND {self._id_pred('mid', ids)}"))
-            return f"SELECT 'r' AS type, unnest([{','.join(map(str, sorted(rel_ids)))}]::BIGINT[]) AS id"
+            return f"SELECT 'r' AS type, id FROM {self._ids_table(sorted(rel_ids))}"
         return (f"SELECT DISTINCT 'r' AS type, r.id FROM (SELECT id, unnest(members, recursive := true) FROM {self.t['r']}) r "
                 f"JOIN {member_set} x ON x.type = r.type AND x.id = r.ref")
 
