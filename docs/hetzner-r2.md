@@ -26,7 +26,7 @@ planet totals, plus three regional full-history lakes scaled up. Times are still
 | Peak extra disk during the run | not measured | 64 GB (94 GB used, 30 GB before) | n/a |
 | Peak RSS, extract / build | not measured | 67.5 GB / 109.8 GB | n/a |
 
-Times scale linearly with the input size. Germany's build peaked at 110 GB of the box's 125 GB RAM with `--group-rows 100000000`, which leaves little headroom. A lower `--group-rows` (50 M) should reduce it, but that has not been measured.
+Times scale linearly with the input size. Germany's build peaked at 110 GB of the box's 125 GB RAM with `--group-rows 100000000`, which leaves little headroom. A lower `--group-rows` does reduce it: on Minnesota the build peaked at 6.6 GB with 100 M and 3.8 GB with 2 M (one group per table versus 3–5), at the cost of more sorts. Germany with a lower value has not been run.
 
 Minnesota was then published to R2 (the lake copied in 4 min 39 s) and kept current by the updater service: one batch of 14–30 minutely diffs takes 340–570 s, about 12 s per diff with areas and Lance maintenance, which is faster than real time.
 
@@ -169,8 +169,14 @@ curl -sSf https://osm-planet-eu-central-1.s3.dualstack.eu-central-1.amazonaws.co
 ```
 
 ```bash
-curl -sSf https://osm-planet-eu-central-1.s3.dualstack.eu-central-1.amazonaws.com/$F | tee >(md5sum > /data/pbf.md5) | rust/osm-extract/target/release/osm-extract - /data/raw --history --bucket-bits 12 --dense-index /data/idx 2>&1 | tee /data/extract.log
+SIZE=$(curl -sSfI https://osm-planet-eu-central-1.s3.dualstack.eu-central-1.amazonaws.com/$F | awk 'tolower($1) == "content-length:" {print $2 + 0}')
 ```
+
+```bash
+curl -sSf https://osm-planet-eu-central-1.s3.dualstack.eu-central-1.amazonaws.com/$F | tee >(md5sum > /data/pbf.md5) | rust/osm-extract/target/release/osm-extract - /data/raw --history --bucket-bits 12 --dense-index /data/idx --input-size $SIZE 2>&1 | tee /data/extract.log
+```
+
+- **Progress:** every 30 s the extractor prints a line with the input read, its share and ETA (`--input-size`; a file's size is known without it), the rate, resident and peak memory, and the counts so far.
 
 - **Checksum:** compare `/data/pbf.md5` with the published `.md5`. If they differ, or the download breaks, start the extract again.
 - **Disk headroom:** if there is room, downloading first (`curl -o`) makes a restart cheaper.
@@ -190,6 +196,7 @@ uv run python src/build_lake.py --raw /data/raw --lake /data/build --catalog /da
 
 - **Upload:** Parquet goes straight to R2. 1 Gbit is about 400 GB an hour, faster than the build produces it.
 - **`--consume`:** deletes each raw bucket once the last table that needs it is built; `build.log` reports the GB freed.
+- **Progress:** each table's line ends with the process's peak memory so far, and a table sorted in many groups prints a line at most every 30 s (`lake.X: group 12/40 done`). The log is line-buffered, so `| tee build.log` shows it live.
 - **`--group-rows`:** sets how many rows each sort holds. 100 M suits 64–128 GB of RAM; use 50 M with 48 GB.
 - **`--lance`:** optional. It adds 490–550 GB in R2 (about 2× the current tables it copies) for queries 1.54× faster, mostly recursion and id lookups.
 
@@ -221,7 +228,7 @@ EnvironmentFile=/etc/sunchaser.env
 Environment=HOME=/root
 LimitNOFILE=65536
 WorkingDirectory=/data/sunchaser
-ExecStart=/data/sunchaser/.venv/bin/python src/updater.py job --loop --catalog-url ${LAKE}/catalog.ducklake --workdir /data/updater --max-seconds 300 --compact-every 3600
+ExecStart=/data/sunchaser/.venv/bin/python src/updater.py job --loop --catalog-url ${LAKE}/catalog.ducklake --workdir /data/updater --max-seconds 300 --compact-every 3600 --upload-every 120
 Restart=always
 RestartSec=30
 TimeoutStopSec=600
@@ -241,6 +248,9 @@ journalctl -u sunchaser-updater -f
 - **Not `uv run`:** the unit runs the venv's Python directly. Under `uv run`, SIGTERM stops `uv` and the Python child is killed before its cleanup, so the writer lease is never released and a restart waits out its TTL (measured). The API unit can keep `uv run`: it holds no lease.
 - **Catalog uploads:** each commit uploads the catalog once, compacted first (`objcatalog.compact`): DuckDB files never shrink, and the updater's churn left Minnesota's at 121 MB with 14 MB live, so the upload is 13.6 MB. At the live edge the updater commits once per minute-diff (≈ 20 per hour), so this is what keeps the uploads small. A catalog straight from `build_areas.py --full` can hold the areas inlined (Germany's: 435 MB, 422 MB of it area geometry, 6 MB once flushed to Parquet and rewritten); the updater's first hourly compaction flushes them, and its commits after that are small.
 - **`HOME`:** systemd units have none, and DuckDB needs it to find its extensions; without `Environment=HOME=/root` the service exits at once with "Can't find the home directory".
+- **`--upload-every N`:** upload the catalog at most every N seconds (default 0: after every batch). The updater keeps applying diffs in between; a crash loses only the batches since the last upload, and the next start applies them again. Readers see the lake at most N seconds (plus one poll) late. 120 here, with the 13.6 MB compacted catalog.
+- **Compaction in steps:** the hourly compaction (flush, merge, rewrite, expire, clean up, one Lance table at a time) runs one step per cycle, so diffs keep flowing between steps instead of waiting for the whole thing. A one-shot `job` (no `--loop`) still runs all the steps at once.
+- **Stopping:** SIGTERM makes the updater finish the diff in hand, upload what is pending, release the lease and exit, so `systemctl restart` loses nothing. A long step (a Lance merge) delays that; `TimeoutStopSec=600` is the backstop.
 - **`--keep-versions [N]`:** copies the whole catalog to `lake/catalogs/` after every commit (≈ 117 MiB each for Minnesota, a copy every 6 minutes) and keeps only the newest N (default 24). Without a limit that was ≈ 28 GB a day, so keep N small, and larger lakes have larger catalogs. Off in the sample unit.
 - **`--region`:** for a regional lake add `--region s,w,n,e` (the extract's bounding box, from `osmium fileinfo`), or the updater applies the whole planet's edits.
 

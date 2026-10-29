@@ -36,10 +36,11 @@ done_() { touch "$DATA/state/$1.done"; }
 
 if stage extract; then
   rm -rf "$DATA/raw" "$DATA/idx"
+  size=$(curl -sSfI "$PLANET_URL" | awk 'tolower($1) == "content-length:" {print $2 + 0}')  # for % and ETA in the progress lines
   $M --label extract --watch "$DATA/raw" --watch "$DATA/idx" -- bash -c \
     "set -o pipefail; uv run python -I tools/fetch_parallel.py '$PLANET_URL' --threads $THREADS 2>'$DATA/logs/fetch.log' \
      | tee >(md5sum > '$DATA/logs/planet.md5') \
-     | $X - '$DATA/raw' --history --bucket-bits $BUCKET_BITS --writer-mem-mb $WRITER_MEM_MB --dense-index '$DATA/idx'" 2>&1 | tee "$DATA/logs/extract.log"
+     | $X - '$DATA/raw' --history --bucket-bits $BUCKET_BITS --writer-mem-mb $WRITER_MEM_MB --dense-index '$DATA/idx' --input-size ${size:-0}" 2>&1 | tee "$DATA/logs/extract.log"
   expected=$(curl -sSf "$PLANET_URL.md5" | cut -d' ' -f1)
   got=$(cut -d' ' -f1 "$DATA/logs/planet.md5")
   [ "$expected" = "$got" ] || { echo "md5 mismatch ($got, expected $expected): re-run"; exit 1; }
