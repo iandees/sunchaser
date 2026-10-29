@@ -11,6 +11,7 @@ Supported:
   evaluators   (if: ...) with t[], is_tag, count_tags, count_members, id, type, length, is_closed, number,
                is_number, arithmetic, comparisons, && || ! ?:  (src/evaluator.py)
   foreach      foreach[.src][->.var](...); and {...}
+  attic        [date:"T"] (history since the lake was built), (newer:"T"), (changed:"T1"[,"T2"])
   blocks       ( ... ) union, ( a; - b; ) difference, "-> .name" on every statement
   recursion    > >> < <<  (optionally ".set >")
   item         .set;
@@ -46,6 +47,8 @@ class Query:
     pivots: list = field(default_factory=list)       # (pivot) / (pivot.x) set names
     poly: list | None = None                         # (poly:"lat lon ...") vertices
     ifs: list = field(default_factory=list)          # (if: ...) evaluator source texts
+    newer: str | None = None                         # (newer:"T")
+    changed: tuple | None = None                     # (changed[:"T1"[,"T2"]])
     into: str = "_"
     line: int = 0
 
@@ -113,7 +116,7 @@ class Script:
 TYPE_WORDS = {"node": "n", "way": "w", "rel": "r", "relation": "r", "nwr": "nwr", "nw": "nw", "nr": "nr", "wr": "wr",
               "area": "a"}
 UNSUPPORTED = {"if", "for", "complete", "retro", "compare", "make", "convert", "timeline",
-               "local", "derived", "changed", "newer"}
+               "local", "derived"}
 
 
 class Parser:
@@ -248,11 +251,19 @@ class Parser:
                 self.expect(",")
                 v.append(float(self.number()))
             settings["bbox"] = Bbox(v[0], v[1], v[2], v[3])
-        elif key in ("date", "diff", "adiff"):
-            raise QLError(f"line {self.line()}: static error: [{key}:...] (attic data) is not supported yet.")
+        elif key == "date":
+            settings["date"] = self.iso_date()
+        elif key in ("diff", "adiff"):
+            raise QLError(f"line {self.line()}: static error: [{key}:...] is not supported yet.")
         else:
             self.err(f"unknown setting '{key}'")
         self.expect("]")
+
+    def iso_date(self):
+        v = self.string()
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", v):
+            self.err(f"date must look like \"2026-10-25T12:00:00Z\", got \"{v}\"")
+        return v
 
     def csv_spec(self):
         self.expect("(")
@@ -554,7 +565,17 @@ class Parser:
                 if len(nums) < 6 or len(nums) % 2:
                     self.err("poly needs at least three \"lat lon\" pairs")
                 q.poly = list(zip(nums[0::2], nums[1::2]))
-            elif w in ("user", "uid", "newer", "changed", "user_touched"):
+            elif w == "newer":
+                self.expect(":")
+                q.newer = self.iso_date()
+            elif w == "changed":
+                t1 = t2 = None
+                if self.eat(":"):
+                    t1 = self.iso_date()
+                    if self.eat(","):
+                        t2 = self.iso_date()
+                q.changed = (t1, t2)
+            elif w in ("user", "uid", "user_touched"):
                 raise QLError(f"line {self.line()}: static error: the filter '({w}...)' is not supported yet.")
             else:
                 self.err(f"unknown filter '{w}'")
@@ -577,8 +598,11 @@ class Executor:
         doc = Document(fmt=st.get("out", "xml"), csv=st.get("csv"), timestamp=self.timestamp,
                        json_callback=json_callback)
         self.global_bbox = st.get("bbox")
+        self.settings = st
         self.sets = {"_": self.e._new("SELECT NULL::VARCHAR AS type, NULL::BIGINT AS id WHERE false")}
-        doc.with_areas = self.e.has_areas()
+        if st.get("date"):
+            self.e.set_date(st["date"])
+        doc.with_areas = self.e.has_areas() and not st.get("date")
         self.doc = doc
         for stmt in script.body:
             self.exec(stmt)
@@ -651,6 +675,13 @@ class Executor:
                 ids = self._meet(ids, cand)
             for src in q.pivots:
                 ids = self._meet(ids, e.pivot_ids(self.get(src), t))
+            if q.newer is not None and t != "a":
+                ids = self._meet(ids, e.newer_ids(t, q.newer))
+            if q.changed is not None and t != "a":
+                t1, t2 = q.changed
+                if t1 is None:  # (changed) takes its range from [diff:...]/[date:...]
+                    t1 = self.settings.get("date") or self._missing_changed_range(q)
+                ids = self._meet(ids, e.changed_ids(t, t1, t2))
             bbox = q.bbox
             if self.global_bbox is not None and bbox is None:
                 bbox = self.global_bbox
@@ -682,6 +713,10 @@ class Executor:
         if not parts:
             return e._new("SELECT NULL::VARCHAR AS type, NULL::BIGINT AS id WHERE false")
         return e._new(" UNION ALL ".join(parts))
+
+    @staticmethod
+    def _missing_changed_range(q):
+        raise QLError(f"line {q.line}: static error: (changed) needs a date: (changed:\"T\") or a [date:] setting.")
 
     def _apply_ifs(self, t, cand, exprs):
         """(if: ...) filters, evaluated per element in Python on the candidates of the other filters."""

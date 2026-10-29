@@ -157,6 +157,51 @@ class Engine:
         else:
             self.t = {k: f"lake.{v}" for k, v in TABLE.items()}
 
+    # ---- attic ([date:...]) ----------------------------------------------------
+
+    date = None
+
+    @property
+    def indexed(self):
+        """Present-only indexes (tag postings, locator, reverse member indexes) are usable."""
+        return self.mode == "lake" and self.date is None
+
+    def _date_lit(self):
+        return f"TIMESTAMPTZ '{self.date}'"
+
+    def set_date(self, ts):
+        """Answer as of ts: current rows valid then plus history rows covering it (Overpass's attic
+        semantics: an element without history exists from its version timestamp on)."""
+        if self.mode != "lake":
+            raise ValueError("[date:] needs a lake")
+        self.date = ts
+        d = self._date_lit()
+        cols = {"n": "qt, id, lat, lon, tags",
+                "w": "qt_key31, qt_level, qt, id, min_lat, max_lat, min_lon, max_lon, tags, nds, nd_lat, nd_lon",
+                "r": "qt_key31, qt_level, qt, id, min_lat, max_lat, min_lon, max_lon, tags, members"}
+        for t, name in (("n", "nodes"), ("w", "ways"), ("r", "relations")):
+            self.t[t] = (f"(SELECT {cols[t]} FROM lake.{name} WHERE valid_from <= {d} UNION ALL "
+                         f"SELECT {cols[t]} FROM lake.{name}_history WHERE valid_from <= {d} AND valid_to > {d})")
+        self.plan.use_postings = False
+        self.plan.locator = False
+        self.lance = None
+
+    def newer_ids(self, t, ts):
+        """(newer:"T"): elements whose version timestamp is after T."""
+        name = {"n": "nodes", "w": "ways", "r": "relations"}[t]
+        return self._materialize_ids(f"SELECT id FROM lake.{name}_meta WHERE ts > TIMESTAMPTZ '{ts}'")
+
+    def changed_ids(self, t, t1, t2=None):
+        """(changed:"T1"[,"T2"]): elements with any change (version, deletion, or geometry) in (T1, T2]."""
+        upper = f" AND ts <= TIMESTAMPTZ '{t2}'" if t2 else ""
+        return self._materialize_ids(
+            f"SELECT DISTINCT id FROM lake.changes WHERE type = '{t}' AND ts > TIMESTAMPTZ '{t1}'{upper}")
+
+    def history_start(self):
+        """Earliest time attic queries can answer for (the lake's build snapshot)."""
+        rows = self._sql("SELECT min(ts) FROM lake.changes").fetchall()
+        return rows[0][0]
+
     # ---- set plumbing ------------------------------------------------------
 
     trace = None  # optional callable(label, fn) used by the profiler
@@ -302,7 +347,7 @@ class Engine:
         if t == "a":
             return self._query_areas(bbox, filters, ids, within)
         tbl = self.t[t]
-        if t == "n" and self.mode == "lake" and any(f.op in self.NEEDS_TAG for f in filters):
+        if t == "n" and self.indexed and any(f.op in self.NEEDS_TAG for f in filters):
             tbl = "lake.nodes_tagged"
         push, local = [], [f.sql() for f in filters]
         cols = ["id", "tags"]
@@ -342,6 +387,8 @@ class Engine:
     # ---- areas (statements/area_query.cc, map_to_area.cc, coord_query.cc, pivot.cc) ----
 
     def _query_areas(self, bbox, filters, ids, within):
+        if self.date is not None:
+            raise ValueError("areas are not available for [date:] queries")
         where = [f.sql() for f in filters]
         for w in ([within] if isinstance(within, str) else (within or [])):
             where.append(f"id IN (SELECT id FROM {w} WHERE type = 'a')")
@@ -582,6 +629,8 @@ class Engine:
         if not ids:
             return {}
         ids = sorted(set(ids))
+        if self.date is not None:
+            return self._meta_attic(t, ids)
         tbl = self.META_TABLE[t] if self.mode == "lake" else self.t[t]
         where = self._id_pred("id", ids)
         if self.mode == "lake":
@@ -590,9 +639,21 @@ class Engine:
         rows = self._sql(f'SELECT id, version, ts, changeset, uid, "user" FROM {tbl} WHERE {where}').fetchall()
         return {r[0]: r[1:] for r in rows}
 
+    def _meta_attic(self, t, ids):
+        """Metadata of the versions valid at self.date: history rows first, else the current version."""
+        name = {"n": "nodes", "w": "ways", "r": "relations"}[t]
+        out = {r[0]: r[1:] for r in self._sql(
+            f'SELECT id, version, ts, changeset, uid, "user" FROM lake.{name}_history '
+            f"WHERE valid_from <= {self._date_lit()} AND valid_to > {self._date_lit()} AND {self._id_pred('id', ids)}").fetchall()}
+        rest = [i for i in ids if i not in out]
+        if rest:
+            out.update((r[0], r[1:]) for r in self._sql(
+                f'SELECT id, version, ts, changeset, uid, "user" FROM lake.{name}_meta WHERE {self._id_pred("id", rest)}').fetchall())
+        return out
+
     def sort_keys(self, t, ids):
         """id -> Overpass index (for `out qt`)."""
-        if self.mode == "lake":
+        if self.indexed:
             self._locator_pred(t, sorted(set(ids)))
             return {i: self._locator_memo[t].get(i) or 0 for i in ids}
         return {i: 0 for i in ids}
@@ -725,7 +786,7 @@ class Engine:
         node_ids = self._ids_of(s, "n")
         if not node_ids:
             return []
-        if self.mode == "lake":
+        if self.indexed:
             return self._materialize_ids(
                 f"SELECT way_id FROM lake.node_parent_ways WHERE {self._id_pred('node_id', node_ids)}")
         return self._materialize_ids(
@@ -737,7 +798,7 @@ class Engine:
         if not ids:
             return []
         role_pred = f" AND role = {sq(role)}" if role is not None else ""
-        if self.mode == "lake" and role is None:
+        if self.indexed and role is None:
             return self._materialize_ids(
                 f"SELECT rel_id FROM lake.member_parent_rels WHERE mtype = '{mtype}' AND {self._id_pred('mid', ids)}")
         return self._materialize_ids(
@@ -756,7 +817,7 @@ class Engine:
 
     def _parent_rels(self, member_set):
         """Relations having any (type, id) of the set table member_set as a member (collect_relations)."""
-        if self.mode == "lake":
+        if self.indexed:
             rel_ids = set()
             for mt in "nwr":
                 ids = self._ids_of(member_set, mt)
@@ -780,7 +841,7 @@ class Engine:
             cur = nxt
 
     def _up(self, s, closure):
-        if self.mode == "lake":
+        if self.indexed:
             node_ids = self._ids_of(s, "n")
             way_ids = self._materialize_ids(
                 f"SELECT way_id FROM lake.node_parent_ways WHERE {self._id_pred('node_id', node_ids)}") if node_ids else []

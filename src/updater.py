@@ -192,18 +192,38 @@ class Updater:
         moved = [i for i, r in nodes.items() if i in ex["n"]]
         cascade_w = set()
         if moved:
-            cascade_w = {w for (w,) in self.sql(
-                f"SELECT DISTINCT way_id FROM lake.node_parent_ways WHERE {self.e._id_pred('node_id', sorted(moved))}").fetchall()}
+            pairs = self.sql(f"SELECT DISTINCT node_id, way_id FROM lake.node_parent_ways "
+                             f"WHERE {self.e._id_pred('node_id', sorted(moved))}").fetchall()
+            cascade_w = {w for _, w in pairs}
+            way_moves = {}
+            for n, w in pairs:
+                way_moves.setdefault(w, []).append(nodes[n]["ts"])
+        else:
+            way_moves = {}
         cascade_w -= set(ways)
         geo_ways = set(ways) | cascade_w
-        cascade_r = set()
+        # change time per element (valid_from of the new row, valid_to of the replaced one): its own version
+        # timestamp, or for geometry-only changes the latest move that caused it
+        ct = {("n", i): r["ts"] for i, r in nodes.items()}
+        ct.update((("w", i), r["ts"]) for i, r in ways.items())
+        ct.update((("r", i), r["ts"]) for i, r in rels.items())
+        for w, times in way_moves.items():
+            ct[("w", w)] = max(times + ([ct[("w", w)]] if ("w", w) in ct else []))
+        cascade_r, rel_moves = set(), {}
         for mt, ids in (("n", [i for i in nodes if i in ex["n"]]), ("w", sorted(geo_ways))):
             if ids:
-                cascade_r |= {r for (r,) in self.sql(
-                    f"SELECT DISTINCT rel_id FROM lake.member_parent_rels WHERE mtype = '{mt}' AND {self.e._id_pred('mid', sorted(ids))}").fetchall()}
+                for mid, rel in self.sql(f"SELECT DISTINCT mid, rel_id FROM lake.member_parent_rels WHERE mtype = '{mt}' "
+                                         f"AND {self.e._id_pred('mid', sorted(ids))}").fetchall():
+                    cascade_r.add(rel)
+                    if (mt, mid) in ct:
+                        rel_moves.setdefault(rel, []).append(ct[(mt, mid)])
         cascade_r -= set(rels)
+        for r_, times in rel_moves.items():
+            ct[("r", r_)] = max(times + ([ct[("r", r_)]] if ("r", r_) in ct else []))
+        self.change_time = ct
 
         # 3. stage new rows in build-compatible temp tables
+        self.batch = {"n": nodes}
         self._stage_nodes(nodes)
         self._stage_ways(ways, cascade_w)
         self._stage_relations(rels, cascade_r)
@@ -344,15 +364,56 @@ class Updater:
 
     # -- rewrite
 
-    def _del(self, table, t, ids, keycol, idcol="id", keys=None):
-        """DELETE rows of ids, pruned by their known index keys (tables are sorted by key)."""
-        if not ids:
-            return
+    def _where(self, t, ids, keycol, idcol="id", keys=None):
+        """Predicate selecting rows of ids, pruned by their known index keys (tables are sorted by key)."""
         pred = self.e._id_pred(idcol, sorted(ids))
         if keys:
             vals = [qt.key31(k) if keycol == "qt_key31" or (keycol == "k" and t != "n") else k for k in keys]
             pred = self.e._ranges_sql(keycol, self.e._value_ranges(vals)) + " AND " + pred
-        self.sql(f"DELETE FROM lake.{table} WHERE {pred}")
+        return pred
+
+    def _del(self, table, t, ids, keycol, idcol="id", keys=None):
+        if ids:
+            self.sql(f"DELETE FROM lake.{table} WHERE {self._where(t, ids, keycol, idcol, keys)}")
+
+    def _archive(self, t, ids, keys):
+        """Copy the outgoing versions of ids, with their metadata, into the history table."""
+        if not ids:
+            return
+        meta = f"(SELECT * FROM lake.{ {'n': 'nodes', 'w': 'ways', 'r': 'relations'}[t]}_meta WHERE {self._where(t, ids, 'k', keys=keys)})"
+        if t == "n":
+            cur = (f"(SELECT * FROM lake.nodes_tagged WHERE {self._where('n', ids, 'qt', keys=keys)} UNION ALL "
+                   f"SELECT * FROM lake.nodes_untagged WHERE {self._where('n', ids, 'qt', keys=keys)})")
+            hist = "nodes_history"
+        else:
+            hist = {"w": "ways_history", "r": "relations_history"}[t]
+            cur = f"(SELECT * FROM lake.{ {'w': 'ways', 'r': 'relations'}[t]} WHERE {self._where(t, ids, 'qt_key31', keys=keys)})"
+        self.sql(f"""INSERT INTO lake.{hist}
+            SELECT c.*, x.t AS valid_to, m.version, m.ts, m.changeset, m.uid, m."user"
+            FROM {cur} c JOIN upd_ct x ON x.type = '{t}' AND x.id = c.id
+            LEFT JOIN {meta} m ON m.id = c.id""")
+
+    def _log_changes(self, touched, old, direct):
+        """lake.changes: one row per element and batch (drives changed / [diff] / [adiff])."""
+        rows = []
+        for t in "nwr":
+            old_meta = self.e.meta(t, sorted(old[t])) if old[t] else {}
+            for i in touched[t]:
+                r = direct[t].get(i)
+                ov = old_meta.get(i, (None,))[0]
+                if r is None:
+                    action, nv = "geometry", ov
+                elif r["deleted"]:
+                    action, nv = "delete", None
+                else:
+                    action, nv = ("modify" if i in old[t] else "create"), r["version"]
+                rows.append((self.change_time.get((t, i)), t, i, ov, nv, action))
+        self.con.register("chg_arrow", pa.table({
+            "ts": pa.array([r[0] for r in rows], pa.timestamp("s", tz="UTC")), "type": [r[1] for r in rows],
+            "id": pa.array([r[2] for r in rows], pa.int64()), "old_version": pa.array([r[3] for r in rows], pa.int32()),
+            "new_version": pa.array([r[4] for r in rows], pa.int32()), "action": [r[5] for r in rows]}))
+        self.sql("INSERT INTO lake.changes SELECT * FROM chg_arrow")
+        self.con.unregister("chg_arrow")
 
     def _rewrite(self, touched, ex, ways, rels):
         old = {t: {i: ex[t][i] for i in touched[t] if i in ex[t]} for t in "nwr"}
@@ -369,26 +430,38 @@ class Updater:
             for i, members in self.e.elements_by_id("r", sorted(set(rels) & set(old["r"])), ["id", "members"]):
                 old_rel_members[i] = members
 
+        ct = self.change_time
+        self.con.register("upd_ct_arrow", pa.table({
+            "type": [k[0] for k in ct], "id": pa.array([k[1] for k in ct], pa.int64()),
+            "t": pa.array(list(ct.values()), pa.timestamp("s", tz="UTC"))}))
+        self.sql("CREATE OR REPLACE TEMP TABLE upd_ct AS SELECT * FROM upd_ct_arrow")
+        self.con.unregister("upd_ct_arrow")
+        self._log_changes(touched, old, {"n": self.batch["n"], "w": ways, "r": rels})
+        for t in "nwr":
+            self._archive(t, old[t], list(old[t].values()))
+
         nk = list(old["n"].values())
         self._del("nodes_tagged", "n", old["n"], "qt", keys=nk)
         self._del("nodes_untagged", "n", old["n"], "qt", keys=nk)
         self._del("nodes_meta", "n", old["n"], "k", keys=nk)
-        self.sql("INSERT INTO lake.nodes_tagged SELECT qt, id, lat, lon, tags FROM upd_n WHERE cardinality(tags) > 0")
-        self.sql("INSERT INTO lake.nodes_untagged SELECT qt, id, lat, lon, tags FROM upd_n WHERE cardinality(tags) = 0")
+        self.sql("INSERT INTO lake.nodes_tagged SELECT qt, id, lat, lon, tags, ts FROM upd_n WHERE cardinality(tags) > 0")
+        self.sql("INSERT INTO lake.nodes_untagged SELECT qt, id, lat, lon, tags, ts FROM upd_n WHERE cardinality(tags) = 0")
         self.sql('INSERT INTO lake.nodes_meta SELECT qt, id, version, ts, changeset, uid, "user" FROM upd_n')
 
         wk = list(old["w"].values())
         self._del("ways", "w", old["w"], "qt_key31", keys=wk)
         self._del("ways_meta", "w", old["w"], "k", keys=wk)
-        self.sql("""INSERT INTO lake.ways SELECT ov_key31(qt), ov_level(qt), qt, id, min_lat, max_lat, min_lon, max_lon,
-                    tags, nds, nd_lat, nd_lon FROM upd_w""")
+        self.sql("""INSERT INTO lake.ways SELECT ov_key31(w.qt), ov_level(w.qt), w.qt, w.id, w.min_lat, w.max_lat, w.min_lon,
+                    w.max_lon, w.tags, w.nds, w.nd_lat, w.nd_lon, coalesce(x.t, w.ts)
+                    FROM upd_w w LEFT JOIN upd_ct x ON x.type = 'w' AND x.id = w.id""")
         self.sql('INSERT INTO lake.ways_meta SELECT ov_key31(qt), id, version, ts, changeset, uid, "user" FROM upd_w')
 
         rk = list(old["r"].values())
         self._del("relations", "r", old["r"], "qt_key31", keys=rk)
         self._del("relations_meta", "r", old["r"], "k", keys=rk)
-        self.sql("""INSERT INTO lake.relations SELECT ov_key31(qt), ov_level(qt), qt, id, min_lat, max_lat, min_lon,
-                    max_lon, tags, members FROM upd_r""")
+        self.sql("""INSERT INTO lake.relations SELECT ov_key31(r.qt), ov_level(r.qt), r.qt, r.id, r.min_lat, r.max_lat,
+                    r.min_lon, r.max_lon, r.tags, r.members, coalesce(x.t, r.ts)
+                    FROM upd_r r LEFT JOIN upd_ct x ON x.type = 'r' AND x.id = r.id""")
         self.sql('INSERT INTO lake.relations_meta SELECT ov_key31(qt), id, version, ts, changeset, uid, "user" FROM upd_r')
 
         for t, src in (("n", "upd_n"), ("w", "upd_w"), ("r", "upd_r")):

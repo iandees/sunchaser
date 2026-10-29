@@ -156,23 +156,38 @@ def main():
     meta = "version, ts, changeset, uid, \"user\""
     step("lake.nodes_tagged", """
         CREATE TABLE lake.nodes_tagged SORTED BY (qt, id) AS
-        SELECT qt, id, lat, lon, tags FROM n WHERE cardinality(tags) > 0 ORDER BY qt, id""")
+        SELECT qt, id, lat, lon, tags, ts AS valid_from FROM n WHERE cardinality(tags) > 0 ORDER BY qt, id""")
     step("lake.nodes_untagged", """
         CREATE TABLE lake.nodes_untagged SORTED BY (qt, id) AS
-        SELECT qt, id, lat, lon, tags FROM n WHERE cardinality(tags) = 0 ORDER BY qt, id""")
+        SELECT qt, id, lat, lon, tags, ts AS valid_from FROM n WHERE cardinality(tags) = 0 ORDER BY qt, id""")
     step("lake.nodes (view)", """
         CREATE VIEW lake.nodes AS
         SELECT * FROM lake.nodes_tagged UNION ALL SELECT * FROM lake.nodes_untagged""")
     step("lake.ways", """
         CREATE TABLE lake.ways SORTED BY (qt_key31, id) AS
         SELECT ov_key31(qt) AS qt_key31, ov_level(qt) AS qt_level, qt, id, min_lat, max_lat, min_lon, max_lon,
-               tags, nds, nd_lat, nd_lon
+               tags, nds, nd_lat, nd_lon, ts AS valid_from
         FROM w ORDER BY qt_key31, id""")
     step("lake.relations", """
         CREATE TABLE lake.relations SORTED BY (qt_key31, id) AS
         SELECT ov_key31(qt) AS qt_key31, ov_level(qt) AS qt_level, qt, id, min_lat, max_lat, min_lon, max_lon,
-               tags, members
+               tags, members, ts AS valid_from
         FROM r ORDER BY qt_key31, id""")
+    # History (attic): versions the updater replaced, valid in [valid_from, valid_to). Current rows carry
+    # valid_from: the version timestamp at build (what Overpass assumes without attic data), the change
+    # time after an update (including geometry-only changes from moved nodes).
+    step("lake.*_history", """
+        CREATE TABLE lake.nodes_history SORTED BY (qt, valid_from) AS
+          SELECT t.*, t.valid_from AS valid_to, 0::INT AS version, NULL::TIMESTAMPTZ AS ts, 0::BIGINT AS changeset,
+                 0::INT AS uid, ''::VARCHAR AS "user" FROM lake.nodes_tagged t WHERE false;
+        CREATE TABLE lake.ways_history SORTED BY (qt_key31, valid_from) AS
+          SELECT w.*, w.valid_from AS valid_to, 0::INT AS version, NULL::TIMESTAMPTZ AS ts, 0::BIGINT AS changeset,
+                 0::INT AS uid, ''::VARCHAR AS "user" FROM lake.ways w WHERE false;
+        CREATE TABLE lake.relations_history SORTED BY (qt_key31, valid_from) AS
+          SELECT r.*, r.valid_from AS valid_to, 0::INT AS version, NULL::TIMESTAMPTZ AS ts, 0::BIGINT AS changeset,
+                 0::INT AS uid, ''::VARCHAR AS "user" FROM lake.relations r WHERE false;
+        CREATE TABLE lake.changes (ts TIMESTAMPTZ, type VARCHAR, id BIGINT, old_version INT, new_version INT,
+                                   action VARCHAR);""")
     for src, tbl, key in (("n", "nodes_meta", "qt"), ("w", "ways_meta", "ov_key31(qt)"), ("r", "relations_meta", "ov_key31(qt)")):
         step(f"lake.{tbl}", f"""
             CREATE TABLE lake.{tbl} SORTED BY (k, id) AS
