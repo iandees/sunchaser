@@ -358,24 +358,44 @@ class Engine:
             found |= self._in_area(t, cand, name)
         return sorted(found)
 
-    def _in_area(self, t, cand, area_tbl):
+    def in_poly_ids(self, t, pts, filters=(), bbox=None):
+        """(poly:"lat lon ..."): like (area) but direct nodes and ways on the border count
+        (polygon_query.cc collect_* with add_border=true); relation members must be inside."""
+        ring = list(pts) + ([pts[0]] if pts[0] != pts[-1] else [])
+        wkt = "POLYGON((" + ", ".join(f"{lo!r} {la!r}" for la, lo in ring) + "))"
+        name = f"poly{next(self._ids)}"
+        self._sql(f"CREATE OR REPLACE TEMP TABLE {name} AS SELECT ST_GeomFromText('{wkt}') AS g")
+        box = Bbox(min(p[0] for p in pts), min(p[1] for p in pts), max(p[0] for p in pts), max(p[1] for p in pts))
+        if bbox is not None:
+            box = Bbox(max(box.s, bbox.s), max(box.w, bbox.w), min(box.n, bbox.n), min(box.e, bbox.e))
+            if box.s > box.n or box.w > box.e:
+                return []
+        cand = self._new(self._query_one(t, box, list(filters), None, None))
+        return sorted(self._in_area(t, cand, name, add_border=True))
+
+    def _in_area(self, t, cand, area_tbl, add_border=None):
+        """Elements of set cand inside the geometry in area_tbl. add_border: whether touching the
+        border counts (None = Overpass's area defaults: yes for nodes, no for ways)."""
         point = "ST_Point(lon / 1e7, ov_lat(lat))"
         line = ("CASE WHEN len(nd_lat) = 1 THEN ST_Point(nd_lon[1] / 1e7, ov_lat(nd_lat[1])) ELSE "
                 "ST_MakeLine(list_transform(list_filter(range(1, len(nd_lat) + 1), lambda i: nd_lat[i] <> -2147483648), "
                 "lambda i: ST_Point(nd_lon[i] / 1e7, ov_lat(nd_lat[i])))) END")
         if t == "n":
             rows = self.elements(cand, "n", ["id", "lat", "lon"])
-            sel = f"SELECT id FROM x, {area_tbl} a WHERE ST_Intersects(a.g, {point})"
+            test = "ST_Intersects(a.g, p)" if add_border in (None, True) else "ST_Contains(a.g, p)"
+            sel = f"SELECT id FROM (SELECT id, {point} AS p FROM x), {area_tbl} a WHERE {test}"
         elif t == "w":
             rows = self.elements(cand, "w", ["id", "nd_lat", "nd_lon"])
+            test = "ST_Intersects(a.g, l)" + ("" if add_border else " AND NOT ST_Touches(a.g, l)")
             sel = (f"SELECT id FROM (SELECT id, {line} AS l FROM x WHERE len(list_filter(nd_lat, lambda v: v <> -2147483648)) > 0), "
-                   f"{area_tbl} a WHERE ST_Intersects(a.g, l) AND NOT ST_Touches(a.g, l)")
+                   f"{area_tbl} a WHERE {test}")
         else:
             members = self.elements(cand, "r", ["id", "members"])
             node_ids = sorted({m["ref"] for _, ms in members for m in ms if m["type"] == "n"})
             way_ids = sorted({m["ref"] for _, ms in members for m in ms if m["type"] == "w"})
-            inside_n = set(self._in_area("n", self._new(self._fetch("n", node_ids)), area_tbl)) if node_ids else set()
-            inside_w = set(self._in_area("w", self._new(self._fetch("w", way_ids)), area_tbl)) if way_ids else set()
+            # relation members never count on the border (collect_* with add_border=false)
+            inside_n = set(self._in_area("n", self._new(self._fetch("n", node_ids)), area_tbl, False)) if node_ids else set()
+            inside_w = set(self._in_area("w", self._new(self._fetch("w", way_ids)), area_tbl, False)) if way_ids else set()
             return {i for i, ms in members
                     if any((m["type"] == "n" and m["ref"] in inside_n) or (m["type"] == "w" and m["ref"] in inside_w)
                            for m in ms)}

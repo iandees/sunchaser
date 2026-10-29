@@ -44,6 +44,9 @@ QL += [
     ("regex_value_icase", f'[out:json];node[name~"^berlin",i]{b(MITTE)};out ids;'),
     ("key_regex", f'[out:json];way[~"^name:"~"."]{b(TINY)};out ids;'),
     ("not_equal_missing", f"[out:json];way[highway][bridge!=yes]{b(TINY)};out ids;"),
+    ("poly_nodes", '[out:json];node(poly:"52.515 13.375 52.520 13.380 52.518 13.390")[amenity];out ids;'),
+    ("poly_ways", '[out:json];way(poly:"52.515 13.375 52.520 13.380 52.518 13.390")[highway];out ids;'),
+    ("poly_rels", '[out:json];rel(poly:"52.515 13.375 52.520 13.380 52.518 13.390")[type=route];out ids;'),
     ("multiple_outs", f"[out:json];node[amenity=cafe]{b(TINY)};out ids;out count;out tags;"),
 ]
 

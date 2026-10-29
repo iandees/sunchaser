@@ -6,6 +6,7 @@ Supported:
                [k] [!k] [k=v] [k!=v] [k~re] [k!~re] [~kre~vre] (",i" for case-insensitive),
                (s,w,n,e) (id) (id:1,2) (.set) (w) (r) (r:"role") (bn) (bw) (br) (with .set),
                (around:radius,lat,lon) (around.set:radius) (area) (area.set) (pivot) (pivot.set)
+               (poly:"lat lon lat lon ...")
   areas        map_to_area, is_in, is_in(lat,lon)  (areas come from build_areas.py)
   blocks       ( ... ) union, ( a; - b; ) difference, "-> .name" on every statement
   recursion    > >> < <<  (optionally ".set >")
@@ -39,6 +40,7 @@ class Query:
     around: tuple | None = None                      # (radius, points or set name)
     areas: list = field(default_factory=list)        # (area) / (area.x) set names
     pivots: list = field(default_factory=list)       # (pivot) / (pivot.x) set names
+    poly: list | None = None                         # (poly:"lat lon ...") vertices
     into: str = "_"
     line: int = 0
 
@@ -485,7 +487,13 @@ class Parser:
                     q.around = (radius, pts)
             elif w in ("area", "pivot"):
                 (q.areas if w == "area" else q.pivots).append(self.setname() or "_")
-            elif w in ("poly", "if", "user", "uid", "newer", "changed", "user_touched"):
+            elif w == "poly":
+                self.expect(":")
+                nums = [float(v) for v in self.string().split()]
+                if len(nums) < 6 or len(nums) % 2:
+                    self.err("poly needs at least three \"lat lon\" pairs")
+                q.poly = list(zip(nums[0::2], nums[1::2]))
+            elif w in ("if", "user", "uid", "newer", "changed", "user_touched"):
                 raise QLError(f"line {self.line()}: static error: the filter '({w}...)' is not supported yet.")
             else:
                 self.err(f"unknown filter '{w}'")
@@ -582,6 +590,10 @@ class Executor:
             if q.areas and t != "a":
                 area_ids = sorted({i for src in q.areas for i in e._ids_of(self.get(src), "a")})
                 ids = self._meet(ids, e.in_area_ids(t, area_ids, q.filters, bbox) if area_ids else [])
+                if not ids:
+                    continue
+            if q.poly is not None and t != "a":
+                ids = self._meet(ids, e.in_poly_ids(t, q.poly, q.filters, bbox))
                 if not ids:
                     continue
             if q.around is not None:
