@@ -173,3 +173,27 @@ Altogether about 29%, which is similar in spirit to Overpass's `*_tags_*` and `.
 2. **Lance as the element store**: replace `nodes_*` and `elem_locator` with a tile-sorted Lance table (BTree on id), and keep DuckLake for `tag_postings`, meta, and history. Re-run the corpus.
 3. **Sets carry payload**: carry element payload (nds, geometry) in the set tables so recursion stops re-fetching ways. This is the largest remaining source of requests.
 4. **Wider coverage**: add `out geom` / JSON output and a QL parser front end. Then grow the corpus to about 200 queries drawn from real overpass-turbo traffic patterns.
+
+## Lance in the live path (`bench_lance*.json`, `bench_nolance*.json`)
+
+Setup:
+- **Engine:** as deployed (`lance_scope="ids"`): Lance serves id-driven fetches, including the `out` statement's element fetch. Spatial scans and bbox+tag queries stay on DuckLake, and `out meta` still reads the DuckLake `*_meta` tables.
+- **Lake:** Berlin, updated by scheduled jobs through 24 diffs plus a compaction, read through the S3 stand-in with 30 ms per request.
+- **Runs:** the 69 current-data queries of the differential corpus (history queries don't use Lance), alternated Lance / no Lance twice, each run a fresh process. Per-query times are the best of 2.
+
+| | No Lance | Lance |
+|---|---|---|
+| Sum of 69 queries | 148.2 s | **110.3 s** |
+| Median query | 1.44 s | **0.81 s** |
+| Geometric-mean speedup | 1.00× | **1.54×** |
+| Queries faster by more than 1.2× | – | 51 |
+| Queries slower by more than 1.2× | – | 1 (`out meta` on a bbox) |
+| Object-store requests per run | ~6,170 | ~12,720 |
+| Bytes read per run | 0.53 GB | 1.24 GB |
+
+- **Wins:** up to 3.5×. Examples: `regex_value_icase` 0.87 → 0.25 s, `recurse_filter_r` 2.65 → 0.80 s, `named_sets` 2.25 → 0.73 s, `poly_nodes` 1.53 → 0.49 s.
+- **No gain for `out meta`:** its metadata comes from DuckLake.
+- **Costs:**
+  - **Storage:** Lance adds about 1.25× the lake's Parquet (645 MB next to 512 MB for Berlin).
+  - **Requests and bytes:** about 2× per query. On R2 that is about $0.03 more per thousand queries, at $0.36 per million reads.
+  - **Build:** Lance writing took 17 s on top of the 35 s build (+50%).

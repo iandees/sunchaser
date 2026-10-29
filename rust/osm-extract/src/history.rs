@@ -42,7 +42,7 @@ const CHUNK_BLOBS: usize = 64;
 // ---- decoded versions -------------------------------------------------------------
 
 #[derive(Clone)]
-struct Meta {
+pub(crate) struct Meta {
     version: i32,
     secs: i64,
     changeset: i64,
@@ -52,14 +52,14 @@ struct Meta {
 }
 
 #[derive(Clone)]
-enum Body {
+pub(crate) enum Body {
     Node(i32, i32),
     Way(Vec<i64>),
     Rel(Vec<(u8, i64, String)>), // (b'n' | b'w' | b'r', ref, role)
 }
 
 #[derive(Clone)]
-struct Version {
+pub(crate) struct Version {
     kind: u8, // 0 node, 1 way, 2 relation (PBF order)
     id: i64,
     meta: Meta,
@@ -67,67 +67,61 @@ struct Version {
     body: Body,
 }
 
+fn tags_of<'a>(it: impl Iterator<Item = (&'a str, &'a str)>) -> Vec<(String, String)> {
+    it.map(|(k, v)| (k.to_string(), v.to_string())).collect()
+}
+
+pub(crate) fn dense_version(n: &osmpbf::DenseNode) -> Version {
+    let meta = match n.info() {
+        Some(i) => Meta {
+            version: i.version(),
+            secs: i.milli_timestamp().div_euclid(1000),
+            changeset: i.changeset(),
+            uid: i.uid(),
+            user: i.user().unwrap_or("").to_string(),
+            visible: i.visible(),
+        },
+        None => Meta { version: 0, secs: 0, changeset: 0, uid: 0, user: String::new(), visible: true },
+    };
+    Version { kind: 0, id: n.id(), tags: tags_of(n.tags()), body: Body::Node(n.decimicro_lat(), n.decimicro_lon()), meta }
+}
+
+pub(crate) fn node_version(n: &osmpbf::Node) -> Version {
+    Version {
+        kind: 0,
+        id: n.id(),
+        meta: info_meta(&n.info()),
+        tags: tags_of(n.tags()),
+        body: Body::Node(n.decimicro_lat(), n.decimicro_lon()),
+    }
+}
+
+pub(crate) fn way_version(w: &osmpbf::Way) -> Version {
+    Version { kind: 1, id: w.id(), meta: info_meta(&w.info()), tags: tags_of(w.tags()), body: Body::Way(w.refs().collect()) }
+}
+
+pub(crate) fn rel_version(r: &osmpbf::Relation) -> Version {
+    let members = r
+        .members()
+        .map(|m| {
+            let t = match m.member_type {
+                RelMemberType::Node => b'n',
+                RelMemberType::Way => b'w',
+                RelMemberType::Relation => b'r',
+            };
+            (t, m.member_id, m.role().unwrap_or("").to_string())
+        })
+        .collect();
+    Version { kind: 2, id: r.id(), meta: info_meta(&r.info()), tags: tags_of(r.tags()), body: Body::Rel(members) }
+}
+
 fn decode(block: &PrimitiveBlock) -> Vec<Version> {
     let mut out = Vec::new();
     for g in block.groups() {
-        for n in g.dense_nodes() {
-            let meta = match n.info() {
-                Some(i) => Meta {
-                    version: i.version(),
-                    secs: i.milli_timestamp().div_euclid(1000),
-                    changeset: i.changeset(),
-                    uid: i.uid(),
-                    user: i.user().unwrap_or("").to_string(),
-                    visible: i.visible(),
-                },
-                None => Meta { version: 0, secs: 0, changeset: 0, uid: 0, user: String::new(), visible: true },
-            };
-            out.push(Version {
-                kind: 0,
-                id: n.id(),
-                tags: n.tags().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
-                body: Body::Node(n.decimicro_lat(), n.decimicro_lon()),
-                meta,
-            });
-        }
-        for n in g.nodes() {
-            out.push(Version {
-                kind: 0,
-                id: n.id(),
-                meta: info_meta(&n.info()),
-                tags: n.tags().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
-                body: Body::Node(n.decimicro_lat(), n.decimicro_lon()),
-            });
-        }
-        for w in g.ways() {
-            out.push(Version {
-                kind: 1,
-                id: w.id(),
-                meta: info_meta(&w.info()),
-                tags: w.tags().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
-                body: Body::Way(w.refs().collect()),
-            });
-        }
-        for r in g.relations() {
-            let members = r
-                .members()
-                .map(|m| {
-                    let t = match m.member_type {
-                        RelMemberType::Node => b'n',
-                        RelMemberType::Way => b'w',
-                        RelMemberType::Relation => b'r',
-                    };
-                    (t, m.member_id, m.role().unwrap_or("").to_string())
-                })
-                .collect();
-            out.push(Version {
-                kind: 2,
-                id: r.id(),
-                meta: info_meta(&r.info()),
-                tags: r.tags().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
-                body: Body::Rel(members),
-            });
-        }
+        out.extend(g.dense_nodes().map(|n| dense_version(&n)));
+        out.extend(g.nodes().map(|n| node_version(&n)));
+        out.extend(g.ways().map(|w| way_version(&w)));
+        out.extend(g.relations().map(|r| rel_version(&r)));
     }
     out
 }
@@ -778,46 +772,157 @@ fn take_groups(pending: &mut Vec<Version>, last_chunk: bool) -> Vec<Vec<Version>
     groups
 }
 
-pub fn run(args: &Args) -> Result<()> {
-    let out = &args.out;
-    std::fs::create_dir_all(out)?;
-    let t0 = Instant::now();
-    let bits = args.bucket_bits;
-    let nb = 1usize << bits;
-    let id_shift = 34 - bits;
-    let mk = |sub: &str, s: Arc<Schema>, n: usize| Buckets::new(out.join(sub), s, n);
-    std::fs::create_dir_all(out.join("locator"))?;
-    let mut locator = Vec::new();
-    for t in ["n", "w", "r"] {
-        let f = File::create(out.join("locator").join(format!("{t}.parquet")))?;
-        locator.push(ArrowWriter::try_new(f, locator_schema(), Some(props()?))?);
-    }
-    let mut w = Writers {
-        cur: [
-            mk("nodes", hist_schema(Kind::Nodes, false), nb)?,
-            mk("ways", hist_schema(Kind::Ways, false), nb)?,
-            mk("relations", hist_schema(Kind::Relations, false), nb)?,
-        ],
-        hist: [
-            mk("nodes_history", hist_schema(Kind::Nodes, true), nb)?,
-            mk("ways_history", hist_schema(Kind::Ways, true), nb)?,
-            mk("relations_history", hist_schema(Kind::Relations, true), nb)?,
-        ],
-        changes: mk("changes", changes_schema(), 1024)?,
-        parents: mk("node_parent_ways", parents_schema(), nb)?,
-        locator,
-    };
-    let (mut nodes, mut ways): (Timeline<16>, Timeline<32>) = match &args.dense {
-        Some(dir) => {
-            std::fs::create_dir_all(dir)?;
-            (Timeline::disk(dir, "node_positions", args.max_node_id)?, Timeline::disk(dir, "way_geometry", args.max_way_id)?)
+/// One history extraction: version groups in, bucketed raw tables out. Fed in PBF order; a group
+/// may continue in the next feed (versions of one element spanning blocks).
+pub(crate) struct Pipeline {
+    out: PathBuf,
+    w: Writers,
+    nodes: Timeline<16>,
+    ways: Timeline<32>,
+    counts: [u64; 3],
+    pub(crate) versions: u64,
+    phase: u8,
+    pending: Vec<Version>,
+    bits: u32,
+    nb: usize,
+    id_shift: u32,
+    pub(crate) busy: f64, // seconds spent processing (for resource measurements)
+}
+
+impl Pipeline {
+    pub(crate) fn new(out: &Path, bits: u32, dense: Option<(&Path, u64, u64)>) -> Result<Self> {
+        std::fs::create_dir_all(out)?;
+        let nb = 1usize << bits;
+        let mk = |sub: &str, s: Arc<Schema>, n: usize| Buckets::new(out.join(sub), s, n);
+        std::fs::create_dir_all(out.join("locator"))?;
+        let mut locator = Vec::new();
+        for t in ["n", "w", "r"] {
+            let f = File::create(out.join("locator").join(format!("{t}.parquet")))?;
+            locator.push(ArrowWriter::try_new(f, locator_schema(), Some(props()?))?);
         }
-        None => (Timeline::ram(), Timeline::ram()),
-    };
-    let mut counts = [0u64; 3];
-    let mut versions = 0u64;
-    let mut phase = 0u8;
-    let mut pending: Vec<Version> = Vec::new();
+        let w = Writers {
+            cur: [
+                mk("nodes", hist_schema(Kind::Nodes, false), nb)?,
+                mk("ways", hist_schema(Kind::Ways, false), nb)?,
+                mk("relations", hist_schema(Kind::Relations, false), nb)?,
+            ],
+            hist: [
+                mk("nodes_history", hist_schema(Kind::Nodes, true), nb)?,
+                mk("ways_history", hist_schema(Kind::Ways, true), nb)?,
+                mk("relations_history", hist_schema(Kind::Relations, true), nb)?,
+            ],
+            changes: mk("changes", changes_schema(), 1024)?,
+            parents: mk("node_parent_ways", parents_schema(), nb)?,
+            locator,
+        };
+        let (nodes, ways) = match dense {
+            Some((dir, max_node, max_way)) => {
+                std::fs::create_dir_all(dir)?;
+                (Timeline::disk(dir, "node_positions", max_node)?, Timeline::disk(dir, "way_geometry", max_way)?)
+            }
+            None => (Timeline::ram(), Timeline::ram()),
+        };
+        Ok(Pipeline {
+            out: out.to_path_buf(),
+            w,
+            nodes,
+            ways,
+            counts: [0; 3],
+            versions: 0,
+            phase: 0,
+            pending: Vec::new(),
+            bits,
+            nb,
+            id_shift: 34 - bits,
+            busy: 0.0,
+        })
+    }
+
+    /// Versions in PBF order; `last` flushes the final group.
+    pub(crate) fn feed(&mut self, vs: Vec<Version>, last: bool) -> Result<()> {
+        let t = Instant::now();
+        self.versions += vs.len() as u64;
+        self.pending.extend(vs);
+        let mut by_kind: [Vec<Vec<Version>>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        for g in take_groups(&mut self.pending, last) {
+            by_kind[g[0].kind as usize].push(g);
+        }
+        // process by type in PBF order; a type's timeline is complete once the next type starts
+        for (k, gs) in by_kind.into_iter().enumerate() {
+            let k = k as u8;
+            if gs.is_empty() {
+                continue;
+            }
+            if k < self.phase {
+                bail!("PBF not sorted by type");
+            }
+            while self.phase < k {
+                if self.phase == 0 {
+                    self.nodes.finish()?;
+                } else {
+                    self.ways.finish()?;
+                }
+                self.phase += 1;
+            }
+            let (nodes, ways) = (&self.nodes, &self.ways);
+            let outs: Vec<Out> = match k {
+                0 => gs.into_par_iter().map(node_group).collect(),
+                1 => gs.into_par_iter().map(|g| way_group(g, nodes)).collect(),
+                _ => gs.into_par_iter().map(|g| rel_group(g, nodes, ways)).collect(),
+            };
+            for o in &outs {
+                self.counts[k as usize] += o.rows.iter().filter(|r| r.to.is_none()).count() as u64;
+                for (id, recs) in &o.timeline {
+                    if k == 0 {
+                        let r16: Vec<[u8; 16]> = recs.iter().map(|r| r[..16].try_into().unwrap()).collect();
+                        self.nodes.push(*id, &r16)?;
+                    } else if k == 1 {
+                        self.ways.push(*id, recs)?;
+                    }
+                }
+            }
+            self.w.write(k, outs, self.bits, self.id_shift, self.nb)?;
+        }
+        self.busy += t.elapsed().as_secs_f64();
+        Ok(())
+    }
+
+    /// Close the files and write manifest.json; returns a summary line.
+    pub(crate) fn finish(self, extra: &str) -> Result<String> {
+        let Pipeline { out, w, counts, versions, bits, id_shift, busy, .. } = self;
+        let Writers { cur, hist, changes, parents, locator } = w;
+        for l in locator {
+            l.close()?;
+        }
+        let mut hist_rows = [0u64; 3];
+        for b in cur {
+            b.close()?;
+        }
+        for (i, b) in hist.into_iter().enumerate() {
+            hist_rows[i] = b.close()?;
+        }
+        let n_changes = changes.close()?;
+        let n_parents = parents.close()?;
+        let mut m = File::create(out.join("manifest.json"))?;
+        writeln!(
+            m,
+            "{{\"format\": 2, \"history\": true, \"bucket_bits\": {bits}, \"node_id_shift\": {id_shift}, \
+             \"versions\": {versions}, \"nodes\": {}, \"ways\": {}, \"relations\": {}, \"nodes_history\": {}, \
+             \"ways_history\": {}, \"relations_history\": {}, \"changes\": {n_changes}, \
+             \"node_parent_ways\": {n_parents}, \"process_seconds\": {busy:.1}{}{extra}}}",
+            counts[0], counts[1], counts[2], hist_rows[0], hist_rows[1], hist_rows[2], crate::header_fields()
+        )?;
+        Ok(format!(
+            "{versions} versions -> current n={} w={} r={}, history n={} w={} r={}, changes={n_changes}",
+            counts[0], counts[1], counts[2], hist_rows[0], hist_rows[1], hist_rows[2]
+        ))
+    }
+}
+
+pub fn run(args: &Args) -> Result<()> {
+    let t0 = Instant::now();
+    let dense = args.dense.as_deref().map(|d| (d, args.max_node_id, args.max_way_id));
+    let mut p = Pipeline::new(&args.out, args.bucket_bits, dense)?;
     let mut blobs = crate::open_input(&args.input)?.peekable();
     loop {
         let chunk: Vec<_> = blobs.by_ref().take(CHUNK_BLOBS).collect::<std::result::Result<_, _>>()?;
@@ -834,83 +939,12 @@ pub fn run(args: &Args) -> Result<()> {
                 Err(e) => Some(Err(e)),
             })
             .collect::<std::result::Result<_, _>>()?;
-        for d in decoded {
-            versions += d.len() as u64;
-            pending.extend(d);
-        }
-        let mut by_kind: [Vec<Vec<Version>>; 3] = [Vec::new(), Vec::new(), Vec::new()];
-        for g in take_groups(&mut pending, last) {
-            by_kind[g[0].kind as usize].push(g);
-        }
-        // process by type in PBF order; a type's timeline is complete once the next type starts
-        for (k, gs) in by_kind.into_iter().enumerate() {
-            let k = k as u8;
-            if gs.is_empty() {
-                continue;
-            }
-            if k < phase {
-                bail!("PBF not sorted by type");
-            }
-            while phase < k {
-                if phase == 0 {
-                    nodes.finish()?;
-                } else {
-                    ways.finish()?;
-                }
-                phase += 1;
-            }
-            let outs: Vec<Out> = match k {
-                0 => gs.into_par_iter().map(node_group).collect(),
-                1 => gs.into_par_iter().map(|g| way_group(g, &nodes)).collect(),
-                _ => gs.into_par_iter().map(|g| rel_group(g, &nodes, &ways)).collect(),
-            };
-            for o in &outs {
-                counts[k as usize] += o.rows.iter().filter(|r| r.to.is_none()).count() as u64;
-                for (id, recs) in &o.timeline {
-                    if k == 0 {
-                        let r16: Vec<[u8; 16]> = recs.iter().map(|r| r[..16].try_into().unwrap()).collect();
-                        nodes.push(*id, &r16)?;
-                    } else if k == 1 {
-                        ways.push(*id, recs)?;
-                    }
-                }
-            }
-            w.write(k, outs, bits, id_shift, nb)?;
-        }
+        p.feed(decoded.into_iter().flatten().collect(), last)?;
         if last {
             break;
         }
     }
-    for l in w.locator {
-        l.close()?;
-    }
-    let mut hist_rows = [0u64; 3];
-    let Writers { cur, hist, changes, parents, .. } = w;
-    for b in cur {
-        b.close()?;
-    }
-    for (i, b) in hist.into_iter().enumerate() {
-        hist_rows[i] = b.close()?;
-    }
-    let n_changes = changes.close()?;
-    let n_parents = parents.close()?;
-    let mut m = File::create(out.join("manifest.json"))?;
-    writeln!(
-        m,
-        "{{\"format\": 2, \"history\": true, \"bucket_bits\": {bits}, \"node_id_shift\": {id_shift}, \
-         \"nodes\": {}, \"ways\": {}, \"relations\": {}, \"nodes_history\": {}, \"ways_history\": {}, \
-         \"relations_history\": {}, \"changes\": {n_changes}, \"node_parent_ways\": {n_parents}{}}}",
-        counts[0], counts[1], counts[2], hist_rows[0], hist_rows[1], hist_rows[2], crate::header_fields()
-    )?;
-    println!(
-        "history: {versions} versions -> current n={} w={} r={}, history n={} w={} r={}, changes={n_changes} {:.1}s",
-        counts[0],
-        counts[1],
-        counts[2],
-        hist_rows[0],
-        hist_rows[1],
-        hist_rows[2],
-        t0.elapsed().as_secs_f64()
-    );
+    let summary = p.finish("")?;
+    println!("history: {summary} {:.1}s", t0.elapsed().as_secs_f64());
     Ok(())
 }

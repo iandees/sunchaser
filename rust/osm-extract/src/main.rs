@@ -23,6 +23,7 @@
 //! locations stored, then way and relation blocks are built in parallel. This relies on the PBF being
 //! sorted by type then id (checked), as planet files and extracts are.
 
+mod cut;
 mod history;
 mod quadtile;
 
@@ -619,6 +620,7 @@ struct Args {
     max_node_id: u64,
     max_way_id: u64,
     history: bool,
+    cuts: Vec<String>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -630,6 +632,7 @@ fn parse_args() -> Result<Args> {
         max_node_id: 1 << 34,
         max_way_id: 1 << 31,
         history: false,
+        cuts: Vec::new(),
     };
     let mut pos = Vec::new();
     let mut it = std::env::args().skip(1);
@@ -641,6 +644,7 @@ fn parse_args() -> Result<Args> {
             "--max-node-id" => a.max_node_id = val("--max-node-id")?.parse()?,
             "--max-way-id" => a.max_way_id = val("--max-way-id")?.parse()?,
             "--history" => a.history = true,
+            "--cut" => a.cuts.push(val("--cut")?),
             _ if arg.starts_with("--") => bail!("unknown option {arg}"),
             _ => pos.push(arg),
         }
@@ -648,7 +652,7 @@ fn parse_args() -> Result<Args> {
     // every bucket of the four bucketed tables is an open file until the end: 4 << 12 at most
     if pos.len() != 2 || !(1..=12).contains(&a.bucket_bits) {
         bail!("usage: osm-extract <input.osm.pbf | - for stdin> <out-dir> [--bucket-bits 1..12 (8)] \
-               [--dense-index DIR [--max-node-id N] [--max-way-id N]] [--history]");
+               [--dense-index DIR [--max-node-id N] [--max-way-id N]] [--history [--cut name:s,w,n,e ...]]");
     }
     a.input = PathBuf::from(&pos[0]);
     a.out = PathBuf::from(&pos[1]);
@@ -657,6 +661,9 @@ fn parse_args() -> Result<Args> {
 
 fn main() -> Result<()> {
     let args = parse_args()?;
+    if !args.cuts.is_empty() {
+        return cut::run(&args);
+    }
     if args.history {
         return history::run(&args);
     }
