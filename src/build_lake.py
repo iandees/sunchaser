@@ -165,6 +165,7 @@ def main():
     ap.add_argument("--sequence", default="", help="minutely replication sequence of the source data")
     ap.add_argument("--row-group", type=int, default=16384)
     ap.add_argument("--target-file-mb", type=int, default=64)
+    ap.add_argument("--lance", metavar="BASE", help="also build the Lance id store here (e.g. s3://bucket/lake/lance)")
     ap.add_argument("--group-rows", type=int, default=50_000_000,
                     help="bucketed input: rows sorted per insert (bounds memory and temp disk)")
     args = ap.parse_args()
@@ -271,6 +272,10 @@ def main():
         # WAL: API readers must not block the updater's commits ("database is locked")
         import sqlite3
         sqlite3.connect(catalog[len("sqlite:"):], timeout=30).execute("PRAGMA journal_mode=WAL").fetchall()
+
+    if args.lance:
+        import lancestore
+        lancestore.build(con, args.lance)
 
     for tbl, files, mb in con.sql("""
             SELECT table_name, file_count, round(file_size_bytes / 1e6, 1)

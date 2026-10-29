@@ -84,6 +84,39 @@ def push(local, url, etag):
             raise
 
 
+def acquire_lease(url, ttl):
+    """A writer lease next to the catalog (<catalog>.lease), so overlapping scheduled runs don't
+    both do the work: the second one sees the lease and exits. Created with If-None-Match: *; an
+    expired lease (a crashed run) is taken over with If-Match on its ETag. Returns the lease's ETag,
+    or None if another run holds it. The conditional catalog PUT remains the actual guarantee."""
+    import json
+    import time
+    from botocore.exceptions import ClientError
+    bucket, key = _split(url + ".lease")
+    s3 = _client()
+    body = json.dumps({"expires": time.time() + ttl}).encode()
+    try:
+        return s3.put_object(Bucket=bucket, Key=key, Body=body, IfNoneMatch="*")["ETag"]
+    except ClientError as e:
+        if e.response["Error"]["Code"] not in ("PreconditionFailed", "412", "ConditionalRequestConflict"):
+            raise
+    try:
+        cur = s3.get_object(Bucket=bucket, Key=key)
+    except ClientError:
+        return None  # released meanwhile: let the next run take it
+    if json.loads(cur["Body"].read()).get("expires", 0) > time.time():
+        return None
+    try:
+        return s3.put_object(Bucket=bucket, Key=key, Body=body, IfMatch=cur["ETag"])["ETag"]
+    except ClientError:
+        return None
+
+
+def release_lease(url):
+    bucket, key = _split(url + ".lease")
+    _client().delete_object(Bucket=bucket, Key=key)
+
+
 def copy(url, dest_url):
     """Server-side copy, e.g. to keep a versioned history of catalogs for rollback."""
     bucket, key = _split(url)

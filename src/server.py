@@ -14,6 +14,7 @@ Configuration (environment):
   SUNCHASER_MAX_TIMEOUT  cap for [timeout:N] in seconds (default 180)
   SUNCHASER_MAX_OUTPUT   cap for a response in bytes (default 2 GiB); [maxsize:N] can lower it
   SUNCHASER_MAX_QUERIES  queries executed concurrently (default 16); more wait in line
+  SUNCHASER_LANCE        "off" to ignore a lake's Lance id store (default: use it when the lake has one)
 
 Each request runs on its own DuckDB cursor (temp tables are per cursor) in a worker thread and
 streams its output as it is produced, so large results never sit in memory; a slow client pauses
@@ -41,7 +42,8 @@ from starlette.routing import Route
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import lakeconn  # noqa: E402
 import ql  # noqa: E402
-from engine import SQL_MACROS, Engine  # noqa: E402
+import lancestore  # noqa: E402
+from engine import SQL_MACROS, Engine, Plan  # noqa: E402
 
 COPYRIGHT = "The data included in this document is from www.openstreetmap.org. The data is made available under ODbL."
 
@@ -104,6 +106,30 @@ def refresher():
 
 DB = None
 DB_LOCK = threading.Lock()
+
+
+STORES = {}  # (lance base, pinned versions) -> lancestore.Store
+
+
+def lance_store(cur):
+    """The Lance id store at the versions this request's catalog snapshot records (None: no Lance).
+    Read through the request's own cursor, so it always matches the DuckLake data it sees."""
+    if env("LANCE", "on") == "off":
+        return None
+    try:
+        base, versions = lancestore.state_versions(cur)
+    except duckdb.Error:
+        return None
+    if not base:
+        return None
+    key = (base, tuple(sorted(versions.items())))
+    with DB_LOCK:
+        store = STORES.get(key)
+        if store is None:
+            if len(STORES) > 8:
+                STORES.clear()
+            store = STORES[key] = lancestore.Store(base, versions)
+    return store
 
 
 def db():
@@ -198,7 +224,10 @@ def _execute(script, callback, sink):
         timer.start()
         started = time.time()
         try:
-            ql.Executor(Engine(cur, "lake", init_macros=False), doc.timestamp).run(script, doc=doc)
+            store = lance_store(cur)
+            engine = Engine(cur, "lake", init_macros=False, lance=store,
+                            plan=Plan(lance_scope="ids") if store else None)
+            ql.Executor(engine, doc.timestamp).run(script, doc=doc)
         except duckdb.InterruptException:
             if sink.cancelled.is_set():
                 raise ClientGone()

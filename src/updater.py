@@ -258,6 +258,7 @@ class Updater:
             self.batch_no = int(self.sql("SELECT value FROM lake.state WHERE key = 'batch'").fetchall()[0][0]) + 1
             self.sql(f"UPDATE lake.state SET value = '{self.batch_no}' WHERE key = 'batch'")
             self._rewrite(touched, ex, ways, rels)
+            self._update_lance(touched)
             if osm_base:
                 self.sql(f"UPDATE lake.state SET value = '{osm_base}' WHERE key = 'osm_base'")
             if sequence is not None:
@@ -272,6 +273,26 @@ class Updater:
         self.e._locator_memo.clear()
         return {"changes": len(ch), "nodes": len(nodes), "ways": len(ways), "rels": len(rels),
                 "cascade_ways": len(cascade_w), "cascade_rels": len(cascade_r), "secs": round(time.time() - t0, 2)}
+
+    def _update_lance(self, touched):
+        """Keep the Lance id store (src/lancestore.py) in step; its new versions are recorded in
+        lake.state inside this diff's transaction."""
+        import lancestore
+        base, versions = lancestore.state_versions(self.con)
+        if not base:
+            return
+        rows = {
+            "nodes_tagged": self.sql("SELECT qt, id, lat, lon, tags, ts AS valid_from FROM upd_n "
+                                     "WHERE cardinality(tags) > 0").arrow().read_all(),
+            "nodes_untagged": self.sql("SELECT qt, id, lat, lon, tags, ts AS valid_from FROM upd_n "
+                                       "WHERE cardinality(tags) = 0").arrow().read_all(),
+            "ways": self.sql("""SELECT ov_key31(w.qt) AS qt_key31, ov_level(w.qt) AS qt_level, w.qt, w.id, w.min_lat,
+                                w.max_lat, w.min_lon, w.max_lon, w.tags, w.nds, w.nd_lat, w.nd_lon,
+                                coalesce(x.t, w.ts) AS valid_from
+                                FROM upd_w w LEFT JOIN upd_ct x ON x.type = 'w' AND x.id = w.id""").arrow().read_all(),
+        }
+        new = lancestore.apply(self.con, base, versions, {"n": touched["n"], "w": touched["w"]}, rows)
+        lancestore._set_state(self.con, base, new)
 
     # -- staging (same column layout as extract.py output, then the build's key computation)
 
@@ -534,6 +555,8 @@ def compact(con, grace=3600):
             print(f"{q:<90} {time.time() - t:6.1f}s")
         except duckdb.Error as e:
             print(f"{q:<90} skipped: {str(e).splitlines()[0][:80]}")
+    import lancestore
+    lancestore.maintain(con, grace)
 
 
 class Maintenance:
@@ -620,10 +643,21 @@ def job(args):
     """One scheduled run against a catalog on object storage (src/objcatalog.py): download it,
     apply pending diffs until caught up or out of time, update areas, compact when due, and upload
     it conditionally. Nothing runs between jobs, so the deployment scales to zero."""
+    import objcatalog
+    t0 = time.time()
+    if not objcatalog.acquire_lease(args.catalog_url, ttl=args.max_seconds + 600):
+        print("job: another run holds the lease; exiting", flush=True)
+        return 3
+    try:
+        return _job(args, t0)
+    finally:
+        objcatalog.release_lease(args.catalog_url)
+
+
+def _job(args, t0):
     import tempfile
     import build_areas
     import objcatalog
-    t0 = time.time()
     with tempfile.TemporaryDirectory(dir=args.workdir) as tmp:
         local = os.path.join(tmp, "catalog.ducklake")
         etag = objcatalog.fetch(args.catalog_url, local)

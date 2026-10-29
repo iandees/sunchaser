@@ -26,8 +26,9 @@ now and why.
 
 | Component | Role |
 |---|---|
-| **Updater** | The only writer, like Overpass's `update_database`. Each replication diff is one DuckLake transaction. Run as `updater.py job` on a schedule, e.g. every minute: download the catalog, apply what's pending, update areas incrementally, compact when due, upload with a conditional PUT. |
+| **Updater** | The only writer, like Overpass's `update_database`. Each replication diff is one DuckLake transaction. Run as `updater.py job` on a schedule, e.g. every minute: take the writer lease, download the catalog, apply what's pending, update areas incrementally, compact when due, upload with a conditional PUT. |
 | **Catalog** | A DuckDB-format DuckLake file stored in the bucket (`src/objcatalog.py`), so no database server is needed. The conditional PUT (If-Match on the downloaded ETag) means overlapping runs can't fork it: the later one is refused and discarded, and the Parquet files it wrote are orphans that compaction deletes after a grace period. SQLite (single host) and Postgres catalogs still work for always-on deployments. |
+| **Lance id store** | Lance copies of `nodes_tagged`, `nodes_untagged` and `ways` (BTree on `id`) for id-driven fetches: recursion, id queries, global tag lookups (up to 2.2× faster than DuckLake key ranges). Spatial scans stay on DuckLake. The updater deletes and re-appends touched ids and records the Lance versions in `lake.state` in the same transaction; readers open Lance at those versions, so both stores always show the same diff. Compaction merges Lance fragments and updates the index. Cost: about 1.25× the size of the whole lake's Parquet again. |
 | **Server** | Read-only and stateless. Attaches the catalog object directly and reopens it when its ETag changes (`SUNCHASER_CATALOG_REFRESH`). One DuckDB cursor per request; `[timeout:N]` interrupts the query; responses stream. |
 
 ## Data layout (one DuckLake schema)
@@ -96,7 +97,7 @@ Catch-up uses hourly diffs (a planet day diff is about 100 MB, too much for one 
    ```
 
    ```bash
-   python src/build_lake.py --raw raw --catalog catalog.ducklake --data-path s3://bucket/lake/data/ --osm-base <pbf timestamp>
+   python src/build_lake.py --raw raw --catalog catalog.ducklake --data-path s3://bucket/lake/data/ --lance s3://bucket/lake/lance --osm-base <pbf timestamp>
    ```
 
    ```bash
@@ -128,6 +129,7 @@ Catch-up uses hourly diffs (a planet day diff is about 100 MB, too much for one 
 | After 5 days of replayed diffs | 66/69 non-area and 9/10 area-related queries identical; the differences come from the reference's state |
 | Fixed 24-hour window (both sides given the lake's edits) | 68/69 current-data queries; 13/13 history queries (`[date:]` incl. `out meta`/`geom`, `newer`, `changed`) vs Overpass with `--keep-attic` |
 | Object-storage catalog, updated only by scheduled jobs (24 h window) | 81/82 queries incl. 13/13 history; two overlapping jobs: one commits, the other is refused (412) and discarded |
+| Lance id store kept by jobs through 24 diffs and a compaction | pinned versions equal the lake tables row for row; 81/82 queries incl. 13/13 history with id fetches on Lance; a second concurrent job exits on the lease |
 | Bucketed vs flat build | identical tables, files in key order (`osm-extract --bucket-bits 12`, 16 groups) |
 
 ## Known gaps
@@ -140,6 +142,5 @@ Catch-up uses hourly diffs (a planet day diff is about 100 MB, too much for one 
 - **Performance:**
   - Single queries take 0.3–3 s on a 4-core box, against 0.1–2.4 s for local-disk Overpass.
   - Large outputs: JSON nodes and ways are serialised in SQL (about 32 MB/s); other formats and modes in Python (about 10 MB/s).
-  - Lance as an id-lookup store (`results/NOTES.md`) is not wired into the live path.
 - **Areas** are rebuilt in full, not incrementally.
 - **Planet scale:** see `docs/planet.md` for the build and update plan, and what is measured vs extrapolated.

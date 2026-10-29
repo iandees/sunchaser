@@ -20,7 +20,7 @@ sys.path[:0] = [str(ROOT / "src"), str(ROOT / "queries")]
 import duckdb  # noqa: E402
 import lakeconn  # noqa: E402
 import ql  # noqa: E402
-from engine import Engine  # noqa: E402
+from engine import Engine, Plan  # noqa: E402
 from ql_corpus import QL, QL_HISTORY  # noqa: E402
 
 
@@ -116,6 +116,7 @@ def main():
     ap.add_argument("--db-dir", default="/home/user/overpass-db")
     ap.add_argument("--only", nargs="*")
     ap.add_argument("--out", default="results/overpass_diff.json")
+    ap.add_argument("--no-lance", action="store_true", help="ignore the lake's Lance id store")
     ap.add_argument("--history", action="store_true",
                     help="also run the attic queries (reference loaded with --keep-attic, same diffs replayed)")
     ap.add_argument("--global-bbox", help="s,w,n,e: inject [bbox:...] into every request (a regional lake "
@@ -123,6 +124,10 @@ def main():
     args = ap.parse_args()
     con = duckdb.connect()
     lakeconn.attach(con, read_only=True)
+    import lancestore
+    base, versions = lancestore.state_versions(con)
+    store = lancestore.Store(base, versions) if base and not args.no_lance else None
+    print(f"Lance id store: {base} {versions}" if store else "no Lance id store", flush=True)
     rows, ok = [], 0
     for name, query in QL + (QL_HISTORY if args.history else []):
         if args.only and name not in args.only:
@@ -135,7 +140,8 @@ def main():
         t_ref = time.perf_counter() - t
         t = time.perf_counter()
         try:
-            _, ours_text = ql.Executor(Engine(con, "lake"), "").run(ql.parse(query)).render()
+            _, ours_text = ql.Executor(Engine(con, "lake", lance=store, plan=Plan(lance_scope="ids") if store else None),
+                                       "").run(ql.parse(query)).render()
             err = None
         except Exception as e:  # report and continue
             ours_text, err = "", f"{type(e).__name__}: {e}"
