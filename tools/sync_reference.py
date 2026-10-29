@@ -24,6 +24,7 @@ def main():
     ap.add_argument("--db-dir", required=True)
     ap.add_argument("--from", dest="start", required=True, help="timestamp the reference is at now")
     ap.add_argument("--bin", default="/home/user/overpass-ref/bin/update_database")
+    ap.add_argument("--keep-attic", action="store_true", help="the reference was loaded with --keep-attic")
     args = ap.parse_args()
     batches = re.findall(r"^(hour|minute)/(\d+) -> (\S+)", pathlib.Path(args.log).read_text(), re.M)
     todo = [(k, int(s), ts) for k, s, ts in batches if ts > args.start]
@@ -36,7 +37,8 @@ def main():
     for kind, seq, ts in plan:
         t = time.time()
         data = updater.osc(kind, seq)
-        r = subprocess.run([args.bin, f"--db-dir={args.db_dir}", "--meta", "--map-compression-method=gz"],
+        r = subprocess.run([args.bin, f"--db-dir={args.db_dir}", "--keep-attic" if args.keep_attic else "--meta",
+                            "--map-compression-method=gz"],
                            input=subprocess.run(["gunzip", "-c"], input=data, capture_output=True).stdout,
                            capture_output=True)
         if r.returncode:

@@ -548,7 +548,7 @@ def apply_with_retry(up, blob, ts, sequence, attempts=5):
             time.sleep(2 ** i)
 
 
-def follow(up, once=False, poll=30, kinds=("hour", "minute"), maintenance=None):
+def follow(up, once=False, poll=30, kinds=("hour", "minute"), maintenance=None, until=None):
     """Catch up with coarse diffs (hourly by default: a planet day diff is ~100 MB, too much to hold
     in one batch), then minute diffs; then poll the minutely feed."""
     base = up.sql("SELECT value FROM lake.state WHERE key = 'osm_base'").fetchall()[0][0]
@@ -562,6 +562,8 @@ def follow(up, once=False, poll=30, kinds=("hour", "minute"), maintenance=None):
         seq = start + 1
         while seq <= cur:
             s, ts = state_of(kind, seq)
+            if until is not None and ts > until:
+                return  # reached the requested point (tests replay a fixed window, not up to now)
             stats = apply_with_retry(up, osc(kind, seq), ts, f"{kind}/{seq}")
             print(f"{kind}/{seq} -> {ts} {stats}", flush=True)
             if maintenance is not None:
@@ -584,6 +586,7 @@ def main():
     ap.add_argument("files", nargs="*")
     ap.add_argument("--region", help="s,w,n,e: keep a regional extract consistent (omit for a planet lake)")
     ap.add_argument("--once", action="store_true", help="catch up and exit instead of following")
+    ap.add_argument("--until", help="stop before the first diff ending after this timestamp (fixed test windows)")
     ap.add_argument("--areas-every", type=int, default=3600, help="seconds between area rebuilds (0: never)")
     ap.add_argument("--compact-every", type=int, default=3600, help="seconds between compactions (0: never)")
     ap.add_argument("--publish-to", help="publish a frozen catalog here (e.g. s3://bucket/lake/catalog.ducklake)")
@@ -602,7 +605,7 @@ def main():
         print(up.apply([pathlib.Path(f).read_bytes() for f in args.files]))
     else:
         follow(up, once=args.once, maintenance=Maintenance(con, args.areas_every, args.compact_every,
-                                                           args.publish_to, args.publish_every))
+                                                           args.publish_to, args.publish_every), until=args.until)
 
 
 if __name__ == "__main__":
