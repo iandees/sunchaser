@@ -209,6 +209,10 @@ def main():
         man = json.loads(manifest.read_text())
         args.osm_base = args.osm_base or man.get("osm_base", "")
         args.sequence = args.sequence or str(man.get("sequence", ""))
+        if not args.osm_base:
+            sys.exit("error: the extract has no replication timestamp (its PBF header lacks one, as Geofabrik's "
+                     "files do), so the updater would have nowhere to start. Pass --osm-base: the extract's "
+                     "cut-off, e.g. the next hour boundary after `osmium fileinfo -e -g data.timestamp.last FILE`.")
         src = bucketed_sources(con, raw, man, args.group_rows)
     else:
         stage_flat(con, raw, step)
