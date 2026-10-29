@@ -126,12 +126,23 @@ def read_osc(blobs):
 
 # ---- applying ----------------------------------------------------------------------------
 
+def migrate(con):
+    """Bring an older lake's schema up to date (idempotent)."""
+    cols = {c for (c,) in con.sql("SELECT column_name FROM duckdb_columns() WHERE database_name = 'lake' "
+                                  "AND table_name = 'changes'").fetchall()}
+    if "batch" not in cols:  # monotonic per applied diff: lets the area build process only new changes
+        con.sql("ALTER TABLE lake.changes ADD COLUMN batch BIGINT")
+    if not con.sql("SELECT 1 FROM lake.state WHERE key = 'batch'").fetchall():
+        con.sql("INSERT INTO lake.state VALUES ('batch', '0')")
+
+
 class Updater:
     def __init__(self, con, region=None):
         self.con = con
         con.sql(MACROS)
         self.e = Engine(con, "lake")
         self.region = region  # (s, w, n, e) or None for a planet lake
+        migrate(con)
 
     def sql(self, q):
         return self.con.sql(q)
@@ -243,6 +254,8 @@ class Updater:
         touched = {"n": set(nodes), "w": set(ways) | cascade_w, "r": set(rels) | cascade_r}
         self.sql("BEGIN TRANSACTION")
         try:
+            self.batch_no = int(self.sql("SELECT value FROM lake.state WHERE key = 'batch'").fetchall()[0][0]) + 1
+            self.sql(f"UPDATE lake.state SET value = '{self.batch_no}' WHERE key = 'batch'")
             self._rewrite(touched, ex, ways, rels)
             if osm_base:
                 self.sql(f"UPDATE lake.state SET value = '{osm_base}' WHERE key = 'osm_base'")
@@ -422,8 +435,9 @@ class Updater:
         self.con.register("chg_arrow", pa.table({
             "ts": pa.array([r[0] for r in rows], pa.timestamp("s", tz="UTC")), "type": [r[1] for r in rows],
             "id": pa.array([r[2] for r in rows], pa.int64()), "old_version": pa.array([r[3] for r in rows], pa.int32()),
-            "new_version": pa.array([r[4] for r in rows], pa.int32()), "action": [r[5] for r in rows]}))
-        self.sql("INSERT INTO lake.changes SELECT * FROM chg_arrow")
+            "new_version": pa.array([r[4] for r in rows], pa.int32()), "action": [r[5] for r in rows],
+            "batch": pa.array([self.batch_no] * len(rows), pa.int64())}))
+        self.sql("INSERT INTO lake.changes BY NAME SELECT * FROM chg_arrow")
         self.con.unregister("chg_arrow")
 
     def _rewrite(self, touched, ex, ways, rels):
@@ -598,7 +612,7 @@ def main():
     ap.add_argument("--region", help="s,w,n,e: keep a regional extract consistent (omit for a planet lake)")
     ap.add_argument("--once", action="store_true", help="catch up and exit instead of following")
     ap.add_argument("--until", help="stop before the first diff ending after this timestamp (fixed test windows)")
-    ap.add_argument("--areas-every", type=int, default=3600, help="seconds between area rebuilds (0: never)")
+    ap.add_argument("--areas-every", type=int, default=300, help="seconds between incremental area updates (0: never)")
     ap.add_argument("--compact-every", type=int, default=3600, help="seconds between compactions (0: never)")
     ap.add_argument("--publish-to", help="publish a frozen catalog here (e.g. s3://bucket/lake/catalog.ducklake)")
     ap.add_argument("--publish-every", type=int, default=300, help="seconds between frozen-catalog publications")

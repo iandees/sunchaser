@@ -233,7 +233,7 @@ def main():
           SELECT r.*, r.valid_from AS valid_to, 0::INT AS version, NULL::TIMESTAMPTZ AS ts, 0::BIGINT AS changeset,
                  0::INT AS uid, ''::VARCHAR AS "user" FROM lake.relations r WHERE false;
         CREATE TABLE lake.changes (ts TIMESTAMPTZ, type VARCHAR, id BIGINT, old_version INT, new_version INT,
-                                   action VARCHAR);""")
+                                   action VARCHAR, batch BIGINT);""")
     fill("nodes_meta", "k, id", f"qt AS k, id, {meta}", src["n"])
     fill("ways_meta", "k, id", f"ov_key31(qt) AS k, id, {meta}", src["w"])
     fill("relations_meta", "k, id", f"ov_key31(qt) AS k, id, {meta}", src["r"])
@@ -264,7 +264,7 @@ def main():
 
     step("lake.state", f"""
         CREATE TABLE lake.state AS SELECT * FROM (VALUES
-          ('osm_base', '{args.osm_base}'), ('sequence', '{args.sequence}')) v(key, value)""")
+          ('osm_base', '{args.osm_base}'), ('sequence', '{args.sequence}'), ('batch', '0')) v(key, value)""")
     # Minutely updates are small: let them inline into the catalog until the next flush/compaction.
     con.sql("CALL lake.set_option('data_inlining_row_limit', 100000)")
     if catalog.startswith("sqlite:"):
