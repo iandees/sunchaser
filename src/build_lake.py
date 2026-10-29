@@ -11,6 +11,7 @@ Two inputs:
 """
 import argparse
 import json
+import os
 import pathlib
 import shutil
 import sys
@@ -85,18 +86,21 @@ def bucketed_sources(con, raw, manifest, group_rows):
     if manifest.get("format") != 2:
         raise SystemExit(f"unsupported extract format {manifest.get('format')}")
 
+    files = {}
+
     def groups(sub):
-        files = sorted((raw / sub).glob("*.parquet"))
-        rows = dict(con.sql(f"SELECT file_name, sum(num_rows) FROM parquet_file_metadata({[str(f) for f in files]}) "
+        files_ = sorted((raw / sub).glob("*.parquet"))
+        rows = dict(con.sql(f"SELECT file_name, sum(num_rows) FROM parquet_file_metadata({[str(f) for f in files_]}) "
                             "GROUP BY 1").fetchall())
         out, cur, n = [], [], 0
-        for f in files:
+        for f in files_:
             if cur and n + rows.get(str(f), 0) > group_rows:
                 out.append(cur)
                 cur, n = [], 0
             cur.append(str(f))
             n += rows.get(str(f), 0)
         out.append(cur)
+        files[sub] = [str(f) for f in files_]
         return [f"read_parquet({g})" for g in out]
 
     src = {"n": groups("nodes"), "w": groups("ways"), "r": groups("relations"),
@@ -104,6 +108,8 @@ def bucketed_sources(con, raw, manifest, group_rows):
     if manifest.get("history"):  # osm-extract --history: every version since the first
         src.update(history=True, nh=groups("nodes_history"), wh=groups("ways_history"),
                    rh=groups("relations_history"), changes=groups("changes"))
+    files["locator"] = [str(f) for f in sorted((raw / "locator").glob("*.parquet"))]
+    src["files"] = files
     return src
 
 
@@ -170,6 +176,8 @@ def main():
     ap.add_argument("--sequence", default="", help="replication sequence of the source data (default: from the header)")
     ap.add_argument("--row-group", type=int, default=16384)
     ap.add_argument("--target-file-mb", type=int, default=64)
+    ap.add_argument("--consume", action="store_true",
+                    help="bucketed input: delete each raw bucket once no later step needs it (less peak disk)")
     ap.add_argument("--lance", metavar="BASE", help="also build the Lance id store here (e.g. s3://bucket/lake/lance)")
     ap.add_argument("--group-rows", type=int, default=50_000_000,
                     help="bucketed input: rows sorted per insert (bounds memory and temp disk)")
@@ -209,28 +217,62 @@ def main():
     # geometry change); from a snapshot the version timestamp, as Overpass assumes without attic data
     vf = "valid_from" if src["history"] else "ts AS valid_from"
 
-    def fill(table, sort, select, sources, where=""):
+    def fill(table, sort, select, sources, where="", append=False):
         """Create lake.<table> from the first source and append the rest, each sorted by `sort`.
         Sources are disjoint, increasing key ranges, so the table ends up globally sorted."""
         t = time.time()
         for i, source in enumerate(sources):
             sql = f"SELECT {select} FROM {source} {where} ORDER BY {sort}"
-            con.sql(f"CREATE TABLE lake.{table} SORTED BY ({sort}) AS {sql}" if i == 0
-                    else f"INSERT INTO lake.{table} {sql}")
-        print(f"{'lake.' + table:<22} {time.time() - t:6.1f}s  ({len(sources)} groups)")
+            con.sql(f"CREATE TABLE lake.{table} SORTED BY ({sort}) AS {sql}" if i == 0 and not append
+                    else f"INSERT INTO lake.{table} BY NAME {sql}")
+        print(f"{'lake.' + table:<22} {time.time() - t:6.1f}s  ({len(sources)} groups)", flush=True)
 
+    def consume(*subs):
+        """--consume: raw buckets no later step reads are deleted, so the build's peak disk use
+        shrinks as it goes (the extract's raw output is the largest thing on disk)."""
+        if not args.consume or "files" not in src:
+            return
+        freed = 0
+        for sub in subs:
+            for f in src["files"].get(sub, []):
+                freed += os.path.getsize(f)
+                os.remove(f)
+        print(f"{'consumed ' + '+'.join(subs):<22} {freed / 1e9:6.1f} GB freed", flush=True)
+
+    # Tables are built type by type so each raw input can be freed after its last use.
     # Layout mirrors Overpass: element skeletons apart from metadata (*_meta files), and tagged
     # nodes apart from untagged way vertices (Overpass reads tags_local before any skeleton).
     meta = "version, ts, changeset, uid, \"user\""
+    # kv = 'key=value' as one sort/filter column: a single zone-map range per lookup, where separate
+    # k/v predicates made DuckDB probe v in every row group (266 vs 15 requests, results/NOTES.md).
+    # The one global sort of the build: per type, out of core; types are appended in order.
+    posting = "SELECT '{t}' AS type, unnest(map_keys(tags)) AS k, unnest(map_values(tags)) AS v, ov_key31(qt) AS qt_key31, id FROM {s}"
+    postings = lambda t: [f"({posting.format(t=t, s=union(src[t]))})"]
+    pcols = "type, k || '=' || v AS kv, k, v, qt_key31, id"
+
     fill("nodes_tagged", "qt, id", f"qt, id, lat, lon, tags, {vf}", src["n"], "WHERE cardinality(tags) > 0")
     fill("nodes_untagged", "qt, id", f"qt, id, lat, lon, tags, {vf}", src["n"], "WHERE cardinality(tags) = 0")
     step("lake.nodes (view)", """
         CREATE VIEW lake.nodes AS
         SELECT * FROM lake.nodes_tagged UNION ALL SELECT * FROM lake.nodes_untagged""")
+    fill("nodes_meta", "k, id", f"qt AS k, id, {meta}", src["n"])
+    fill("tag_postings", "type, kv, qt_key31, id", pcols, postings("n"))
+    consume("nodes")
+
     fill("ways", "qt_key31, id", f"""ov_key31(qt) AS qt_key31, ov_level(qt) AS qt_level, qt, id,
          min_lat, max_lat, min_lon, max_lon, tags, nds, nd_lat, nd_lon, {vf}""", src["w"])
+    fill("ways_meta", "k, id", f"ov_key31(qt) AS k, id, {meta}", src["w"])
+    fill("tag_postings", "type, kv, qt_key31, id", pcols, postings("w"), append=True)
+    consume("ways")
+
     fill("relations", "qt_key31, id", f"""ov_key31(qt) AS qt_key31, ov_level(qt) AS qt_level, qt, id,
          min_lat, max_lat, min_lon, max_lon, tags, members, {vf}""", src["r"])
+    fill("relations_meta", "k, id", f"ov_key31(qt) AS k, id, {meta}", src["r"])
+    fill("tag_postings", "type, kv, qt_key31, id", pcols, postings("r"), append=True)
+    fill("member_parent_rels", "mtype, mid", "DISTINCT m.type AS mtype, m.ref AS mid, m.id AS rel_id",
+         [f"(SELECT id, unnest(members, recursive := true) FROM {union(src['r'])}) m"])
+    consume("relations")
+
     # History (attic): versions the updater replaced, valid in [valid_from, valid_to). Current rows carry
     # valid_from: the version timestamp at build (what Overpass assumes without attic data), the change
     # time after an update (including geometry-only changes from moved nodes).
@@ -247,33 +289,26 @@ def main():
         CREATE TABLE lake.changes (ts TIMESTAMPTZ, type VARCHAR, id BIGINT, old_version INT, new_version INT,
                                    action VARCHAR, batch BIGINT);""")
     if src["history"]:
-        def append(table, sort, select, sources):
-            t = time.time()
-            for source in sources:
-                con.sql(f"INSERT INTO lake.{table} BY NAME SELECT {select} FROM {source} ORDER BY {sort}")
-            print(f"{'lake.' + table:<22} {time.time() - t:6.1f}s  ({len(sources)} groups)")
         hist = f"valid_from, valid_to, {meta}"
-        append("nodes_history", "qt, valid_from", f"qt, id, lat, lon, tags, {hist}", src["nh"])
-        append("ways_history", "qt_key31, valid_from", f"""ov_key31(qt) AS qt_key31, ov_level(qt) AS qt_level, qt, id,
-               min_lat, max_lat, min_lon, max_lon, tags, nds, nd_lat, nd_lon, {hist}""", src["wh"])
-        append("relations_history", "qt_key31, valid_from", f"""ov_key31(qt) AS qt_key31, ov_level(qt) AS qt_level, qt,
-               id, min_lat, max_lat, min_lon, max_lon, tags, members, {hist}""", src["rh"])
+        fill("nodes_history", "qt, valid_from", f"qt, id, lat, lon, tags, {hist}", src["nh"], append=True)
+        consume("nodes_history")
+        fill("ways_history", "qt_key31, valid_from", f"""ov_key31(qt) AS qt_key31, ov_level(qt) AS qt_level, qt, id,
+             min_lat, max_lat, min_lon, max_lon, tags, nds, nd_lat, nd_lon, {hist}""", src["wh"], append=True)
+        consume("ways_history")
+        fill("relations_history", "qt_key31, valid_from", f"""ov_key31(qt) AS qt_key31, ov_level(qt) AS qt_level, qt,
+             id, min_lat, max_lat, min_lon, max_lon, tags, members, {hist}""", src["rh"], append=True)
+        consume("relations_history")
         # buckets are consecutive periods of change time: sorted one at a time, the log is in time order
-        append("changes", "ts, type, id", "ts, type, id, old_version, new_version, action, batch", src["changes"])
-    fill("nodes_meta", "k, id", f"qt AS k, id, {meta}", src["n"])
-    fill("ways_meta", "k, id", f"ov_key31(qt) AS k, id, {meta}", src["w"])
-    fill("relations_meta", "k, id", f"ov_key31(qt) AS k, id, {meta}", src["r"])
-    # kv = 'key=value' as one sort/filter column: a single zone-map range per lookup, where separate
-    # k/v predicates made DuckDB probe v in every row group (266 vs 15 requests, results/NOTES.md).
-    # The one global sort of the build: per type, out of core.
-    posting = "SELECT '{t}' AS type, unnest(map_keys(tags)) AS k, unnest(map_values(tags)) AS v, ov_key31(qt) AS qt_key31, id FROM {s}"
-    fill("tag_postings", "type, kv, qt_key31, id", "type, k || '=' || v AS kv, k, v, qt_key31, id",
-         [f"({posting.format(t=t, s=union(src[t]))})" for t in ("n", "w", "r")])
+        fill("changes", "ts, type, id", "ts, type, id, old_version, new_version, action, batch", src["changes"],
+             append=True)
+        consume("changes")
+
     if src["locator"]:  # already in id order: no sort
         t = time.time()
         con.sql("CREATE TABLE lake.elem_locator SORTED BY (type, id) AS " + " UNION ALL ".join(
             f"SELECT * FROM (SELECT '{k}' AS type, id, qt FROM '{src['locator']}/{k}.parquet')" for k in "nwr"))
-        print(f"{'lake.elem_locator':<22} {time.time() - t:6.1f}s")
+        print(f"{'lake.elem_locator':<22} {time.time() - t:6.1f}s", flush=True)
+        consume("locator")
     else:
         step("lake.elem_locator", """
             CREATE TABLE lake.elem_locator SORTED BY (type, id) AS
@@ -281,12 +316,11 @@ def main():
                            UNION ALL SELECT 'r', id, qt FROM r) ORDER BY type, id""")
     if src["parents"]:  # distinct per way already, bucketed by node id
         fill("node_parent_ways", "node_id", "node_id, way_id", src["parents"])
+        consume("node_parent_ways")
     else:
         step("lake.node_parent_ways", """
             CREATE TABLE lake.node_parent_ways SORTED BY (node_id) AS
             SELECT DISTINCT unnest(nds) AS node_id, id AS way_id FROM w ORDER BY node_id""")
-    fill("member_parent_rels", "mtype, mid", "DISTINCT m.type AS mtype, m.ref AS mid, m.id AS rel_id",
-         [f"(SELECT id, unnest(members, recursive := true) FROM {union(src['r'])}) m"])
 
     step("lake.state", f"""
         CREATE TABLE lake.state AS SELECT * FROM (VALUES

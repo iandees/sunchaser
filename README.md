@@ -12,7 +12,8 @@ storage (S3, Cloudflare R2, or anything S3-compatible), kept current by a minute
   cascade. Each diff is one DuckLake transaction, so readers see whole diffs only.
 
 See [`docs/architecture.md`](docs/architecture.md) for how it works, [`docs/aws.md`](docs/aws.md) for a planet
-build with full history on AWS that scales to zero, [`docs/design.md`](docs/design.md)
+build with full history on AWS that scales to zero, [`docs/hetzner-r2.md`](docs/hetzner-r2.md) for the same on
+Cloudflare R2 (no egress fees) with a Hetzner box or a laptop, [`docs/design.md`](docs/design.md)
 for the original design exploration, and [`results/NOTES.md`](results/NOTES.md) for the measurements
 that shaped it.
 
@@ -47,6 +48,7 @@ that shaped it.
 | `src/lakeconn.py` | Catalog and S3/R2 connection setup shared by all tools |
 | `tools/compare_overpass.py` | Differential test against `osm3s_query` |
 | `tools/range_server.py` | S3-compatible test store (conditional PUTs, ETags) with latency injection and I/O accounting |
+| `tools/relocate_lake.py` | Points a lake built on local disk at its new location after copying it to R2/S3 |
 | `tools/make_history_extract.py` | Synthesises a history file (snapshot + applied diffs) to test the full-history build |
 | `queries/` | Engine corpus and full-QL differential corpus |
 

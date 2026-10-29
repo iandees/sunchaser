@@ -1,5 +1,8 @@
 # Planet build with full history on AWS
 
+> Egress from AWS costs about $0.09/GB for query results and for any reads from outside AWS. For
+> storage without egress fees and flat-rate compute, see [`hetzner-r2.md`](hetzner-r2.md).
+
 This runbook builds a planet lake with full history (`[date:]`, `newer` and `changed` back to the first
 OSM edits), keeps it current with minutely diffs, and serves it, with nothing running between
 updater runs and requests.

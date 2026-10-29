@@ -640,55 +640,103 @@ def follow(up, once=False, poll=30, kinds=("hour", "minute"), maintenance=None, 
 
 
 def job(args):
-    """One scheduled run against a catalog on object storage (src/objcatalog.py): download it,
-    apply pending diffs until caught up or out of time, update areas, compact when due, and upload
-    it conditionally. Nothing runs between jobs, so the deployment scales to zero."""
+    """Updater runs against a catalog on object storage (src/objcatalog.py), holding the writer lease.
+    One run (default): download the catalog, apply pending diffs until caught up or out of time,
+    update areas, compact when due, upload it conditionally, exit; scheduled, nothing runs between
+    runs. --loop: keep running and keep the catalog on local disk, uploading after each batch of
+    diffs (no download per run; for an always-on host)."""
     import objcatalog
     t0 = time.time()
-    if not objcatalog.acquire_lease(args.catalog_url, ttl=args.lease_seconds or args.max_seconds + 600):
+    ttl = args.lease_seconds or args.max_seconds + 600
+    lease = objcatalog.acquire_lease(args.catalog_url, ttl=ttl)
+    if not lease:
         print("job: another run holds the lease; exiting", flush=True)
         return 3
     try:
-        return _job(args, t0)
+        return _loop(args, lease, ttl) if args.loop else _job(args, t0)
     finally:
         objcatalog.release_lease(args.catalog_url)
 
 
+def _cycle(local, args, deadline):
+    """Attach the local catalog, apply what's pending, update areas, compact when due, detach.
+    Returns (diffs applied, catalog changed, state)."""
+    import build_areas
+    con = duckdb.connect()
+    lakeconn.attach(con, catalog=local, data_path="")  # the catalog knows its data path
+    try:
+        region = tuple(map(float, args.region.split(","))) if args.region else None
+        up = Updater(con, region)
+        n = follow(up, once=True, until=args.until, deadline=deadline)
+        if n and args.areas_every:
+            build_areas.build(con)
+        state = dict(con.sql("SELECT key, value FROM lake.state").fetchall())
+        compacted = False
+        if args.compact_every and time.time() - float(state.get("compacted_at", "0")) >= args.compact_every:
+            compact(con, grace=args.file_grace)
+            con.sql("DELETE FROM lake.state WHERE key = 'compacted_at'")
+            con.sql(f"INSERT INTO lake.state VALUES ('compacted_at', '{time.time():.0f}')")
+            compacted = True
+        con.sql("DETACH lake")  # the file is complete and closed before it is uploaded
+        return n, bool(n) or compacted, state
+    finally:
+        con.close()
+
+
+def _commit(args, local, etag, state):
+    """Conditional upload; returns the new ETag, or None if another writer committed first."""
+    import objcatalog
+    try:
+        new = objcatalog.push(local, args.catalog_url, etag)
+    except objcatalog.Conflict as e:
+        print(f"job: {e}; discarding this run", flush=True)
+        return None
+    if args.keep_versions:
+        objcatalog.copy(args.catalog_url, args.catalog_url.rsplit("/", 1)[0]
+                        + f"/catalogs/{state.get('osm_base', 'unknown').replace(':', '')}.ducklake")
+    return new
+
+
 def _job(args, t0):
     import tempfile
-    import build_areas
     import objcatalog
     with tempfile.TemporaryDirectory(dir=args.workdir) as tmp:
         local = os.path.join(tmp, "catalog.ducklake")
         etag = objcatalog.fetch(args.catalog_url, local)
-        con = duckdb.connect()
-        lakeconn.attach(con, catalog=local, data_path="")  # the catalog knows its data path
-        region = tuple(map(float, args.region.split(","))) if args.region else None
-        up = Updater(con, region)
-        n = follow(up, once=True, until=args.until, deadline=t0 + args.max_seconds)
-        if n and args.areas_every:
-            build_areas.build(con)
-        state = dict(con.sql("SELECT key, value FROM lake.state").fetchall())
-        last = float(state.get("compacted_at", "0"))
-        if args.compact_every and time.time() - last >= args.compact_every:
-            compact(con, grace=args.file_grace)
-            con.sql("DELETE FROM lake.state WHERE key = 'compacted_at'")
-            con.sql(f"INSERT INTO lake.state VALUES ('compacted_at', '{time.time():.0f}')")
-        elif not n:
+        n, changed, state = _cycle(local, args, t0 + args.max_seconds)
+        if not changed:
             print(f"job: nothing new at {state.get('osm_base')}", flush=True)
             return 0
-        con.sql("DETACH lake")
-        con.close()
-        try:
-            objcatalog.push(local, args.catalog_url, etag)
-        except objcatalog.Conflict as e:
-            print(f"job: {e}; discarding this run", flush=True)
+        if _commit(args, local, etag, state) is None:
             return 2
-        if args.keep_versions:
-            objcatalog.copy(args.catalog_url, args.catalog_url.rsplit("/", 1)[0]
-                            + f"/catalogs/{state.get('osm_base', 'unknown').replace(':', '')}.ducklake")
     print(f"job: {n} diffs to {state.get('osm_base')}, committed in {time.time() - t0:.0f}s", flush=True)
     return 0
+
+
+def _loop(args, lease, ttl):
+    """Always-on updater: the catalog stays on local disk between batches; each batch is uploaded
+    with If-Match on the previous upload's ETag, and the lease is renewed every cycle."""
+    import objcatalog
+    workdir = args.workdir or "."
+    local = os.path.join(workdir, "catalog.ducklake")
+    etag = objcatalog.fetch(args.catalog_url, local)
+    print(f"job --loop: catalog {args.catalog_url} -> {local}", flush=True)
+    while True:
+        t = time.time()
+        n, changed, state = _cycle(local, args, t + args.max_seconds)
+        if changed:
+            etag = _commit(args, local, etag, state)
+            if etag is None:
+                return 2  # someone else wrote the catalog: stop rather than fork it
+            print(f"job --loop: {n} diffs to {state.get('osm_base')}, committed in {time.time() - t:.0f}s", flush=True)
+        lease = objcatalog.renew_lease(args.catalog_url, lease, ttl)
+        if not lease:
+            print("job --loop: lost the writer lease; exiting", flush=True)
+            return 3
+        if args.until and state.get("osm_base", "") >= args.until:
+            return 0
+        if not n:
+            time.sleep(args.poll)
 
 
 def main():
@@ -707,6 +755,9 @@ def main():
     ap.add_argument("--keep-versions", action="store_true", help="job: also copy each committed catalog to catalogs/")
     ap.add_argument("--file-grace", type=int, default=3600, help="seconds before unreferenced files are deleted")
     ap.add_argument("--workdir", help="job: local scratch for the catalog (default: system temp)")
+    ap.add_argument("--loop", action="store_true",
+                    help="job: keep running with the catalog on local disk (always-on host; --workdir keeps it)")
+    ap.add_argument("--poll", type=float, default=30, help="job --loop: seconds to wait when nothing is new")
     ap.add_argument("--lease-seconds", type=float, help="job: writer lease length (default: --max-seconds + 600); "
                                                         "set it above the longest run, e.g. a compaction")
     args = ap.parse_args()

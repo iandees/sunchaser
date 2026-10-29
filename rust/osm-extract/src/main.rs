@@ -28,7 +28,7 @@ mod quadtile;
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -580,20 +580,35 @@ fn iso8601(secs: i64) -> String {
 }
 
 /// `"osm_base": ..., "sequence": ...` manifest fields from the PBF header's replication info, so the
-/// lake (and the updater) start where the file ends.
-fn header_fields(input: &Path) -> Result<String> {
-    let mut fields = String::new();
-    if let Some(blob) = BlobReader::from_path(input)?.next() {
-        if let Ok(BlobDecode::OsmHeader(h)) = blob?.decode() {
-            if let Some(ts) = h.osmosis_replication_timestamp() {
-                fields += &format!(", \"osm_base\": \"{}\"", iso8601(ts));
-            }
-            if let Some(seq) = h.osmosis_replication_sequence_number() {
-                fields += &format!(", \"sequence\": {seq}");
-            }
+/// lake (and the updater) start where the file ends. Captured while the input streams past.
+static HEADER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn note_header(h: &osmpbf::HeaderBlock) {
+    HEADER.get_or_init(|| {
+        let mut fields = String::new();
+        if let Some(ts) = h.osmosis_replication_timestamp() {
+            fields += &format!(", \"osm_base\": \"{}\"", iso8601(ts));
         }
-    }
-    Ok(fields)
+        if let Some(seq) = h.osmosis_replication_sequence_number() {
+            fields += &format!(", \"sequence\": {seq}");
+        }
+        fields
+    });
+}
+
+fn header_fields() -> String {
+    HEADER.get().cloned().unwrap_or_default()
+}
+
+/// The PBF from a file, or from stdin for `-` (e.g. piped from a download, so the file never has
+/// to be stored: the planet history is 164 GB).
+fn open_input(path: &Path) -> Result<BlobReader<Box<dyn Read + Send>>> {
+    let r: Box<dyn Read + Send> = if path.as_os_str() == "-" {
+        Box::new(BufReader::with_capacity(16 << 20, std::io::stdin()))
+    } else {
+        Box::new(BufReader::with_capacity(16 << 20, File::open(path).with_context(|| format!("open {}", path.display()))?))
+    };
+    Ok(BlobReader::new(r))
 }
 
 struct Args {
@@ -632,7 +647,7 @@ fn parse_args() -> Result<Args> {
     }
     // every bucket of the four bucketed tables is an open file until the end: 4 << 12 at most
     if pos.len() != 2 || !(1..=12).contains(&a.bucket_bits) {
-        bail!("usage: osm-extract <input.osm.pbf> <out-dir> [--bucket-bits 1..12 (8)] \
+        bail!("usage: osm-extract <input.osm.pbf | - for stdin> <out-dir> [--bucket-bits 1..12 (8)] \
                [--dense-index DIR [--max-node-id N] [--max-way-id N]] [--history]");
     }
     a.input = PathBuf::from(&pos[0]);
@@ -677,13 +692,17 @@ fn main() -> Result<()> {
     let elem_bucket = |b: &RecordBatch| qt_column(b).values().iter().map(|&q| (key31(q) >> (33 - bits)) as usize).collect::<Vec<_>>();
     let (mut n_nodes, mut n_ways, mut n_rels) = (0u64, 0u64, 0u64);
 
-    let mut blobs = BlobReader::from_path(&args.input).context("open pbf")?.peekable();
+    let mut blobs = open_input(&args.input)?.peekable();
     while blobs.peek().is_some() {
         let chunk: Vec<_> = blobs.by_ref().take(CHUNK_BLOBS).collect::<std::result::Result<_, _>>()?;
         let blocks: Vec<PrimitiveBlock> = chunk
             .par_iter()
             .filter_map(|b| match b.decode() {
                 Ok(BlobDecode::OsmData(block)) => Some(Ok(block)),
+                Ok(BlobDecode::OsmHeader(h)) => {
+                    note_header(&h);
+                    None
+                }
                 Ok(_) => None,
                 Err(e) => Some(Err(e)),
             })
@@ -743,7 +762,7 @@ fn main() -> Result<()> {
         m,
         "{{\"format\": 2, \"bucket_bits\": {bits}, \"node_id_shift\": {id_shift}, \"nodes\": {n_nodes}, \
          \"ways\": {n_ways}, \"relations\": {n_rels}, \"node_parent_ways\": {n_parents}{}}}",
-        header_fields(&args.input)?
+        header_fields()
     )?;
     println!(
         "nodes={n_nodes} ways={n_ways} relations={n_rels} node_parent_ways={n_parents} {:.1}s ({} threads)",

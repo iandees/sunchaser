@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use arrow::array::{
     ArrayRef, Int32Builder, Int64Array, Int64Builder, ListBuilder, MapBuilder, StringBuilder, StructBuilder,
     TimestampMillisecondBuilder, UInt32Builder,
@@ -28,7 +28,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use memmap2::{Mmap, MmapMut};
-use osmpbf::{BlobDecode, BlobReader, PrimitiveBlock, RelMemberType};
+use osmpbf::{BlobDecode, PrimitiveBlock, RelMemberType};
 use parquet::arrow::ArrowWriter;
 use rayon::prelude::*;
 
@@ -818,7 +818,7 @@ pub fn run(args: &Args) -> Result<()> {
     let mut versions = 0u64;
     let mut phase = 0u8;
     let mut pending: Vec<Version> = Vec::new();
-    let mut blobs = BlobReader::from_path(&args.input).context("open pbf")?.peekable();
+    let mut blobs = crate::open_input(&args.input)?.peekable();
     loop {
         let chunk: Vec<_> = blobs.by_ref().take(CHUNK_BLOBS).collect::<std::result::Result<_, _>>()?;
         let last = chunk.is_empty() || blobs.peek().is_none();
@@ -826,6 +826,10 @@ pub fn run(args: &Args) -> Result<()> {
             .par_iter()
             .filter_map(|b| match b.decode() {
                 Ok(BlobDecode::OsmData(block)) => Some(Ok(decode(&block))),
+                Ok(BlobDecode::OsmHeader(hd)) => {
+                    crate::note_header(&hd);
+                    None
+                }
                 Ok(_) => None,
                 Err(e) => Some(Err(e)),
             })
@@ -896,7 +900,7 @@ pub fn run(args: &Args) -> Result<()> {
         "{{\"format\": 2, \"history\": true, \"bucket_bits\": {bits}, \"node_id_shift\": {id_shift}, \
          \"nodes\": {}, \"ways\": {}, \"relations\": {}, \"nodes_history\": {}, \"ways_history\": {}, \
          \"relations_history\": {}, \"changes\": {n_changes}, \"node_parent_ways\": {n_parents}{}}}",
-        counts[0], counts[1], counts[2], hist_rows[0], hist_rows[1], hist_rows[2], crate::header_fields(&args.input)?
+        counts[0], counts[1], counts[2], hist_rows[0], hist_rows[1], hist_rows[2], crate::header_fields()
     )?;
     println!(
         "history: {versions} versions -> current n={} w={} r={}, history n={} w={} r={}, changes={n_changes} {:.1}s",

@@ -112,6 +112,20 @@ def acquire_lease(url, ttl):
         return None
 
 
+def renew_lease(url, etag, ttl):
+    """Extend a lease this writer holds (If-Match on its ETag). Returns the new ETag, or None if
+    the lease was taken over (it had expired)."""
+    import json
+    import time
+    from botocore.exceptions import ClientError
+    bucket, key = _split(url + ".lease")
+    body = json.dumps({"expires": time.time() + ttl}).encode()
+    try:
+        return _client().put_object(Bucket=bucket, Key=key, Body=body, IfMatch=etag)["ETag"]
+    except ClientError:
+        return None
+
+
 def release_lease(url):
     bucket, key = _split(url + ".lease")
     _client().delete_object(Bucket=bucket, Key=key)
