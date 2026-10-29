@@ -20,6 +20,7 @@ import argparse
 import os
 import pathlib
 import sys
+import threading
 import time
 import urllib.request
 
@@ -39,6 +40,9 @@ TAGS_T = pa.map_(pa.string(), pa.string())
 META_T = [("version", pa.int32()), ("ts", pa.timestamp("s", tz="UTC")), ("changeset", pa.int64()),
           ("uid", pa.int32()), ("user", pa.string())]
 MEMBER_T = pa.struct([("type", pa.string()), ("ref", pa.int64()), ("role", pa.string())])
+
+
+STOP = threading.Event()  # set by SIGTERM: finish the diff in hand, upload, release the lease, exit
 
 
 # ---- replication feed ----------------------------------------------------------------
@@ -540,23 +544,59 @@ class Updater:
                      WHERE id IN ({changed_rels})) m""")
 
 
-def compact(con, grace=3600):
-    """Periodic maintenance: inlined rows -> sorted Parquet, small files merged, old snapshots dropped.
-    Files are deleted only `grace` seconds after they stop being referenced, so readers still on an
-    older catalog (or a frozen copy) keep working; orphans from discarded job runs go the same way."""
-    for q in ("CALL ducklake_flush_inlined_data('lake')", "CALL ducklake_merge_adjacent_files('lake')",
-              "CALL ducklake_rewrite_data_files('lake')",
-              f"CALL ducklake_expire_snapshots('lake', older_than => now() - INTERVAL {int(grace)} SECOND)",
-              f"CALL ducklake_cleanup_old_files('lake', older_than => now() - INTERVAL {int(grace)} SECOND)",
-              f"CALL ducklake_delete_orphaned_files('lake', older_than => now() - INTERVAL {int(grace)} SECOND)"):
-        t = time.time()
-        try:
-            con.sql(q)
-            print(f"{q:<90} {time.time() - t:6.1f}s")
-        except duckdb.Error as e:
-            print(f"{q:<90} skipped: {str(e).splitlines()[0][:80]}")
+def compaction_steps(grace=3600):
+    """The compaction as (label, run(con)) steps: inlined rows -> sorted Parquet, small files merged,
+    old snapshots dropped, Lance fragments merged. Files are deleted only `grace` seconds after they
+    stop being referenced, so readers still on an older catalog (or a frozen copy) keep working;
+    orphans from discarded job runs go the same way."""
+    sql = ("CALL ducklake_flush_inlined_data('lake')", "CALL ducklake_merge_adjacent_files('lake')",
+           "CALL ducklake_rewrite_data_files('lake')",
+           f"CALL ducklake_expire_snapshots('lake', older_than => now() - INTERVAL {int(grace)} SECOND)",
+           f"CALL ducklake_cleanup_old_files('lake', older_than => now() - INTERVAL {int(grace)} SECOND)",
+           f"CALL ducklake_delete_orphaned_files('lake', older_than => now() - INTERVAL {int(grace)} SECOND)")
     import lancestore
-    lancestore.maintain(con, grace)
+    return ([(q, lambda con, q=q: con.sql(q)) for q in sql]
+            + [(f"lance maintain {name}", lambda con, name=name: lancestore.maintain(con, grace, [name]))
+               for name in lancestore.TABLES])
+
+
+def run_step(con, label, run):
+    t = time.time()
+    try:
+        run(con)
+        if not label.startswith("lance"):  # lance maintain prints its own line
+            print(f"{label:<90} {time.time() - t:6.1f}s", flush=True)
+    except duckdb.Error as e:
+        print(f"{label:<90} skipped: {str(e).splitlines()[0][:80]}", flush=True)
+
+
+def compact(con, grace=3600):
+    """All the compaction steps in a row (the CLI and the `run` mode)."""
+    for label, run in compaction_steps(grace):
+        run_step(con, label, run)
+
+
+COMPACTION = None  # job --loop: the steps still to run, one per cycle, so diffs flow between them
+
+
+def compact_due(con, args, state):
+    """job: run compaction if it is due; True if any step ran. With --loop one step runs per cycle:
+    a flush or a Lance merge takes minutes on a big lake, and the updater is the only thing keeping the
+    lake current, so it applies diffs between steps instead of stalling for the whole compaction. A
+    one-shot job (a new process each run) runs all the steps."""
+    global COMPACTION
+    if COMPACTION is None:
+        if not args.compact_every or time.time() - float(state.get("compacted_at", "0")) < args.compact_every:
+            return False
+        COMPACTION = compaction_steps(args.file_grace)
+    for _ in range(1 if args.loop else len(COMPACTION)):
+        label, run = COMPACTION.pop(0)
+        run_step(con, label, run)
+    if not COMPACTION:
+        COMPACTION = None
+        con.sql("DELETE FROM lake.state WHERE key = 'compacted_at'")
+        con.sql(f"INSERT INTO lake.state VALUES ('compacted_at', '{time.time():.0f}')")
+    return True
 
 
 class Maintenance:
@@ -619,7 +659,7 @@ def follow(up, once=False, poll=30, kinds=("hour", "minute"), maintenance=None, 
             s, ts = state_of(kind, seq)
             if until is not None and ts > until:
                 return applied  # reached the requested point (tests replay a fixed window, not up to now)
-            if deadline is not None and time.time() > deadline:
+            if STOP.is_set() or (deadline is not None and time.time() > deadline):
                 return applied  # the next job continues from state.osm_base
             stats = apply_with_retry(up, osc(kind, seq), ts, f"{kind}/{seq}")
             applied += 1
@@ -631,7 +671,7 @@ def follow(up, once=False, poll=30, kinds=("hour", "minute"), maintenance=None, 
             if kind == "minute" and seq > cur and not once:
                 while True:
                     cur, _ = state_of("minute")
-                    if cur >= seq:
+                    if cur >= seq or STOP.is_set():
                         break
                     time.sleep(poll)
         if once and kind == "minute":
@@ -649,9 +689,9 @@ def job(args):
     import signal
     t0 = time.time()
     ttl = args.lease_seconds or args.max_seconds + 600
-    # systemd stops a service with SIGTERM: exit through the `finally` so the lease is released and
-    # the restarted job doesn't wait out the old one's TTL
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+    # systemd stops a service with SIGTERM: finish the diff in hand, upload, and release the lease
+    # (the `finally`), so the restarted job doesn't wait out the old one's TTL
+    signal.signal(signal.SIGTERM, lambda *_: STOP.set())
     lease = objcatalog.acquire_lease(args.catalog_url, ttl=ttl)
     if not lease:
         print("job: another run holds the lease; exiting", flush=True)
@@ -675,12 +715,7 @@ def _cycle(local, args, deadline):
         if n and args.areas_every:
             build_areas.build(con)
         state = dict(con.sql("SELECT key, value FROM lake.state").fetchall())
-        compacted = False
-        if args.compact_every and time.time() - float(state.get("compacted_at", "0")) >= args.compact_every:
-            compact(con, grace=args.file_grace)
-            con.sql("DELETE FROM lake.state WHERE key = 'compacted_at'")
-            con.sql(f"INSERT INTO lake.state VALUES ('compacted_at', '{time.time():.0f}')")
-            compacted = True
+        compacted = compact_due(con, args, state)
         con.sql("DETACH lake")  # the file is complete and closed before it is uploaded
         return n, bool(n) or compacted, state
     finally:
@@ -719,29 +754,37 @@ def _job(args, t0):
 
 
 def _loop(args, lease, ttl):
-    """Always-on updater: the catalog stays on local disk between batches; each batch is uploaded
-    with If-Match on the previous upload's ETag, and the lease is renewed every cycle."""
+    """Always-on updater: the catalog stays on local disk between batches; each upload is conditional
+    on the previous upload's ETag, and the lease is renewed every cycle. Uploads happen at most every
+    --upload-every seconds (at the next cycle after that, so within --poll more), and at once when
+    stopping or at --until: a crash loses only the batches since the last upload, which the next start
+    applies again."""
     import objcatalog
     workdir = args.workdir or "."
     local = os.path.join(workdir, "catalog.ducklake")
     etag = objcatalog.fetch(args.catalog_url, local)
     print(f"job --loop: catalog {args.catalog_url} -> {local}", flush=True)
+    dirty, unsent, last_upload = False, 0, 0.0
     while True:
         t = time.time()
         n, changed, state = _cycle(local, args, t + args.max_seconds)
-        if changed:
+        dirty, unsent = dirty or changed, unsent + n
+        reached = args.until and state.get("osm_base", "") >= args.until
+        if dirty and (not args.upload_every or STOP.is_set() or reached
+                      or time.time() - last_upload >= args.upload_every):
             etag = _commit(args, local, etag, state)
             if etag is None:
                 return 2  # someone else wrote the catalog: stop rather than fork it
-            print(f"job --loop: {n} diffs to {state.get('osm_base')}, committed in {time.time() - t:.0f}s", flush=True)
+            print(f"job --loop: {unsent} diffs to {state.get('osm_base')}, committed in {time.time() - t:.0f}s", flush=True)
+            dirty, unsent, last_upload = False, 0, time.time()
         lease = objcatalog.renew_lease(args.catalog_url, lease, ttl)
         if not lease:
             print("job --loop: lost the writer lease; exiting", flush=True)
             return 3
-        if args.until and state.get("osm_base", "") >= args.until:
+        if STOP.is_set() or reached:
             return 0
-        if not n:
-            time.sleep(args.poll)
+        if not n and COMPACTION is None:
+            STOP.wait(args.poll)
 
 
 def main():
@@ -759,6 +802,8 @@ def main():
     ap.add_argument("--max-seconds", type=float, default=240, help="job: stop applying diffs after this long")
     ap.add_argument("--keep-versions", nargs="?", type=int, const=24, default=0, metavar="N",
                     help="job: also copy each committed catalog to catalogs/, keeping the newest N (default 24)")
+    ap.add_argument("--upload-every", type=float, default=0, metavar="SECONDS",
+                    help="job --loop: upload the catalog at most this often (default 0: after every batch)")
     ap.add_argument("--file-grace", type=int, default=3600, help="seconds before unreferenced files are deleted")
     ap.add_argument("--workdir", help="job: local scratch for the catalog (default: system temp)")
     ap.add_argument("--loop", action="store_true",

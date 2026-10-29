@@ -129,14 +129,15 @@ def apply(con, base, versions, touched, rows):
     return out
 
 
-def maintain(con, grace=3600):
+def maintain(con, grace=3600, tables=None):
     """Compaction for Lance: merge small fragments, index appended rows, drop versions older than
-    the grace period. Records the new versions (one DuckLake commit)."""
+    the grace period. Records the new versions (one DuckLake commit). `tables` limits it to some
+    of them (the updater does one per cycle); the others keep their recorded version."""
     base, versions = state_versions(con)
     if not base:
         return
-    new = {}
-    for name in TABLES:
+    new = dict(versions)
+    for name in tables or TABLES:
         t = time.time()
         ds = lance.dataset(f"{base}/{name}.lance", storage_options=storage_options())
         ds.optimize.compact_files(target_rows_per_fragment=1 << 20, max_rows_per_group=ROWS_PER_GROUP)
