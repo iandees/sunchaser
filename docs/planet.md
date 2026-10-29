@@ -1,96 +1,97 @@
 # Running sunchaser for the planet
 
-This is the plan for a planet-scale deployment. It is extrapolated from the Berlin measurements below. Nothing here has run at planet scale yet: the development box has 4 cores, 15 GB RAM and 250 GB of disk.
+What a full-history planet deployment needs, from a measured sizing run, plus how it runs. The step-by-step runbooks are `docs/hetzner-r2.md` (Hetzner + Cloudflare R2, recommended) and `docs/aws.md`.
 
-## Measured on the Berlin extract (4 cores)
+## How the numbers were measured
 
-| Step | Input | Time | Output |
+`deploy/hetzner/sizing.sh` on a 4-core, 15 GB container (October 2026), in two parts:
+
+1. **One streamed pass over the real history planet** (`history-261019.osm.pbf`, 164 GB). The file goes from OSMF's bucket straight into `osm-extract --cut` and is never stored. The pass:
+   - counts the whole planet exactly (`planet_stats.json`);
+   - cuts full-history extracts of three regions with different mixes.
+2. **Per region:** the lake (with Lance) and its areas are built locally under `tools/measure.py`. Then `tools/size_planet.py` scales each table by the planet total it depends on (node, way or relation versions).
+
+The range in each estimate is the spread across the three regions. Raw results are in `results/sizing/`.
+
+| Region | Box | Versions | Share of the planet's versions |
 |---|---|---|---|
-| `osm-extract` (bucketed, in-RAM index) | 183 MB PBF; 12.9 M nodes, 2.27 M ways, 30 k relations | 20–24 s | 600 MB raw Parquet |
-| `osm-extract --dense-index` | same | 65 s (sparse ids: 3.6 GB of index pages for a city) | same |
-| `build_lake.py` (bucketed) | raw Parquet | 35 s (flat input: 71 s) | 540 MB lake |
-| Updater, regional (24 hourly diffs) | about 80 k changes per hour, planet-wide | 320 s for the day (5–14 s per hour) | |
-| Updater, **no region filter** (every change applied) | one planet hour: 67–75 k changes, 54–60 k nodes, 5–7 k ways | 11–22 s per hour | |
+| Luxembourg | 49.44–50.19 N, 5.73–6.53 E | 17.1 M | 0.09% |
+| Berlin | 52.33–52.68 N, 13.08–13.77 E | 27.9 M | 0.15% |
+| Swiss plateau | 46.9–47.6 N, 7.0–9.0 E | 55.1 M | 0.29% |
 
-The bucketed build was checked row by row against the flat build: identical tables, and every table's files are in key order.
+## The planet, exactly (history file of 2026-10-19)
 
-## Planet sizes (OSM, late 2026, approximate)
+| | Versions | Deleted versions | Ids ever used | Max id |
+|---|---|---|---|---|
+| Nodes | 16,657,902,975 | 1,522,378,172 | 12,453,707,759 | 14,298,154,526 |
+| Ways | 2,471,108,843 | 142,010,722 | 1,366,233,306 | 1,569,574,897 |
+| Relations | 67,784,271 | 3,819,482 | 18,740,003 | 21,713,761 |
 
-About 10 B nodes, 1.1 B ways and 13 M relations; the PBF is about 85 GB, roughly 465× Berlin's. Scaled from Berlin per table, where each table follows the element count it is made of:
+There are 15.9 B node-position records (first positions, moves and deletions) and 36.5 B way node references across all way versions.
 
-| Table | Berlin | Planet estimate |
-|---|---|---|
-| `nodes_untagged` | 98 MB | 75 GB |
-| `nodes_tagged` | 32 MB | 15 GB |
-| `ways` (with geometry) | 183 MB | 90 GB |
-| `nodes_meta` | 58 MB | 45 GB |
-| `tag_postings` | 71 MB | 35 GB |
-| `node_parent_ways` | 40 MB | 30 GB |
-| `elem_locator` | 29 MB | 22 GB |
-| `relations`, `*_meta`, `member_parent_rels` | 26 MB | 15 GB |
-| **Total** | 540 MB | **about 330 GB** of Parquet on R2/S3 |
+Measured on the cut pass itself (4 cores): it took 84 min and peaked at 11.6 GB RSS. The download averaged about 33 MB/s over 8 range connections. The extractor set the pace, not the network; the download alone reached 80 MB/s.
 
-Berlin has more tags per element than the planet average, so tag-heavy tables are probably over-estimated.
+## Estimate: disk and storage
 
-## Initial build
+| Planet, full history | Estimate |
+|---|---|
+| Raw extraction (local disk) | 800–850 GB |
+| Node position timeline (`--dense-index`): 8 B per id + 16 B per position record | 370 GB |
+| Way geometry timeline | 115–120 GB |
+| **Peak local disk during the extract** (the PBF is streamed, not stored) | **1.28–1.34 TB** |
+| Lake in object storage (Parquet), of which: | **610–620 GB** |
+| – history and change log (`*_history`, `changes`) | 350–380 GB |
+| – current tables, indexes, metadata | 240–265 GB |
+| Lance id store (current nodes and ways) | 490–550 GB |
 
-One large machine with local NVMe, for example 32–64 vCPU, 128–256 GB RAM and 2 TB NVMe (AWS `i4i.8xlarge`, or `c7gd`/`r7gd`). Run it in the same region as the source PBF (osm-pds publishes the weekly planet PBF in `us-east-1`) or next to the R2 bucket.
+- **Timelines:** they are deleted after the extract. The build then needs only the raw buckets, and `--consume` frees them as it goes, plus DuckDB sort spill. The regional builds' local work directories stayed under 2× their lake size.
+- **Lance:** about 2× the size of the current Parquet tables it copies. On R2 that is about $8 a month, against $9 for the whole Parquet lake. Lance made queries 1.54× faster (geometric mean over the test corpus; see `results/NOTES.md`).
+- **Box sizing:** a 2 × 1 TB RAID0 box (about 1.9 TB usable) has about 30% headroom at the extract's peak. A 1 TB laptop does not fit a full-history extract. It does fit a current-only planet.
 
-1. **Get the PBF.** Note its replication timestamp; it becomes `--osm-base`, and the updater finds its replication sequence from it.
-2. **Extract:**
+## Estimate: time and memory
 
-   ```bash
-   osm-extract planet.osm.pbf /nvme/raw --bucket-bits 12 --dense-index /nvme/idx
-   ```
+| Step | Measured on the regions (4 cores) | Planet, 4 cores | Planet, 6-core i7-8700 (≈) |
+|---|---|---|---|
+| Extract: history processing | 136–316 s; 126–175 k versions/s | 31–43 h | 20–30 h |
+| Lake build (with Lance) | 89–246 s; peak RSS 7–12 GB (DuckDB takes what it's allowed) | 24–39 h | 15–25 h |
+| Areas (full) | 2–10 s | under 1 h | under 1 h |
 
-   - The dense index is about 110 GB for node locations plus 35 GB for the way index. Both are sparse mmap files, written once, sequentially by id, then read randomly while ways and relations are resolved. Keep them on NVMe; page cache does the rest.
-   - With 12 bucket bits, nodes, ways and relations each split into up to 4,096 quadtile-range files, and `node_parent_ways` into 4,096 id-range files. That is about 16 k open files; the soft `ulimit -n` must allow it.
-   - Expected time is 1–2 h, bound by decompression and random index reads. The Berlin rate scaled by PBF size and 8× the cores gives about 25 min of CPU, so the index I/O decides it.
-   - Output is about 350 GB of raw Parquet on NVMe.
-3. **Build the lake** straight into the bucket:
+- **Scaling assumptions:** times are scaled linearly by versions. The core-count column assumes near-linear scaling with cores. Both are assumptions until the first planet build records real numbers (`grep MEASURE /data/logs/*.log`).
+- **Extract:** decoding is not the bottleneck; the cut pass decoded the whole planet in 84 min on 4 cores. History processing is. It runs per id group, in parallel, and is CPU-bound.
+- **Build:** mostly sorting and Parquet encoding. The two relation tables are sorted single-threaded. A parallel sorted insert into DuckLake ran out of memory on Berlin's relation history (490 k versions carrying 303 M member entries), while one thread spills to disk and finishes. Relation history is small in rows but large in members: about 8.1 B member entries across the planet's relation versions.
+- **Memory:** the extractor stays around 3–12 GB, with mimalloc and bounded writer buffers. DuckDB uses up to its memory limit (80% of RAM by default) and spills the rest to local disk. 64 GB is enough; 128 GB leaves page cache for the timelines.
 
-   ```bash
-   SUNCHASER_CATALOG=postgres:... SUNCHASER_DATA_PATH=s3://bucket/lake/ \
-     python src/build_lake.py --raw /nvme/raw --group-rows 200000000
-   ```
+Total for a 6-core box: about 2 days of compute, extract plus build. That is roughly $12 at $0.24/h for a Hetzner auction box.
 
-   - Each element table is filled one bucket group at a time: sort about 200 M rows, then append. Memory and DuckDB temp space stay bounded by the group, not the planet.
-   - The only global sort is `tag_postings` by `key=value`, done per element type out of core (DuckDB spills to `temp_directory`, which should point at NVMe).
-   - `elem_locator` needs no sort, because the PBF is already in id order.
-   - Expected time is 2–4 h, mostly Parquet encoding, zstd and upload; Berlin's 35 s scaled by about 600× rows and 8× cores gives about 45 min of CPU.
-4. **Areas:** `python src/build_areas.py`, about 1.2 M multipolygon and boundary relations, through DuckDB spatial (`ST_BuildArea`). This is a full rebuild today. At planet scale it should run per bucket of relations, or incrementally from `changes`; see below.
-5. **Publish** a frozen catalog for stateless readers: `python src/updater.py publish s3://bucket/lake/catalog.ducklake`.
+## Running costs (R2 + Hetzner)
+
+| | Per month |
+|---|---|
+| R2 storage: 610–620 GB of Parquet + 490–550 GB of Lance | ≈ $17 (≈ $9 without Lance) |
+| R2 requests: a catalog upload per batch, plus compaction | a few dollars |
+| Egress | $0 (R2) |
+| Updater + API host | the Hetzner box, or a small VPS once the build is done |
 
 ## Updates
 
-- **Updater host:** one small, always-on host: 4–8 vCPU, 16–32 GB RAM, near the bucket.
-- **Catalog:** use Postgres, for example RDS or Neon, not SQLite, so API servers on other hosts see minutely commits.
-- **Command:**
-
-  ```bash
-  python src/updater.py run --publish-to s3://bucket/lake/catalog.ducklake
-  ```
-
-  Without `--region`, every change is applied.
-- **Throughput:** a planet hour took 11–22 s to apply on 4 cores, against a Berlin-sized lake with no compaction between hours. That is 0.2–0.4 s per minutely diff, plus about 1 s of fixed overhead per commit.
-  - Against the real planet tables, the deletes have to locate old rows. Lookups go through `elem_locator`, pruned by id zone maps, and deletes are pruned by key, so cost should grow with the number of row groups touched, not with table size. This is the part to measure first at scale.
+- **Shape:** one updater, `updater.py job --loop`, is the only writer. It holds a lease object next to the catalog and keeps the catalog file locally. After each batch it uploads it with `If-Match`, so a second writer can't overwrite it. API servers are read-only and reload when the catalog's ETag changes. Nothing has to stay on: the same job can run on a schedule (`updater.py job`) instead of `--loop`.
+- **Throughput:** a planet hour applied in 11–22 s on 4 cores against a small lake. The cost against planet-sized tables still needs measuring on the real lake; deletes are located through `elem_locator` and pruned by key.
 - **What a commit writes:**
-  - DuckLake 1.0 keeps both new rows (`data_inlining_row_limit`) and deletes (`ducklake_inlined_delete_*`) in the catalog. A minutely commit is a Postgres transaction, not a scatter of small Parquet and delete files.
-  - Compaction (`updater.py compact`, hourly) flushes them into sorted Parquet and merges small files.
-  - The planet touches every region every hour, so compaction rewrites the files a diff touched. Budget about 1–5 GB of rewrites per hour, and run it on a separate schedule from minutely applies; it is already separate in `Maintenance`.
-- **Cascade:** moved nodes cause their ways and relations to be rewritten (Overpass does the same). The parent indexes (`node_parent_ways`, `member_parent_rels`) make this a lookup, not a scan.
-- **History:** every replaced version moves to `*_history` with `valid_from`/`valid_to`, so attic queries work from the build date on. History grows by roughly the volume of changes: about 3–5 M element versions a day, so tens of GB a year. It is sorted like the current tables, so `[date:]` queries prune the same way.
+  - New rows and deletes are inlined in the catalog file (DuckLake 1.0).
+  - Compaction runs inside the job on its own cadence: it flushes inlined data, merges small files, expires snapshots and removes orphaned files.
+  - Lance is updated in the same job, and its versions are pinned in `lake.state` in the same transaction.
+- **Areas:** each batch rebuilds only the areas whose relations changed, including member way moves (the `changes` log's `batch` column).
+- **History:** replaced versions move to `*_history`, so attic queries cover everything since 2005 and keep growing with the edits.
 
 ## Serving
 
-- **API servers** are stateless: `src/server.py` behind a load balancer, autoscaled on CPU. Each one needs only object storage plus either the Postgres catalog (minutely freshness) or the frozen catalog file (freshness of a few minutes, no database).
-- **Cache:** the hot set is the Parquet footers and row groups of popular areas. DuckDB's external file cache, and a local NVMe cache in front of R2/S3, cut first-byte latency. R2 has no egress fees, which suits a public API.
-- **Streaming:** responses stream as they are produced, so large results never sit in memory twice, and a slow client pauses its query. `SUNCHASER_MAX_QUERIES`, `SUNCHASER_MAX_OUTPUT` and `SUNCHASER_MAX_TIMEOUT` bound one server.
-- **Output speed:** JSON for nodes and ways (without `meta` or clipping) is built in DuckDB SQL, at about 32 MB/s per query on 4 cores. A whole-city `out geom` (250 MB) takes 8 s, against 24 s in Python. XML, CSV, `meta`, relations and clipped geometry still serialise in Python, at about 10 MB/s.
+- **API servers** (`src/server.py`) are stateless. They need only the bucket: the catalog file and the Parquet and Lance data.
+- **Cache:** the hot set is Parquet footers and the row groups of popular areas. DuckDB's external file cache, and a local NVMe cache in front of R2, cut first-byte latency.
+- **Streaming:** responses stream as they are produced. `SUNCHASER_MAX_QUERIES`, `SUNCHASER_MAX_OUTPUT` and `SUNCHASER_MAX_TIMEOUT` bound one server.
 
 ## Open items for planet scale
 
-- **Areas:** incremental rebuild, only for relations that changed or whose members moved (the updater's `changes` log has them). Today it is a full rebuild.
-- **Update cost against planet-sized tables:** delete lookups, the compaction cadence and the size of the catalog's inlined data all need measuring.
-- **Serialisation:** move XML, `out meta` and relation geometry into SQL as well.
+- **Extract throughput:** history processing is about 1.5 days on 4–6 cores. A box with more cores, or profiling the node group step (16.7 B versions), shortens it most.
+- **Update cost against the real planet lake:** delete lookups, compaction time and the size of the catalog file.
+- **Query latency against real R2:** the 1.54× Lance gain was measured with a local stand-in at 30 ms per request.
 - **Antimeridian-crossing boxes** in the query engine.

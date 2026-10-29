@@ -96,13 +96,15 @@ def main():
         return per
 
     raw, lake = estimate("raw"), estimate("lake")
-    lance = [r["s"]["lake_bytes"].get(str(pathlib.Path(r["s"]["build"]["peak_disk_gb"] and "") or ""), 0) for r in regions]
+    # Lance holds current nodes and ways only: planet ids ever used, less those deleted (about one
+    # deleted version per deleted id)
+    cur_ids = sum(planet["ids"][i] - planet["deleted"][i] for i in (0, 1))
     lance = []
     for r in regions:
         lb = r["s"]["lake_bytes"]
         lance_b = next((b for k, b in lb.items() if k.endswith("lance")), 0)
         cur = r["s"]["manifest"]
-        lance.append(lance_b * (planet["ids"][0] + planet["ids"][1]) / max(cur["nodes"] + cur["ways"], 1))
+        lance.append(lance_b * cur_ids / max(cur["nodes"] + cur["ways"], 1))
     timeline = 8 * planet["max_id"][0] + 16 * planet["node_moves"]
     way_tl = [8 * planet["max_id"][1] + 32 * (r["s"]["manifest"]["ways"] + r["s"]["manifest"]["ways_history"])
               * pv["w"] / max(r["v"].get("w", 1), 1) for r in regions]

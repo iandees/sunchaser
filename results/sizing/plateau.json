@@ -1,0 +1,98 @@
+{
+ "manifest": {
+  "format": 2,
+  "history": true,
+  "bucket_bits": 8,
+  "node_id_shift": 26,
+  "versions": 55125311,
+  "nodes": 23312804,
+  "ways": 3112631,
+  "relations": 62356,
+  "nodes_history": 17848399,
+  "ways_history": 10027687,
+  "relations_history": 753335,
+  "changes": 60489821,
+  "node_parent_ways": 26468556,
+  "process_seconds": 315.6,
+  "osm_base": "2026-10-19T00:00:04Z",
+  "region": "plateau",
+  "bbox_e7": [
+   469000000,
+   70000000,
+   476000000,
+   90000000
+  ]
+ },
+ "raw_bytes": {
+  "changes": 298093975,
+  "locator": 100519566,
+  "node_parent_ways": 122435877,
+  "nodes": 446671664,
+  "nodes_history": 392210039,
+  "relations": 9153087,
+  "relations_history": 87175779,
+  "ways": 411273029,
+  "ways_history": 971061627
+ },
+ "lake_bytes": {
+  "data": 2093781402,
+  "lance": 1061822877
+ },
+ "build": {
+  "label": "build-plateau",
+  "seconds": 245.7,
+  "exit": 0,
+  "peak_rss_gb": 11.98,
+  "peak_disk_gb": {
+   "/home/user/lakes/cut/build-plateau": 3.16
+  }
+ },
+ "areas": {
+  "label": "areas-plateau",
+  "seconds": 10.0,
+  "exit": 0,
+  "peak_rss_gb": 0.37,
+  "peak_disk_gb": {}
+ },
+ "build_log": [
+  "lake.nodes_tagged         4.8s  (1 groups)",
+  "lake.nodes_untagged       6.6s  (1 groups)",
+  "lake.nodes (view)         0.1s",
+  "lake.nodes_meta           7.1s  (1 groups)",
+  "lake.tag_postings         4.0s  (1 groups)",
+  "lake.ways                12.0s  (1 groups)",
+  "lake.ways_meta            1.4s  (1 groups)",
+  "lake.tag_postings         7.3s  (1 groups)",
+  "lake.relations            1.1s  (1 groups)",
+  "lake.relations_meta       0.2s  (1 groups)",
+  "lake.tag_postings         0.6s  (1 groups)",
+  "lake.member_parent_rels    0.8s  (1 groups)",
+  "lake.*_history            0.3s",
+  "lake.nodes_history       14.2s  (1 groups)",
+  "lake.ways_history        55.1s  (1 groups)",
+  "lake.relations_history   94.3s  (1 groups)",
+  "lake.changes             11.7s  (2 groups)",
+  "lake.elem_locator         4.7s",
+  "lake.node_parent_ways     5.3s  (1 groups)",
+  "lake.state                0.1s",
+  "lance nodes_tagged    rows=   1761881    1.9s",
+  "lance nodes_untagged  rows=  21550923    5.9s",
+  "lance ways            rows=   3112631    3.6s",
+  "  changes            files=4    194.3 MB",
+  "  elem_locator       files=1    50.8 MB",
+  "  member_parent_rels files=1    4.6 MB",
+  "  node_parent_ways   files=1    65.1 MB",
+  "  nodes_history      files=5    272.2 MB",
+  "  nodes_meta         files=2    99.9 MB",
+  "  nodes_tagged       files=1    33.6 MB",
+  "  nodes_untagged     files=3    187.6 MB",
+  "  relations          files=1    6.6 MB",
+  "  relations_history  files=3    140.7 MB",
+  "  relations_meta     files=1    0.8 MB",
+  "  state              files=1    0.0 MB",
+  "  tag_postings       files=3    75.0 MB",
+  "  ways               files=5    292.6 MB",
+  "  ways_history       files=10   644.1 MB",
+  "  ways_meta          files=1    25.6 MB"
+ ]
+}

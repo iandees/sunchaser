@@ -33,9 +33,13 @@ Everything below was validated on a Berlin extract in the cloud session. Details
   - The updater is the only writer: `updater.py job --loop` holds a lease, keeps the catalog locally, and uploads it with `If-Match` after each batch.
   - Readers are stateless and reload when the catalog's ETag changes.
   - R2 supports the conditional PUTs this needs.
-- **Lance id store:** 1.54× faster queries (median 1.44 → 0.81 s at 30 ms per request), for 2× the object-store reads and about 1.25× extra storage. Kept in step with the lake by the updater.
+- **Lance id store:** 1.54× faster queries (median 1.44 → 0.81 s at 30 ms per request), for 2× the object-store reads and extra storage of about 2× the current tables (490–550 GB for the planet). Kept in step with the lake by the updater.
 - **Incremental areas:** each update rebuilds only the areas whose relations changed.
-- **Not measured at planet scale:** time, disk and memory are extrapolations. The sizing pass (step 4) measures them.
+- **Planet sizing (measured, `docs/planet.md`, `results/sizing/`):**
+  - Planet totals are exact.
+  - Sizes are scaled from three regional full-history lakes: peak local disk 1.28–1.34 TB during the extract; lake 610–620 GB of Parquet plus 490–550 GB of Lance.
+  - Times are scaled from a 4-core container: extract ≈ 20–30 h and build ≈ 15–25 h on 6 cores.
+  - The cut pass peaked at 11.6 GB of RAM; regional builds at 12 GB (DuckDB's limit on a 15 GB box).
 
 ## Box facts to check first
 
@@ -91,7 +95,7 @@ s3.delete_object(Bucket=b, Key=k)"
 
 It should print `b'ok'`. A 412 means the key existed already: delete it and re-run.
 
-### 4. Sizing pass (recommended before the full build, ≈ 1–2 h)
+### 4. Sizing pass (optional, ≈ 1.5 h)
 
 ```bash
 tmux new -s sizing 'cd /data/sunchaser && deploy/hetzner/sizing.sh /data/sizing 2>&1 | tee /data/logs/sizing.log'
@@ -102,7 +106,7 @@ tmux new -s sizing 'cd /data/sunchaser && deploy/hetzner/sizing.sh /data/sizing 
 2. Builds each region's lake, with Lance and areas, locally under `tools/measure.py` (time, peak RAM, peak disk).
 3. Writes `/data/sizing/estimate.md`, a planet extrapolation from the regions.
 
-**Check:** the cloud session may already have committed a sizing run from its own 4-core container under `results/sizing/`. If so, compare. This box's core count changes the times, not the sizes.
+**Check:** a sizing run from the cloud session's 4-core container is committed under `results/sizing/`; compare. This box's core count changes the times, not the sizes. Skip this step if the box's disk is clearly enough (1.9 TB RAID0 vs a 1.34 TB peak).
 
 **Decision point:** if the estimate's peak local disk for the extract is above about 90% of `df /data` free space, stop and tell Ian. Options:
 - a box with more NVMe;
@@ -111,7 +115,7 @@ tmux new -s sizing 'cd /data/sunchaser && deploy/hetzner/sizing.sh /data/sizing 
 
 Copy the result back (`scp -r root@<box>:/data/sizing/estimate.md` and the `build-*/sizing.json` files into `results/sizing/`), commit, and show Ian the estimate.
 
-### 5. Planet build (≈ 1–3 days on a 6-core box)
+### 5. Planet build (≈ 1.5–2.5 days on a 6-core box)
 
 ```bash
 tmux new -s build 'cd /data/sunchaser && deploy/hetzner/build-planet.sh 2>&1 | tee -a /data/logs/build-planet.log'

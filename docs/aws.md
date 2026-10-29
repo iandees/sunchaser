@@ -10,9 +10,10 @@ updater runs and requests.
 **Status.** Every step below has run on a Berlin extract on a 4-core box, with the same commands
 and code paths: the full-history extract and build, the object-storage catalog, scheduled updater
 jobs, the Lance store and incremental areas. They matched a real Overpass with attic data on 81 of
-82 queries, including 13 of 13 history queries. The planet run itself hasn't happened yet:
-**sizes and times are extrapolations** (marked ≈), and the first real run should record the actual
-numbers here.
+82 queries, including 13 of 13 history queries. The planet run itself hasn't happened yet.
+Sizes come from a measured sizing run (`docs/planet.md`): exact planet totals, plus three regional
+full-history lakes scaled up. **Times are scaled from 4 cores** (marked ≈), and the first real run
+should record the actual numbers here.
 
 ## Overview
 
@@ -61,16 +62,16 @@ SUNCHASER_S3_URL_STYLE=vhost
 | Root volume | 50 GB gp3 | |
 | Purchase | On-demand. The pipeline has no checkpoints, so a Spot interruption means starting over. | |
 
-Local NVMe space needed (≈):
+Local NVMe space needed (from the sizing run):
 
 | What | Size |
 |---|---|
 | History PBF | 164 GB (October 2026) |
-| Node position timeline | ≈ 110 GB index + ≈ 150–250 GB records |
-| Way geometry timeline | ≈ 15 GB index + ≈ 100–150 GB records |
-| Raw bucketed Parquet: current + history + changes | ≈ 1–1.5 TB |
-| DuckDB build database and spill | ≈ 0.3–0.5 TB |
-| **Total** | **≈ 2–2.5 TB**. Both instance types have more. |
+| Node position timeline | 115 GB index + 255 GB records |
+| Way geometry timeline | 115–120 GB |
+| Raw bucketed Parquet: current + history + changes | 800–850 GB |
+| DuckDB build spill | small next to the raw buckets |
+| **Total** | **≈ 1.45–1.5 TB**. Both instance types have more. |
 
 Set it up, as root:
 
@@ -163,7 +164,7 @@ It reads every version once, in id order, keeping node position and way geometry
 
 The final line gives row counts; `/nvme/raw/manifest.json` records them along with `osm_base`.
 
-The time estimate scales Berlin by file size (15 M versions in 67 s on 4 threads, about 900× smaller), then adds headroom for the random timeline reads. Check `extract.log` for progress.
+History processing measured 126–175 k versions/s on 4 cores (31–43 h for the planet's 19.2 B versions). On 64 vCPUs that is ≈ 2–3 h if it scales well; ≈ 6 h allows for imperfect scaling and the random timeline reads. Check `extract.log` for progress.
 
 ## 5. Build the lake (≈ 4–8 h)
 
@@ -174,7 +175,7 @@ uv run python src/build_lake.py --raw /nvme/raw --lake /nvme/build --catalog /nv
 - **What it does:** sorts and writes each table one bucket group at a time, about 200 M rows per sort, straight to S3.
 - **Global sorts:** `tag_postings` (by `key=value`) is the only one. `changes` is sorted one ≈ 48-day period at a time.
 - **Spill:** DuckDB spills to `/nvme/build`.
-- **Lance:** `--lance` also writes the Lance id store (≈ 1.25× the lake's Parquet size again). Leave it out to save space, at the cost of slower recursion and id lookups.
+- **Lance:** `--lance` also writes the Lance id store (490–550 GB for the planet: about 2× the current tables it copies, 0.85× the full-history lake). Leave it out to save space, at the cost of slower recursion and id lookups.
 
 Then build the areas in full (≈ 1–2 h; DuckDB spatial over about 1.2 M pivot relations):
 
@@ -182,7 +183,7 @@ Then build the areas in full (≈ 1–2 h; DuckDB spatial over about 1.2 M pivot
 SUNCHASER_CATALOG=/nvme/catalog.ducklake uv run python src/build_areas.py --full
 ```
 
-Expected lake size (≈): current tables 330 GB, history and changes 0.6–1.2 TB, Lance 350–400 GB. That is roughly $35–45 a month in S3 Standard; Intelligent-Tiering lowers it for the cold history files.
+Expected lake size (sizing run): current tables 240–265 GB, history and changes 350–380 GB, Lance 490–550 GB. That is roughly $25 a month in S3 Standard; Intelligent-Tiering lowers it for the cold history files.
 
 ## 6. Publish the catalog and catch up
 
@@ -262,7 +263,7 @@ Environment for both: `SUNCHASER_CATALOG=$LAKE/catalog.ducklake`, `SUNCHASER_CAT
 | Item | Estimate |
 |---|---|
 | Build: `i4i.16xlarge` for 10–20 h | ≈ $60–120, once |
-| S3 storage: 1.3–2 TB | ≈ $30–45 a month |
+| S3 storage: 1.1–1.2 TB (0.6 TB without Lance) | ≈ $25 a month |
 | Updater: Lambda every minute, ≈ 20–40 s at 8 GB | ≈ $25–50 a month |
 | Maintenance: Fargate hourly, ≈ 10 min | ≈ $5 a month |
 | S3 requests: catalog GET/PUT per minute plus Parquet PUTs | ≈ $5–15 a month |

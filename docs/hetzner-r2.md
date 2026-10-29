@@ -8,8 +8,11 @@ results, updater reads and API reads then cost nothing per GB, wherever the comp
 - streamed extract from stdin, `--consume` build, `relocate_lake.py`;
 - `updater.py job --loop` with the lease and conditional uploads, and the Lance store.
 
-Results matched a real Overpass with attic data. Planet sizes and times are **extrapolations**
-(marked ≈); write the real ones back here after the first run.
+Results matched a real Overpass with attic data.
+
+Planet sizes come from a **measured sizing run** (`docs/planet.md`, `results/sizing/`): exact
+planet totals, plus three regional full-history lakes scaled up. Times are still scaled from
+4 cores (marked ≈); write the real ones back here after the first run.
 
 ## What goes where
 
@@ -22,24 +25,24 @@ Results matched a real Overpass with attic data. Planet sizes and times are **ex
 
 | | Cost |
 |---|---|
-| R2 storage | $0.015/GB-month (Standard), about $20–30/month for 1.3–2 TB; no egress fees; reads $0.36 per million, writes $4.50 per million |
-| Hetzner auction box | Billed hourly (e.g. $0.24/h for an i7-8700 with 128 GB and 2 × 1 TB NVMe), unmetered 1 Gbit. Build for a couple of days (≈ $10–20), then keep it, or move the updater and API to a small VPS |
+| R2 storage | $0.015/GB-month (Standard): about $17/month for the full-history lake with Lance (610–620 GB Parquet + 490–550 GB Lance), about $9 without Lance. No egress fees; reads $0.36 per million, writes $4.50 per million |
+| Hetzner auction box | Billed hourly (e.g. $0.24/h for an i7-8700 with 128 GB and 2 × 1 TB NVMe), unmetered 1 Gbit. Build for about 2 days (≈ $12), then keep it, or move the updater and API to a small VPS |
 | Downloading the history planet | Free (OSMF publishes it) |
 
 ## Disk: will the history build fit?
 
-Full-history planet, peak local disk (≈):
+Full-history planet, peak local disk (from the sizing run, `docs/planet.md`):
 
 | | Plain | Streamed input + `--consume` |
 |---|---|---|
 | History PBF | 164 GB | 0 (piped from the download) |
-| Timelines (`--dense-index`) | 0.4–0.5 TB | 0.4–0.5 TB, deleted before the build |
-| Raw buckets (current + history + changes) | 1–1.5 TB | 1–1.5 TB, shrinking as the build consumes them |
-| DuckDB sort spill | 0.1–0.3 TB | 0.1–0.3 TB |
-| **Peak** | **≈ 1.7–2.5 TB** | **≈ 1.4–2 TB**, during the extract |
+| Timelines (`--dense-index`) | 370 GB nodes + 115–120 GB ways | the same, deleted before the build |
+| Raw buckets (current + history + changes) | 800–850 GB | the same, shrinking as the build consumes them |
+| DuckDB sort spill | small (regional builds stayed under 2× their lake size) | the same |
+| **Peak** | **≈ 1.45–1.5 TB** | **1.28–1.34 TB**, during the extract |
 
-- **2 × 1 TB, as RAID0 (2 TB):** borderline for full history. Do the country rehearsal (below) to measure before paying for planet hours, or pick an auction box with 2 × 1.92 TB or more.
-- **Current planet only** (no history; `osm-extract` without `--history`, about 0.7 TB peak): fits.
+- **2 × 1 TB, as RAID0 (about 1.9 TB):** fits, with about 30% headroom when streaming.
+- **A 1 TB laptop:** does not fit full history. A current-only planet (`osm-extract` without `--history`) fits.
 
 ## 1. R2
 
@@ -108,13 +111,11 @@ LAKE=s3://osm-lake/lake
 
 Run the long steps inside `tmux` so an SSH drop doesn't kill them.
 
-## 3. Rehearsal on a country (recommended)
+## 3. Sizing pass (optional, about 1.5 h)
 
-Geofabrik offers full-history country extracts (`.osh.pbf`) to logged-in OSM users. Run steps 4–6 on one, for example Germany, about 5% of the planet, without `--dense-index`, then:
-- note the extract and build times, the peak disk use (`df` during the extract), and the lake size;
-- scale by file size to decide whether this box's disk suffices for the planet.
+`deploy/hetzner/sizing.sh /data/sizing` streams the planet once, and cuts and builds three regional history lakes under `tools/measure.py`. It then writes a planet estimate. A run from a 4-core container is committed in `results/sizing/`. Re-run it on the box to see its own speed: the times depend on the box, the sizes don't.
 
-## 4. Extract, streaming the planet (≈ 1–2 days on 6 cores)
+## 4. Extract, streaming the planet (≈ 20–30 h on 6 cores)
 
 The 164 GB history file never touches the disk: it is piped from OSMF's bucket, and its checksum is computed on the way.
 
@@ -140,7 +141,7 @@ Then free the timelines:
 rm -rf /data/idx
 ```
 
-## 5. Build into R2 (≈ 1–2 days on 6 cores)
+## 5. Build into R2 (≈ 15–25 h on 6 cores)
 
 ```bash
 uv run python src/build_lake.py --raw /data/raw --lake /data/build --catalog /data/catalog.ducklake --data-path $LAKE/data/ --lance $LAKE/lance --group-rows 100000000 --consume 2>&1 | tee /data/build.log
@@ -149,7 +150,7 @@ uv run python src/build_lake.py --raw /data/raw --lake /data/build --catalog /da
 - **Upload:** Parquet goes straight to R2. 1 Gbit is about 400 GB an hour, faster than the build produces it.
 - **`--consume`:** deletes each raw bucket once the last table that needs it is built; `build.log` reports the GB freed.
 - **`--group-rows`:** sets how many rows each sort holds. 100 M suits 64–128 GB of RAM; use 50 M with 48 GB.
-- **`--lance`:** optional. It adds ≈ 1.25× the Parquet size in R2 for faster recursion and id queries.
+- **`--lance`:** optional. It adds 490–550 GB in R2 (about 2× the current tables it copies) for queries 1.54× faster, mostly recursion and id lookups.
 
 Then build the areas in full:
 
@@ -232,7 +233,7 @@ Point Overpass Turbo at `https://overpass.example.org/api/`.
 ## Laptop variant
 
 The build runs the same on a laptop: macOS or Linux, 48 GB of RAM is enough. The differences:
-- **Disk:** about 2 TB free for full history (an external NVMe SSD over USB 3.2 or Thunderbolt is fine), or about 0.7 TB for the current planet only.
+- **Disk:** about 1.5 TB free for full history (the extract peaks at 1.28–1.34 TB, and the local lake grows to 1.1–1.2 TB while `--consume` frees the raw buckets), so a 2 TB external NVMe SSD over USB 3.2 or Thunderbolt. The built-in 1 TB is enough only for the current planet.
 - **Open files:** raise the limit before extracting: `ulimit -n 65536` (on macOS also `sudo launchctl limit maxfiles 65536 200000`). Use `--bucket-bits 10` if the limit can't go that high.
 - **Sleep:** keep the machine awake: `caffeinate -i` on macOS, `systemd-inhibit` on Linux.
 - **Sort size:** `--group-rows 50000000`.
@@ -250,5 +251,5 @@ The build runs the same on a laptop: macOS or Linux, 48 GB of RAM is enough. The
   uv run python tools/relocate_lake.py --catalog /ssd/catalog.ducklake --data-path $LAKE/data/ --lance $LAKE/lance
   ```
 
-  Then run `build_areas.py --full` with `SUNCHASER_CATALOG=/ssd/catalog.ducklake`, and upload the catalog with `objcatalog.py put` as in step 6. Uploading 1.3–2 TB takes ≈ 30–45 h at 100 Mbit/s and ≈ 4–5 h at 1 Gbit/s.
+  Then run `build_areas.py --full` with `SUNCHASER_CATALOG=/ssd/catalog.ducklake`, and upload the catalog with `objcatalog.py put` as in step 6. Uploading 1.1–1.2 TB (with Lance) takes ≈ 25–27 h at 100 Mbit/s and ≈ 3 h at 1 Gbit/s.
 - **Updater and API:** run them on an always-on host (step 6–7 on a VPS), not on the laptop.

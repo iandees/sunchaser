@@ -1,0 +1,13 @@
+cut: 5042s; planet versions n=16657902975 w=2471108843 r=67784271
+  luxembourg: 17141597 versions -> current n=6416814 w=937332 r=11245, history n=6594784 w=2695352 r=277223, changes=18649792
+  berlin: 27949158 versions -> current n=9679294 w=1682265 r=22824, history n=9002868 w=6836772 r=488971, changes=30651226
+  plateau: 55125311 versions -> current n=23312804 w=3112631 r=62356, history n=17848399 w=10027687 r=753335, changes=60489821
+MEASURE {"label": "cut", "seconds": 5043.7, "exit": 0, "peak_rss_gb": 11.59, "peak_disk_gb": {"/home/user/lakes/cut": 5.22}}
+617s blobs=27520 versions n=5496912000 w=0 r=0 | luxembourg=7771518 berlin=12372904 plateau=27203451
+1243s blobs=59456 versions n=13702448000 w=0 r=0 | luxembourg=12918197 berlin=18864243 plateau=40051121
+1864s blobs=75392 versions n=16657902975 w=254800000 r=0 | luxembourg=14567470 berlin=22356945 plateau=47142361
+2490s blobs=84480 versions n=16657902975 w=713752000 r=0 | luxembourg=15241725 berlin=23897418 plateau=50147691
+3113s blobs=94272 versions n=16657902975 w=1281224000 r=0 | luxembourg=15921803 berlin=25440640 plateau=52297757
+3731s blobs=104576 versions n=16657902975 w=1950784000 r=0 | luxembourg=16603707 berlin=26460949 plateau=53472603
+4350s blobs=114368 versions n=16657902975 w=2471108843 r=9789570 | luxembourg=16950300 berlin=27624133 plateau=54622213
+4975s blobs=122240 versions n=16657902975 w=2471108843 r=55055001 | luxembourg=17125880 berlin=27931693 plateau=55084321

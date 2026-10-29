@@ -188,6 +188,6 @@ Setup:
 - **Wins:** up to 3.5×. Examples: `regex_value_icase` 0.87 → 0.25 s, `recurse_filter_r` 2.65 → 0.80 s, `named_sets` 2.25 → 0.73 s, `poly_nodes` 1.53 → 0.49 s.
 - **No gain for `out meta`:** its metadata comes from DuckLake.
 - **Costs:**
-  - **Storage:** Lance adds about 1.25× the lake's Parquet (645 MB next to 512 MB for Berlin).
+  - **Storage:** Lance adds about 1.25× the lake's Parquet (645 MB next to 512 MB for Berlin). For the full-history planet it is 490–550 GB next to 610–620 GB of Parquet (`docs/planet.md`).
   - **Requests and bytes:** about 2× per query. On R2 that is about $0.03 more per thousand queries, at $0.36 per million reads.
   - **Build:** Lance writing took 17 s on top of the 35 s build (+50%).
