@@ -88,9 +88,8 @@ The updater, per replication diff:
 Catch-up uses hourly diffs (a planet day diff is about 100 MB, too much for one batch), then minutely.
 
 **Maintenance** runs between batches:
-- **`build_areas.py`:** Overpass's area rules. Areas lag the data, as in Overpass.
-- **`compact`:** flush inlined rows to sorted Parquet, merge small files, expire snapshots.
-- **`publish.py`:** the frozen catalog.
+- **`build_areas.py`:** Overpass's area rules, incrementally for the relations the last batches changed (`--full` rebuilds). Areas lag the data, as in Overpass.
+- **`compact`:** flush inlined rows to sorted Parquet, merge small files, compact Lance, expire snapshots, and delete files unreferenced for longer than the grace period.
 
 ## Deployment on R2 / S3 (scale to zero)
 
@@ -152,5 +151,4 @@ Catch-up uses hourly diffs (a planet day diff is about 100 MB, too much for one 
 - **Performance:**
   - Single queries take 0.3–3 s on a 4-core box, against 0.1–2.4 s for local-disk Overpass.
   - Large outputs: JSON nodes and ways are serialised in SQL (about 32 MB/s); other formats and modes in Python (about 10 MB/s).
-- **Areas** are rebuilt in full, not incrementally.
 - **Planet scale:** see `docs/planet.md` for the build and update plan, and what is measured vs extrapolated.

@@ -1,5 +1,7 @@
 # A cloud-native Overpass: design notes
 
+> Historical: the design exploration this project started from. What was built, and where it differs, is in [`architecture.md`](architecture.md).
+
 *Source reviewed: `drolbr/Overpass-API` master (shallow clone, 2026-10-29). External facts checked on the same date.*
 
 ---

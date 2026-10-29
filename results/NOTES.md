@@ -159,20 +159,14 @@ Of the 490 MB lake:
 
 Altogether about 29%, which is similar in spirit to Overpass's `*_tags_*` and `.map` files. Extrapolating linearly by PBF size (95.5 GB planet / 0.183 GB), the planet lake would be roughly 250 GB of current data. That is an extrapolation, not a measurement.
 
-## Blocked / not done
-- **Reference Overpass**:
-  - Building Overpass from source in this container was blocked by the session's auto-mode policy (running external build scripts).
-  - The public `overpass-api.de` is unreachable through the sandbox proxy, as is `download.geofabrik.de`. That's why the extract comes from BBBike.
-  - Either route would close the semantic-validation gap, which is the next item.
-- **Not covered**: areas, history/attic, `around`/`poly`, output formats (`out geom/meta`, JSON/XML), and the QL parser. The corpus calls the engine API directly.
-- **Simulated network**: the range server mimics latency and counts I/O, but it isn't S3. Real S3 has different concurrency limits, throughput, and first-byte variance.
-- **Single-region scale**: Berlin is about 0.2% of the planet. Planet-scale catalog size, footer caching, and the frequency of compound-level (`qt_level` ≥ 4) objects are untested.
+## Status since the spike
 
-## Suggested next steps (superseded in part by the follow-up above)
-1. **Reference Overpass**: build Overpass locally, or allow egress to an Overpass instance. Replay the corpus with `[date:"2026-10-24T00:00:00Z"]` and diff element sets.
-2. **Lance as the element store**: replace `nodes_*` and `elem_locator` with a tile-sorted Lance table (BTree on id), and keep DuckLake for `tag_postings`, meta, and history. Re-run the corpus.
-3. **Sets carry payload**: carry element payload (nds, geometry) in the set tables so recursion stops re-fetching ways. This is the largest remaining source of requests.
-4. **Wider coverage**: add `out geom` / JSON output and a QL parser front end. Then grow the corpus to about 200 queries drawn from real overpass-turbo traffic patterns.
+The sections above record the first single-region spike; their gaps have since been closed:
+- **Reference Overpass:** built here and used for differential tests (`overpass_diff*.json`): 81/82 identical, including history queries against an attic Overpass.
+- **Coverage:** areas, `around`/`poly`, history, all output formats, and the QL front end.
+- **Lance:** in the live path for id-driven fetches (next section).
+
+Current status and remaining gaps are in the README and `docs/architecture.md`.
 
 ## Lance in the live path (`bench_lance*.json`, `bench_nolance*.json`)
 
