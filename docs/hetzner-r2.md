@@ -221,7 +221,7 @@ EnvironmentFile=/etc/sunchaser.env
 Environment=HOME=/root
 LimitNOFILE=65536
 WorkingDirectory=/data/sunchaser
-ExecStart=/root/.local/bin/uv run python src/updater.py job --loop --catalog-url ${LAKE}/catalog.ducklake --workdir /data/updater --max-seconds 300 --compact-every 3600
+ExecStart=/data/sunchaser/.venv/bin/python src/updater.py job --loop --catalog-url ${LAKE}/catalog.ducklake --workdir /data/updater --max-seconds 300 --compact-every 3600
 Restart=always
 RestartSec=30
 TimeoutStopSec=600
@@ -238,6 +238,8 @@ mkdir -p /data/updater && systemctl daemon-reload && systemctl enable --now sunc
 journalctl -u sunchaser-updater -f
 ```
 
+- **Not `uv run`:** the unit runs the venv's Python directly. Under `uv run`, SIGTERM stops `uv` and the Python child is killed before its cleanup, so the writer lease is never released and a restart waits out its TTL (measured). The API unit can keep `uv run`: it holds no lease.
+- **Catalog uploads:** each commit uploads the catalog once, compacted first (`objcatalog.compact`): DuckDB files never shrink, and the updater's churn left Minnesota's at 121 MB with 14 MB live, so the upload is 13.6 MB. At the live edge the updater commits once per minute-diff (≈ 20 per hour), so this is what keeps the uploads small. A catalog straight from `build_areas.py --full` can hold the areas inlined (Germany's: 435 MB, 422 MB of it area geometry, 6 MB once flushed to Parquet and rewritten); the updater's first hourly compaction flushes them, and its commits after that are small.
 - **`HOME`:** systemd units have none, and DuckDB needs it to find its extensions; without `Environment=HOME=/root` the service exits at once with "Can't find the home directory".
 - **`--keep-versions [N]`:** copies the whole catalog to `lake/catalogs/` after every commit (≈ 117 MiB each for Minnesota, a copy every 6 minutes) and keeps only the newest N (default 24). Without a limit that was ≈ 28 GB a day, so keep N small, and larger lakes have larger catalogs. Off in the sample unit.
 - **`--region`:** for a regional lake add `--region s,w,n,e` (the extract's bounding box, from `osmium fileinfo`), or the updater applies the whole planet's edits.

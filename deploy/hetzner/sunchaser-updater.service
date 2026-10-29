@@ -7,7 +7,7 @@ Wants=network-online.target
 EnvironmentFile=/etc/sunchaser.env
 Environment=HOME=/root
 WorkingDirectory=/data/sunchaser
-ExecStart=/root/.local/bin/uv run python src/updater.py job --loop --catalog-url ${LAKE}/catalog.ducklake --workdir /data/updater --max-seconds 300 --compact-every 3600
+ExecStart=/data/sunchaser/.venv/bin/python src/updater.py job --loop --catalog-url ${LAKE}/catalog.ducklake --workdir /data/updater --max-seconds 300 --compact-every 3600
 Restart=always
 RestartSec=30
 TimeoutStopSec=600
