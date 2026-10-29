@@ -12,10 +12,16 @@ Configuration (environment):
   SUNCHASER_S3_URL_STYLE (path|vhost), SUNCHASER_S3_USE_SSL (true|false)
                        S3 / R2 credentials for DuckDB's httpfs
   SUNCHASER_MAX_TIMEOUT  cap for [timeout:N] in seconds (default 180)
+  SUNCHASER_MAX_OUTPUT   cap for a response in bytes (default 2 GiB); [maxsize:N] can lower it
+  SUNCHASER_MAX_QUERIES  queries executed concurrently (default 16); more wait in line
 
-Each request runs on its own DuckDB cursor (temp tables are per cursor) in a worker thread;
-[timeout:N] interrupts the query, and the response carries Overpass's runtime-error remark.
+Each request runs on its own DuckDB cursor (temp tables are per cursor) in a worker thread and
+streams its output as it is produced, so large results never sit in memory; a slow client pauses
+the query. [timeout:N] interrupts the query, and the response carries Overpass's runtime-error
+remark; a client that disconnects cancels its query.
 """
+import asyncio
+import concurrent.futures
 import datetime as dt
 import html
 import pathlib
@@ -29,7 +35,7 @@ from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
-from starlette.responses import PlainTextResponse, Response
+from starlette.responses import PlainTextResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
@@ -41,6 +47,9 @@ COPYRIGHT = "The data included in this document is from www.openstreetmap.org. T
 
 
 env = lakeconn.env
+MAX_OUTPUT = int(env("MAX_OUTPUT", str(2 << 30)))       # bytes; [maxsize:N] can only lower it
+STREAM_AHEAD = 16                                          # unsent 64 KB chunks before the query waits
+WORKERS = concurrent.futures.ThreadPoolExecutor(int(env("MAX_QUERIES", "16")))  # concurrent queries
 
 
 def open_lake():
@@ -140,36 +149,119 @@ def reopen():
         DB = fresh
 
 
-def run_query(text, callback=None, retried=False):
-    try:
-        return _run_query(text, callback)
-    except (duckdb.CatalogException, duckdb.InvalidInputException) as e:
-        if retried or "ducklake" not in str(e).lower():
-            raise
-        print(f"catalog changed under us, reopening: {str(e).splitlines()[0][:120]}", flush=True)
-        reopen()
-        return run_query(text, callback, retried=True)
+class ClientGone(Exception):
+    pass
 
 
-def _run_query(text, callback=None):
+class Chunker:
+    """Document sink: coalesces output into ~64 KB chunks and hands them to the response stream,
+    blocking (backpressure) while STREAM_AHEAD chunks are unsent."""
+
+    SIZE = 1 << 16
+
+    def __init__(self, loop, queue, cancelled):
+        self.loop, self.queue, self.cancelled = loop, queue, cancelled
+        self.slots = threading.Semaphore(STREAM_AHEAD)
+        self.parts, self.n, self.sent_any = [], 0, False
+
+    def __call__(self, text):
+        self.parts.append(text)
+        self.n += len(text)
+        if self.n >= self.SIZE:
+            self.flush()
+
+    def flush(self):
+        if self.parts:
+            self.put("data", "".join(self.parts))
+            self.parts, self.n, self.sent_any = [], 0, True
+
+    def put(self, kind, value):
+        while not self.slots.acquire(timeout=1):
+            if self.cancelled.is_set():
+                raise ClientGone()
+        if self.cancelled.is_set():
+            raise ClientGone()
+        self.loop.call_soon_threadsafe(self.queue.put_nowait, (kind, value))
+
+
+def _execute(script, callback, sink):
+    """Run a parsed script, streaming into `sink` (a Chunker). Errors before anything was sent
+    propagate (error page / catalog retry); later ones become Overpass runtime-error remarks."""
     cur = db().cursor()
     try:
-        script = ql.parse(text)
-        timeout = min(int(script.settings.get("timeout", 180)), int(env("MAX_TIMEOUT", "180")))
-        engine = Engine(cur, "lake", init_macros=False)
+        st = script.settings
+        timeout = min(int(st.get("timeout", 180)), int(env("MAX_TIMEOUT", "180")))
+        maxsize = min(int(st.get("maxsize", MAX_OUTPUT)), MAX_OUTPUT)
+        doc = ql.Document(fmt=st.get("out", "xml"), csv=st.get("csv"), timestamp=osm_base(cur),
+                          json_callback=callback, sink=sink, maxsize=maxsize)
         timer = threading.Timer(timeout, cur.interrupt)
         timer.start()
         started = time.time()
         try:
-            doc = ql.Executor(engine, osm_base(cur)).run(script, json_callback=callback)
+            ql.Executor(Engine(cur, "lake", init_macros=False), doc.timestamp).run(script, doc=doc)
         except duckdb.InterruptException:
-            doc = ql.Document(fmt=script.settings.get("out", "xml"), timestamp=osm_base(cur))
+            if sink.cancelled.is_set():
+                raise ClientGone()
             doc.remarks.append(f"runtime error: Query timed out after {int(time.time() - started)} seconds.")
+        except ql.OutputTooLarge:
+            doc.remarks.append(f"runtime error: Query run out of memory using about {-(-maxsize >> 20)} MB of RAM.")
+        except (ClientGone, ql.QLError):
+            raise
+        except Exception as e:
+            if not sink.sent_any:
+                raise
+            traceback.print_exc()
+            doc.remarks.append(f"runtime error: {type(e).__name__}: {e}")
         finally:
             timer.cancel()
-        return doc.render()
+        doc.finish()
+        sink.flush()
     finally:
         cur.close()
+
+
+def run_stream(script, callback, sink):
+    """Worker-thread body: execute (retrying once if the catalog was replaced) and signal the end."""
+    try:
+        try:
+            _execute(script, callback, sink)
+        except (duckdb.CatalogException, duckdb.InvalidInputException) as e:
+            if sink.sent_any or "ducklake" not in str(e).lower():
+                raise
+            print(f"catalog changed under us, reopening: {str(e).splitlines()[0][:120]}", flush=True)
+            reopen()
+            sink.parts, sink.n = [], 0
+            _execute(script, callback, sink)
+        sink.put("done", None)
+    except ClientGone:
+        pass
+    except Exception as e:
+        if not isinstance(e, ql.QLError):
+            traceback.print_exc()
+        try:
+            sink.put("error", e)
+        except ClientGone:
+            pass
+
+
+def run_query(text, callback=None):
+    """Buffered execution (tests and tools): (content_type, body)."""
+    script = ql.parse(text)
+    out = []
+
+    class Collect:
+        cancelled = threading.Event()
+        sent_any = False
+
+        def __call__(self, t):
+            out.append(t)
+
+        def flush(self):
+            pass
+
+    doc_type = ql.Document(fmt=script.settings.get("out", "xml"), json_callback=callback).content_type
+    _execute(script, callback, Collect())
+    return doc_type, "".join(out)
 
 
 async def interpreter(request):
@@ -185,13 +277,36 @@ async def interpreter(request):
     if not text:
         return error_page("line 1: parse error: empty query (expected a data= parameter)")
     try:
-        content_type, body = await run_in_threadpool(run_query, text, request.query_params.get("jsonp"))
+        script = ql.parse(text)
     except ql.QLError as e:
         return error_page(str(e))
-    except Exception as e:  # report like Overpass runtime errors instead of a bare 500
-        traceback.print_exc()
-        return error_page(f"runtime error: {type(e).__name__}: {e}")
-    return Response(body, media_type=f"{content_type}; charset=utf-8")
+    callback = request.query_params.get("jsonp")
+    content_type = ql.Document(fmt=script.settings.get("out", "xml"), json_callback=callback).content_type
+    queue, cancelled = asyncio.Queue(), threading.Event()
+    sink = Chunker(asyncio.get_running_loop(), queue, cancelled)
+    WORKERS.submit(run_stream, script, callback, sink)
+    kind, value = await queue.get()
+    sink.slots.release()
+    if kind == "error":
+        cancelled.set()
+        if isinstance(value, ql.QLError):
+            return error_page(str(value))
+        return error_page(f"runtime error: {type(value).__name__}: {value}")
+
+    async def body():
+        nonlocal kind, value
+        try:
+            while kind == "data":
+                yield value
+                kind, value = await queue.get()
+                sink.slots.release()
+            if kind == "error":  # failed after output began: Overpass would end with a remark
+                yield f"\n<!-- runtime error: {type(value).__name__}: {value} -->\n"
+        finally:
+            if kind not in ("done", "error"):  # client went away mid-stream
+                cancelled.set()
+
+    return StreamingResponse(body(), media_type=f"{content_type}; charset=utf-8")
 
 
 async def status(request):

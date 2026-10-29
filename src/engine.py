@@ -394,11 +394,12 @@ class Engine:
             where.append(f"id IN (SELECT id FROM {w} WHERE type = 'a')")
         if ids is not None:
             where.append(f"id IN ({','.join(map(str, ids)) or 'NULL'})")
-        if bbox is not None:
-            s7, w7, n7, e7 = bbox.ints()
-            where.append(f"max_lat >= {s7} AND min_lat <= {n7} AND max_lon >= {w7} AND min_lon <= {e7}")
+        # a bbox does not constrain areas: Bbox_Constraint has no area path ("TODO: filter areas"),
+        # so area(s,w,n,e) alone returns every area
+        if not where and bbox is not None:
+            return "SELECT 'a' AS type, id FROM lake.areas"
         if not where:
-            raise ValueError("Overpass rejects unconstrained queries")
+            raise ValueError("Filters too weak in query statement: specify in addition a bbox, a tag filter, or similar.")
         return f"SELECT 'a' AS type, id FROM lake.areas WHERE " + " AND ".join(where)
 
     def _area_rows(self, area_ids):
@@ -474,6 +475,14 @@ class Engine:
             return {i for (i,) in self.con.sql(sel).fetchall()}
         finally:
             self.con.unregister("x")
+
+    def areas_base(self):
+        """Timestamp of the data the areas were built from (lags osm_base, as in Overpass)."""
+        try:
+            rows = self._sql("SELECT value FROM lake.state WHERE key = 'areas_base'").fetchall()
+            return rows[0][0] if rows else ""
+        except duckdb.Error:
+            return ""
 
     def has_areas(self):
         if not hasattr(self, "_has_areas"):

@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 
 import evaluator
 from engine import Bbox, Filter
-from output import CsvSettings, Document, OutOptions
+from output import CsvSettings, Document, OutOptions, OutputTooLarge  # noqa: F401 (re-exported)
 
 
 class QLError(Exception):
@@ -51,6 +51,15 @@ class Query:
     changed: tuple | None = None                     # (changed[:"T1"[,"T2"]])
     into: str = "_"
     line: int = 0
+
+    @property
+    def standalone(self):
+        """One non-tag filter and nothing else: map_ql_parser.cc builds that filter's own statement
+        (Id_Query_Statement, Recurse_Statement, ...) instead of a Query_Statement, so [bbox:...] does
+        not apply to it."""
+        clauses = ((self.ids is not None) + (self.bbox is not None) + (self.around is not None)
+                   + (self.poly is not None) + len(self.recurse) + len(self.areas) + len(self.pivots))
+        return clauses == 1 and not (self.filters or self.inputs or self.ifs or self.newer or self.changed)
 
 
 @dataclass
@@ -109,6 +118,23 @@ class Out:
 class Script:
     settings: dict
     body: list
+
+    @property
+    def uses_areas(self):
+        """determine_area_level (dispatch/scripting_core.cc): is_in, map_to_area, (area) and area
+        queries open the area database, which adds areas to `out count` and the header."""
+        def walk(stmts):
+            for st in stmts:
+                if isinstance(st, (IsIn, MapToArea)):
+                    return True
+                if isinstance(st, Query) and ("a" in st.types or st.areas):
+                    return True
+                if isinstance(st, (Union, ForEach)) and walk(st.body):
+                    return True
+                if isinstance(st, Difference) and walk([st.left, st.right]):
+                    return True
+            return False
+        return walk(self.body)
 
 
 # ---- parser ------------------------------------------------------------------------
@@ -593,16 +619,21 @@ class Executor:
         self.e = engine
         self.timestamp = timestamp
 
-    def run(self, script, json_callback=None):
+    def run(self, script, json_callback=None, doc=None):
+        """Execute `script`, writing into `doc` (a new buffered Document by default; call
+        render() or finish() on the result)."""
         st = script.settings
-        doc = Document(fmt=st.get("out", "xml"), csv=st.get("csv"), timestamp=self.timestamp,
-                       json_callback=json_callback)
-        self.global_bbox = st.get("bbox")
+        if doc is None:
+            doc = Document(fmt=st.get("out", "xml"), csv=st.get("csv"), timestamp=self.timestamp,
+                           json_callback=json_callback)
+        self.global_bbox = doc.global_bbox = st.get("bbox")
         self.settings = st
         self.sets = {"_": self.e._new("SELECT NULL::VARCHAR AS type, NULL::BIGINT AS id WHERE false")}
         if st.get("date"):
             self.e.set_date(st["date"])
-        doc.with_areas = self.e.has_areas() and not st.get("date")
+        doc.with_areas = script.uses_areas and not st.get("date")
+        if doc.with_areas:
+            doc.areas_timestamp = self.e.areas_base()
         self.doc = doc
         for stmt in script.body:
             self.exec(stmt)
@@ -683,9 +714,11 @@ class Executor:
                     t1 = self.settings.get("date") or self._missing_changed_range(q)
                 ids = self._meet(ids, e.changed_ids(t, t1, t2))
             bbox = q.bbox
-            if self.global_bbox is not None and bbox is None:
+            if self.global_bbox is None or q.standalone:
+                pass
+            elif bbox is None:
                 bbox = self.global_bbox
-            elif self.global_bbox is not None:
+            else:
                 bbox = intersect_bbox(bbox, self.global_bbox)
             if q.areas and t != "a":
                 area_ids = sorted({i for src in q.areas for i in e._ids_of(self.get(src), "a")})

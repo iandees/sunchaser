@@ -19,26 +19,79 @@ class EvalError(Exception):
     pass
 
 
-def num(v):
-    try:
-        f = float(v)
-        return f if math.isfinite(f) else None
-    except (TypeError, ValueError):
+# ---- Overpass's string <-> number conversions (data/utils.h), which follow C's strtod/strtoll ----
+
+_DEC = r"(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?"
+_HEX = r"0[xX](?:[0-9a-fA-F]+\.?[0-9a-fA-F]*|\.[0-9a-fA-F]+)(?:[pP][-+]?\d+)?"
+_STRTOD = re.compile(rf"\s*([-+]?)(?:(inf(?:inity)?)|(nan(?:\([0-9A-Za-z_]*\))?)|({_HEX})|({_DEC}))", re.I)
+_STRTOLL = re.compile(r"\s*([-+]?)(?:0[xX]([0-9a-fA-F]+)|(0[0-7]*)|([1-9]\d*))")
+_I64 = 1 << 63
+
+
+def _strtod(v):
+    """(value, chars consumed, range error) or None, like strtod()."""
+    m = _STRTOD.match(v)
+    if not m:
         return None
+    sign = -1.0 if m.group(1) == "-" else 1.0
+    if m.group(2):
+        return sign * math.inf, m.end(), False
+    if m.group(3):
+        return math.nan, m.end(), False
+    x = float.fromhex(m.group(4)) if m.group(4) else float(m.group(5))
+    return sign * x, m.end(), math.isinf(x)
 
 
-def fmt(x):
-    """Overpass prints whole numbers without a fraction."""
-    if isinstance(x, bool):
-        return "1" if x else "0"
-    if isinstance(x, float):
-        return str(int(x)) if x.is_integer() else repr(x)
-    return str(x)
+def try_double(v):
+    r = _strtod(v) if v else None
+    return r[0] if r and r[1] == len(v) else None
+
+
+def try_starts_with_double(v):
+    r = _strtod(v) if v else None
+    return r[0] if r and not r[2] else None
+
+
+def try_int64(v):
+    m = _STRTOLL.match(v) if v else None
+    if not m or m.end() != len(v):
+        return None
+    x = int(m.group(2), 16) if m.group(2) else int(m.group(3), 8) if m.group(3) else int(m.group(4))
+    x = -x if m.group(1) == "-" else x
+    return max(-_I64, min(_I64 - 1, x))  # strtoll saturates (try_int64 ignores errno)
+
+
+def _wrap(x):
+    return (x + _I64) % (1 << 64) - _I64
+
+
+def to_string(x):
+    """std::ostream << setprecision(14), as Overpass's to_string()."""
+    if isinstance(x, int):
+        return str(x)
+    if math.isnan(x):
+        return "-nan" if math.copysign(1, x) < 0 else "nan"
+    if math.isinf(x):
+        return "inf" if x > 0 else "-inf"
+    return f"{x:.14g}"
+
+
+def num(v):
+    """A string's numeric value (int64 preferred, as the operators try it first), or None."""
+    i = try_int64(v)
+    return i if i is not None else try_double(v)
 
 
 def truthy(v):
-    n = num(v)
-    return (n != 0) if n is not None else v != ""
+    """string_represents_boolean_true"""
+    d = try_double(v)
+    return d != 0 if d is not None else v != ""
+
+
+def fmt(x):
+    if isinstance(x, bool):
+        return "1" if x else "0"
+    return to_string(x)
 
 
 def tokenize(text):
@@ -109,7 +162,7 @@ class Parser:
         if tok[1] == "-":
             self.take()
             f = self.unary()
-            return lambda el: fmt(-num(f(el))) if num(f(el)) is not None else "NaN"
+            return lambda el: _negate(f(el))
         return self.primary()
 
     def primary(self):
@@ -140,36 +193,69 @@ class Parser:
         raise EvalError(f"unexpected {val!r}")
 
 
-def binop(op, a, b):
-    def cmp(el):
-        x, y = a(el), b(el)
-        nx, ny = num(x), num(y)
+def _compare(op, x, y):
+    """Evaluator_Equal/Less/...: int64 if both parse, else double, else byte-wise string order."""
+    for conv in (try_int64, try_double):
+        nx, ny = conv(x), conv(y)
         if nx is not None and ny is not None:
             x, y = nx, ny
-        return {"==": x == y, "!=": x != y, "<": x < y, "<=": x <= y, ">": x > y, ">=": x >= y}[op]
+            break
+    else:
+        x, y = x.encode(), y.encode()
+    return {"==": x == y, "!=": x != y, "<": x < y, "<=": x <= y, ">": x > y, ">=": x >= y}[op]
 
+
+def _arith(op, x, y):
+    """Evaluator_Plus/Minus/Times (int64 first) and Divided (double only)."""
+    if op != "/":
+        ix, iy = try_int64(x), try_int64(y)
+        if ix is not None and iy is not None:
+            return to_string(_wrap({"+": ix + iy, "-": ix - iy, "*": ix * iy}[op]))
+    dx, dy = try_double(x), try_double(y)
+    if dx is None or dy is None:
+        return x + y if op == "+" else "NaN"  # "+" concatenates strings
+    if op == "/":
+        if dy == 0:
+            return to_string(math.nan if dx == 0 or math.isnan(dx) else math.copysign(math.inf, dx) * math.copysign(1, dy))
+        return to_string(dx / dy)
+    try:
+        return to_string({"+": dx + dy, "-": dx - dy, "*": dx * dy}[op])
+    except OverflowError:
+        return to_string(math.inf)
+
+
+def binop(op, a, b):
     if op in ("==", "!=", "<", "<=", ">", ">="):
-        return lambda el: "1" if cmp(el) else "0"
+        return lambda el: "1" if _compare(op, a(el), b(el)) else "0"
     if op == "&&":
         return lambda el: "1" if truthy(a(el)) and truthy(b(el)) else "0"
     if op == "||":
         return lambda el: "1" if truthy(a(el)) or truthy(b(el)) else "0"
+    return lambda el: _arith(op, a(el), b(el))
 
-    def arith(el):
-        x, y = num(a(el)), num(b(el))
-        if x is None or y is None:
-            return a(el) + b(el) if op == "+" else "NaN"  # "+" concatenates strings
-        if op == "/" and y == 0:
-            return "NaN"
-        return fmt({"+": x + y, "-": x - y, "*": x * y, "/": x / y}[op])
-    return arith
+
+def _negate(v):
+    i = try_int64(v)
+    if i is not None:
+        return to_string(_wrap(-i))
+    d = try_double(v)
+    return to_string(-d) if d is not None else "NaN"
+
+
+def _number(v):
+    """Evaluator_Number"""
+    i = try_int64(v)
+    if i is not None:
+        return to_string(i)
+    d = try_starts_with_double(v)
+    return to_string(d) if d is not None else "NaN"
 
 
 def _length(el):
     """core/geometry.cc length(): sum of Overpass great-circle distances between vertices."""
     from engine import great_circle_dist
     pts = [p for p in el.get("coords") or [] if p is not None]
-    return fmt(round(sum(great_circle_dist(*a, *b) for a, b in zip(pts, pts[1:])), 3))
+    return f"{sum(great_circle_dist(*a, *b) for a, b in zip(pts, pts[1:])):.3f}"  # fixed_to_string(.., 3)
 
 
 FUNCS = {
@@ -182,8 +268,8 @@ FUNCS = {
     "type": lambda el: el["type"],
     "length": _length,
     "is_closed": lambda el: "1" if el.get("nds") and len(el["nds"]) > 1 and el["nds"][0] == el["nds"][-1] else "0",
-    "number": lambda el, a: fmt(num(a(el))) if num(a(el)) is not None else "NaN",
-    "is_number": lambda el, a: "1" if num(a(el)) is not None else "0",
+    "number": lambda el, a: _number(a(el)),
+    "is_number": lambda el, a: "1" if try_int64(a(el)) is not None or try_starts_with_double(a(el)) is not None else "0",
 }
 
 

@@ -72,11 +72,33 @@ def fmt_of(query):
 
 
 def inject_bbox(query, bbox):
+    """Add [bbox:...] to the settings block (after its last ']', quotes and nested brackets aware)."""
     setting = f"[bbox:{bbox}]"
-    if query.lstrip().startswith("["):
-        i = query.index(";")
-        return query[:i] + setting + query[i:]
-    return setting + ";" + query
+    i, end = 0, None
+    while True:
+        while i < len(query) and query[i].isspace():
+            i += 1
+        if i >= len(query) or query[i] != "[":
+            break
+        depth, quote = 0, None
+        while i < len(query):
+            c = query[i]
+            if quote:
+                quote = None if c == quote else quote
+            elif c in "\"'":
+                quote = c
+            elif c == "[":
+                depth += 1
+            elif c == "]":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        i += 1
+        end = i
+    if end is None:
+        return setting + ";" + query
+    return query[:end] + setting + query[end:]
 
 
 def overpass(db_dir, query):
