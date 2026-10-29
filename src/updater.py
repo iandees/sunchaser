@@ -645,7 +645,7 @@ def job(args):
     it conditionally. Nothing runs between jobs, so the deployment scales to zero."""
     import objcatalog
     t0 = time.time()
-    if not objcatalog.acquire_lease(args.catalog_url, ttl=args.max_seconds + 600):
+    if not objcatalog.acquire_lease(args.catalog_url, ttl=args.lease_seconds or args.max_seconds + 600):
         print("job: another run holds the lease; exiting", flush=True)
         return 3
     try:
@@ -707,6 +707,8 @@ def main():
     ap.add_argument("--keep-versions", action="store_true", help="job: also copy each committed catalog to catalogs/")
     ap.add_argument("--file-grace", type=int, default=3600, help="seconds before unreferenced files are deleted")
     ap.add_argument("--workdir", help="job: local scratch for the catalog (default: system temp)")
+    ap.add_argument("--lease-seconds", type=float, help="job: writer lease length (default: --max-seconds + 600); "
+                                                        "set it above the longest run, e.g. a compaction")
     args = ap.parse_args()
     if args.cmd == "job":
         sys.exit(job(args))

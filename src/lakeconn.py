@@ -7,6 +7,9 @@ Environment:
   SUNCHASER_S3_ENDPOINT, SUNCHASER_S3_KEY_ID, SUNCHASER_S3_SECRET, SUNCHASER_S3_REGION,
   SUNCHASER_S3_URL_STYLE (path|vhost), SUNCHASER_S3_USE_SSL (true|false)
                         S3-compatible credentials (AWS S3, Cloudflare R2, MinIO, tools/range_server.py)
+  SUNCHASER_S3_CREDENTIAL_CHAIN=true
+                        on AWS: use the default credential chain (instance profile, task or function
+                        role) instead of keys; set SUNCHASER_S3_REGION too
 """
 import os
 
@@ -16,6 +19,11 @@ def env(name, default=None):
 
 
 def configure_s3(con):
+    if env("S3_CREDENTIAL_CHAIN", "false") == "true":
+        # AWS: credentials from the environment, instance profile or task/function role
+        region = f", REGION '{env('S3_REGION')}'" if env("S3_REGION") else ""
+        con.sql(f"CREATE OR REPLACE SECRET lake_s3 (TYPE s3, PROVIDER credential_chain{region})")
+        return
     if not (env("S3_ENDPOINT") or env("S3_KEY_ID")):
         return
     opts = {"KEY_ID": env("S3_KEY_ID", ""), "SECRET": env("S3_SECRET", ""),

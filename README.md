@@ -11,7 +11,8 @@ storage (S3, Cloudflare R2, or anything S3-compatible), kept current by a minute
 - **Updates:** a single-writer updater applies OSM replication diffs with the node → way → relation
   cascade. Each diff is one DuckLake transaction, so readers see whole diffs only.
 
-See [`docs/architecture.md`](docs/architecture.md) for how it works, [`docs/design.md`](docs/design.md)
+See [`docs/architecture.md`](docs/architecture.md) for how it works, [`docs/aws.md`](docs/aws.md) for a planet
+build with full history on AWS that scales to zero, [`docs/design.md`](docs/design.md)
 for the original design exploration, and [`results/NOTES.md`](results/NOTES.md) for the measurements
 that shaped it.
 
@@ -34,23 +35,26 @@ that shaped it.
 | `src/ql.py` | Overpass QL parser and executor |
 | `src/output.py` | `out` statement and the JSON/XML/CSV writers |
 | `src/engine.py` | Overpass statement semantics over DuckDB; DuckLake or Lance element access |
-| `src/updater.py` | Replication follower: catch-up then minutely; areas rebuild, `compact`, frozen-catalog `publish` |
+| `src/updater.py` | Replication follower: `job` (scheduled run against a catalog on S3) or `run` (long-running); incremental areas, `compact` |
+| `src/objcatalog.py` | The DuckLake catalog as an object in S3/R2: conditional upload, writer lease (no database server) |
+| `src/lancestore.py` | Lance id store for id-driven fetches, kept in step with the lake and pinned per catalog |
 | `src/publish.py` | Frozen DuckLake publishing: a read-only catalog file on S3/R2 for stateless readers |
-| `src/build_areas.py` | Overpass's area rules: `lake.areas` from multipolygon/boundary relations |
+| `src/build_areas.py` | Overpass's area rules: `lake.areas`, incrementally from the changes log (`--full` to rebuild) |
 | `src/evaluator.py` | `(if: …)` evaluator expressions |
 | `src/build_lake.py` | Raw Parquet → DuckLake tables with Overpass keys (bucketed input: sorted one key-range group at a time) |
-| `src/extract.py`, `rust/osm-extract` | PBF → raw Parquet. Python is the flat reference; Rust computes all keys and bboxes, writes key-range buckets, and has a dense mmap index for the planet |
+| `src/extract.py`, `rust/osm-extract` | PBF → raw Parquet. Python is the flat reference; Rust computes all keys and bboxes, writes key-range buckets, has a dense mmap index for the planet, and builds full history from a history PBF (`--history`) |
 | `src/quadtile.py` | Exact port of Overpass's index math (fuzz-tested against the C++ header) |
 | `src/lakeconn.py` | Catalog and S3/R2 connection setup shared by all tools |
 | `tools/compare_overpass.py` | Differential test against `osm3s_query` |
-| `tools/range_server.py` | S3-compatible test store with latency injection and I/O accounting |
+| `tools/range_server.py` | S3-compatible test store (conditional PUTs, ETags) with latency injection and I/O accounting |
+| `tools/make_history_extract.py` | Synthesises a history file (snapshot + applied diffs) to test the full-history build |
 | `queries/` | Engine corpus and full-QL differential corpus |
 
 ## Running it
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install duckdb osmium pyarrow pylance numpy starlette uvicorn python-multipart pytz
+.venv/bin/pip install -r requirements.txt
 ```
 
 Extract and build. The Rust extractor is the fast path; it needs `cargo` and outputs the same Parquet:
