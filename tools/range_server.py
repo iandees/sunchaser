@@ -6,12 +6,19 @@ Adds a fixed first-byte latency per request (to mimic S3 GETs) and counts reques
   GET /__latency?ms=40 -> change the per-request latency
   GET /<bucket>?list-type=2&prefix=..&delimiter=..  -> minimal S3 ListObjectsV2 (path-style), so
       S3 clients (Lance's object_store, DuckDB s3://) can use the server as an endpoint.
+  PUT /<bucket>/<key> (If-None-Match: * honoured), DELETE, and multipart uploads
+      (POST ?uploads, PUT ?partNumber&uploadId, POST ?uploadId, DELETE ?uploadId): enough S3 for
+      DuckDB/DuckLake and Lance writers. Requests are not authenticated.
 """
 import argparse
 import json
 import os
+import hashlib
+import re
+import shutil
 import socket
 import threading
+import uuid
 import time
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlparse
@@ -106,6 +113,108 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_error(404)
             return None, None
         return path, os.path.getsize(path)
+
+    # ---- writes ------------------------------------------------------------------
+
+    def _local(self):
+        rel = unquote(urlparse(self.path).path).lstrip("/")
+        path = os.path.normpath(os.path.join(os.getcwd(), rel))
+        if not path.startswith(os.getcwd() + os.sep):
+            raise PermissionError(rel)
+        return path
+
+    def _body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        return self.rfile.read(n) if n else b""
+
+    def _reply(self, code, body=b"", ctype="application/xml", headers=()):
+        self.send_response(code)
+        for k, v in headers:
+            self.send_header(k, v)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+    def _uploads(self, upload_id):
+        return os.path.join(os.getcwd(), ".uploads", re.sub(r"[^A-Za-z0-9-]", "", upload_id))
+
+    def do_PUT(self):
+        if CONFIG["latency_ms"]:
+            time.sleep(CONFIG["latency_ms"] / 1000)
+        q = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
+        data = self._body()
+        record(urlparse(self.path).path + "?put", len(data))
+        etag = '"' + hashlib.md5(data).hexdigest() + '"'
+        if "uploadId" in q:
+            d = self._uploads(q["uploadId"])
+            with open(os.path.join(d, f"{int(q['partNumber']):05d}"), "wb") as f:
+                f.write(data)
+            return self._reply(200, headers=[("ETag", etag)])
+        path = self._local()
+        if self.headers.get("If-None-Match") == "*" and os.path.exists(path):
+            return self._reply(412, b"<Error><Code>PreconditionFailed</Code></Error>")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.{uuid.uuid4().hex}.tmp"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)  # atomic, like an S3 object PUT
+        self._reply(200, headers=[("ETag", etag)])
+
+    def do_POST(self):
+        if CONFIG["latency_ms"]:
+            time.sleep(CONFIG["latency_ms"] / 1000)
+        u = urlparse(self.path)
+        q = {k: v[0] for k, v in parse_qs(u.query, keep_blank_values=True).items()}
+        body = self._body()
+        record(u.path + "?post", len(body))
+        key = unquote(u.path).lstrip("/")
+        if "delete" in q:  # DeleteObjects
+            bucket = key.split("/")[0]
+            for k in re.findall(rb"<Key>([^<]+)</Key>", body):
+                try:
+                    os.remove(os.path.normpath(os.path.join(os.getcwd(), bucket, k.decode())))
+                except FileNotFoundError:
+                    pass
+            return self._reply(200, b'<?xml version="1.0" encoding="UTF-8"?><DeleteResult></DeleteResult>')
+        if "uploads" in q:
+            upload_id = uuid.uuid4().hex
+            os.makedirs(self._uploads(upload_id), exist_ok=True)
+            bucket, _, k = key.partition("/")
+            xml = (f'<?xml version="1.0" encoding="UTF-8"?><InitiateMultipartUploadResult><Bucket>{escape(bucket)}'
+                   f"</Bucket><Key>{escape(k)}</Key><UploadId>{upload_id}</UploadId></InitiateMultipartUploadResult>")
+            return self._reply(200, xml.encode())
+        if "uploadId" in q:
+            d = self._uploads(q["uploadId"])
+            path = self._local()
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            parts = [int(n) for n in re.findall(rb"<PartNumber>(\d+)</PartNumber>", body)] or \
+                sorted(int(n) for n in os.listdir(d))
+            tmp = f"{path}.{uuid.uuid4().hex}.tmp"
+            with open(tmp, "wb") as out:
+                for n in parts:
+                    with open(os.path.join(d, f"{n:05d}"), "rb") as f:
+                        shutil.copyfileobj(f, out)
+            os.replace(tmp, path)
+            shutil.rmtree(d, ignore_errors=True)
+            bucket, _, k = key.partition("/")
+            xml = (f'<?xml version="1.0" encoding="UTF-8"?><CompleteMultipartUploadResult><Bucket>{escape(bucket)}'
+                   f'</Bucket><Key>{escape(k)}</Key><ETag>"{uuid.uuid4().hex}"</ETag></CompleteMultipartUploadResult>')
+            return self._reply(200, xml.encode())
+        self._reply(400, b"<Error><Code>InvalidRequest</Code></Error>")
+
+    def do_DELETE(self):
+        q = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
+        record(urlparse(self.path).path + "?delete", 0)
+        if "uploadId" in q:
+            shutil.rmtree(self._uploads(q["uploadId"]), ignore_errors=True)
+        else:
+            try:
+                os.remove(self._local())
+            except FileNotFoundError:
+                pass
+        self._reply(204)
 
     def do_HEAD(self):
         path, size = self._file()

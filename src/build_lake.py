@@ -12,6 +12,7 @@ import time
 import duckdb
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
+import lakeconn  # noqa: E402
 import quadtile as qt  # noqa: E402
 
 # Overpass bit tricks as DuckDB macros (all on UBIGINT so shifts never overflow).
@@ -71,7 +72,12 @@ META_COLS = "version, ts, changeset, uid, \"user\""
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--raw", default="data/raw")
-    ap.add_argument("--lake", default="data/lake")
+    ap.add_argument("--lake", default="data/lake", help="local working dir (and default catalog/data location)")
+    ap.add_argument("--catalog", help="DuckLake catalog (sqlite:..., postgres:..., or a .ducklake file); "
+                                      "default <lake>/osm.ducklake or $SUNCHASER_CATALOG")
+    ap.add_argument("--data-path", help="where Parquet goes (s3://bucket/prefix/ for S3/R2); default <lake>/data")
+    ap.add_argument("--osm-base", default="", help="timestamp of the source data (state.osm_base)")
+    ap.add_argument("--sequence", default="", help="minutely replication sequence of the source data")
     ap.add_argument("--row-group", type=int, default=16384)
     ap.add_argument("--target-file-mb", type=int, default=64)
     args = ap.parse_args()
@@ -79,11 +85,15 @@ def main():
     if lake.exists():
         shutil.rmtree(lake)
     lake.mkdir(parents=True)
+    catalog = args.catalog or lakeconn.env("CATALOG") or f"{lake}/osm.ducklake"
+    data_path = args.data_path or lakeconn.env("DATA_PATH") or f"{lake}/data"
+    if catalog.startswith("sqlite:"):
+        pathlib.Path(catalog[7:]).unlink(missing_ok=True)
 
     con = duckdb.connect(str(lake / "build.duckdb"))
     con.sql("SET preserve_insertion_order = false")
     con.sql(MACROS)
-    con.sql(f"ATTACH 'ducklake:{lake}/osm.ducklake' AS lake (DATA_PATH '{lake}/data')")
+    lakeconn.attach(con, catalog, data_path)
     for opt, val in (("parquet_compression", "'zstd'"), ("parquet_row_group_size", args.row_group),
                      ("target_file_size", f"'{args.target_file_mb}MB'"), ("data_inlining_row_limit", 0)):
         con.sql(f"CALL lake.set_option('{opt}', {val})")
@@ -189,6 +199,12 @@ def main():
         CREATE TABLE lake.member_parent_rels SORTED BY (mtype, mid) AS
         SELECT DISTINCT m.type AS mtype, m.ref AS mid, m.id AS rel_id
         FROM (SELECT id, unnest(members, recursive := true) FROM r) m ORDER BY mtype, mid""")
+
+    step("lake.state", f"""
+        CREATE TABLE lake.state AS SELECT * FROM (VALUES
+          ('osm_base', '{args.osm_base}'), ('sequence', '{args.sequence}')) v(key, value)""")
+    # Minutely updates are small: let them inline into the catalog until the next flush/compaction.
+    con.sql("CALL lake.set_option('data_inlining_row_limit', 100000)")
 
     for tbl, files, mb in con.sql("""
             SELECT table_name, file_count, round(file_size_bytes / 1e6, 1)

@@ -32,13 +32,16 @@ CREATE OR REPLACE MACRO ov_seg(flat, flon, tlat, tlon, s, n, w, e) AS
                tlon + CASE WHEN tlat < s THEN (flon - tlon) * (s - tlat) / (flat - tlat)
                            WHEN tlat > n THEN (flon - tlon) * (n - tlat) / (flat - tlat) ELSE 0 END) >= w)
   END;
+-- Coordinates as Overpass's ::lat() computes them (ilat / 1e7 - 91.0): on bbox edges the rounding
+-- differs from lat_e7 / 1e7 and decides membership.
+CREATE OR REPLACE MACRO ov_lat(lat_e7) AS ((lat_e7::BIGINT + 910000000) / 1e7 - 91.0);
 -- Bbox_Filter::matches: single-node ways must be contained, otherwise any segment intersects.
 CREATE OR REPLACE MACRO ov_way_in_bbox(lats, lons, s, n, w, e) AS
   CASE
     WHEN len(lats) = 0 THEN false
-    WHEN len(lats) = 1 THEN lats[1] / 1e7 BETWEEN s AND n AND lons[1] / 1e7 BETWEEN w AND e
+    WHEN len(lats) = 1 THEN ov_lat(lats[1]) BETWEEN s AND n AND lons[1] / 1e7 BETWEEN w AND e
     ELSE list_bool_or(list_transform(range(2, len(lats) + 1), lambda i:
-           ov_seg(lats[i - 1] / 1e7, lons[i - 1] / 1e7, lats[i] / 1e7, lons[i] / 1e7, s, n, w, e)))
+           ov_seg(ov_lat(lats[i - 1]), lons[i - 1] / 1e7, ov_lat(lats[i]), lons[i] / 1e7, s, n, w, e)))
   END;
 """
 

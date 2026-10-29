@@ -18,7 +18,6 @@ Each request runs on its own DuckDB cursor (temp tables are per cursor) in a wor
 """
 import datetime as dt
 import html
-import os
 import pathlib
 import sys
 import threading
@@ -34,36 +33,20 @@ from starlette.responses import PlainTextResponse, Response
 from starlette.routing import Route
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import lakeconn  # noqa: E402
 import ql  # noqa: E402
 from engine import SQL_MACROS, Engine  # noqa: E402
 
 COPYRIGHT = "The data included in this document is from www.openstreetmap.org. The data is made available under ODbL."
 
 
-def env(name, default=None):
-    return os.environ.get(f"SUNCHASER_{name}", default)
+env = lakeconn.env
 
 
 def open_lake():
     con = duckdb.connect()
-    con.sql("LOAD ducklake; LOAD httpfs")
     con.sql("SET parquet_metadata_cache = true")
-    if env("S3_ENDPOINT") or env("S3_KEY_ID"):
-        opts = {"KEY_ID": env("S3_KEY_ID", ""), "SECRET": env("S3_SECRET", ""),
-                "REGION": env("S3_REGION", "auto"), "URL_STYLE": env("S3_URL_STYLE", "path"),
-                "USE_SSL": env("S3_USE_SSL", "true")}
-        if env("S3_ENDPOINT"):
-            opts["ENDPOINT"] = env("S3_ENDPOINT")
-        body = ", ".join(f"{k} {v}" if k == "USE_SSL" else f"{k} '{v}'" for k, v in opts.items())
-        con.sql(f"CREATE OR REPLACE SECRET lake_s3 (TYPE s3, {body})")
-    catalog = env("CATALOG", "data/lake/osm.ducklake")
-    if catalog.startswith("sqlite:"):
-        con.sql("LOAD sqlite")
-    if catalog.startswith("postgres:"):
-        con.sql("LOAD postgres")
-    data_path = env("DATA_PATH")
-    extra = f", DATA_PATH '{data_path}', OVERRIDE_DATA_PATH true" if data_path else ""
-    con.sql(f"ATTACH 'ducklake:{catalog}' AS lake (READ_ONLY{extra})")
+    lakeconn.attach(con, read_only=True, override_data_path=bool(env("DATA_PATH")))
     con.sql(SQL_MACROS)
     return con
 
