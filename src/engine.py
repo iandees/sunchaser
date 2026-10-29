@@ -13,6 +13,8 @@ import itertools
 import re
 from dataclasses import dataclass, field
 
+import duckdb
+
 import quadtile as qt
 
 # Bbox_Double::intersects (core/geometry.cc) for west <= east, no antimeridian handling.
@@ -107,7 +109,9 @@ def sq(s):
     return "'" + s.replace("'", "''") + "'"
 
 
-TABLE = {"n": "nodes", "w": "ways", "r": "relations"}
+TABLE = {"n": "nodes", "w": "ways", "r": "relations", "a": "areas"}
+AREA_REL_OFFSET = 3600000000
+AREA_WAY_OFFSET = 2400000000
 
 
 @dataclass
@@ -135,6 +139,10 @@ class Engine:
         self._locator_memo = {}
         if init_macros:
             con.sql(SQL_MACROS)
+        try:
+            con.sql("LOAD spatial")
+        except duckdb.Error:
+            pass
         if mode == "raw":
             con.sql(f"""
               CREATE OR REPLACE TEMP VIEW nodes AS SELECT * FROM '{raw_dir}/nodes.parquet';
@@ -256,6 +264,8 @@ class Engine:
         """(push, local) predicates selecting ids of type t."""
         if not ids:
             return ["false"], []
+        if t == "a":
+            return [], [self._id_pred("id", ids)]  # areas: small table, no locator entry
         if self._lance_route(t):
             return [f"id IN ({','.join(map(str, ids))})"], []  # Lance BTree lookup
         push, local = [], [self._id_pred("id", ids)]
@@ -274,6 +284,8 @@ class Engine:
     NEEDS_TAG = {"=", "exists", "~", "k~v"}
 
     def _query_one(self, t, bbox, filters, ids, within):
+        if t == "a":
+            return self._query_areas(bbox, filters, ids, within)
         tbl = self.t[t]
         if t == "n" and self.mode == "lake" and any(f.op in self.NEEDS_TAG for f in filters):
             tbl = "lake.nodes_tagged"
@@ -307,6 +319,109 @@ class Engine:
         if not push and not local:
             raise ValueError("Overpass rejects unconstrained queries")
         return self._scan(t, push, local, cols=cols, tbl=tbl)
+
+    # ---- areas (statements/area_query.cc, map_to_area.cc, coord_query.cc, pivot.cc) ----
+
+    def _query_areas(self, bbox, filters, ids, within):
+        where = [f.sql() for f in filters]
+        for w in ([within] if isinstance(within, str) else (within or [])):
+            where.append(f"id IN (SELECT id FROM {w} WHERE type = 'a')")
+        if ids is not None:
+            where.append(f"id IN ({','.join(map(str, ids)) or 'NULL'})")
+        if bbox is not None:
+            s7, w7, n7, e7 = bbox.ints()
+            where.append(f"max_lat >= {s7} AND min_lat <= {n7} AND max_lon >= {w7} AND min_lon <= {e7}")
+        if not where:
+            raise ValueError("Overpass rejects unconstrained queries")
+        return f"SELECT 'a' AS type, id FROM lake.areas WHERE " + " AND ".join(where)
+
+    def _area_rows(self, area_ids):
+        if not area_ids:
+            return []
+        return self._sql(f"""SELECT id, min_lat, max_lat, min_lon, max_lon, geom_wkb FROM lake.areas
+                             WHERE id IN ({','.join(map(str, area_ids))})""").fetchall()
+
+    def in_area_ids(self, t, area_ids, filters=(), bbox=None):
+        """(area) / (area.x): nodes inside or on the border; ways with a vertex strictly inside or a
+        segment crossing the interior (a way only touching the border does not count); relations
+        with such a node or way member."""
+        found = set()
+        for aid, s7, n7, w7, e7, wkb in self._area_rows(area_ids):
+            box = Bbox(ov_lat_f(s7), w7 / 1e7, ov_lat_f(n7), e7 / 1e7)
+            if bbox is not None:
+                box = Bbox(max(box.s, bbox.s), max(box.w, bbox.w), min(box.n, bbox.n), min(box.e, bbox.e))
+                if box.s > box.n or box.w > box.e:
+                    continue
+            name = f"area{next(self._ids)}"
+            self.con.execute(f"CREATE OR REPLACE TEMP TABLE {name} AS SELECT ST_GeomFromWKB(?::BLOB) AS g", [wkb])
+            cand = self._new(self._query_one(t, box, list(filters), None, None))
+            found |= self._in_area(t, cand, name)
+        return sorted(found)
+
+    def _in_area(self, t, cand, area_tbl):
+        point = "ST_Point(lon / 1e7, ov_lat(lat))"
+        line = ("CASE WHEN len(nd_lat) = 1 THEN ST_Point(nd_lon[1] / 1e7, ov_lat(nd_lat[1])) ELSE "
+                "ST_MakeLine(list_transform(list_filter(range(1, len(nd_lat) + 1), lambda i: nd_lat[i] <> -2147483648), "
+                "lambda i: ST_Point(nd_lon[i] / 1e7, ov_lat(nd_lat[i])))) END")
+        if t == "n":
+            rows = self.elements(cand, "n", ["id", "lat", "lon"])
+            sel = f"SELECT id FROM x, {area_tbl} a WHERE ST_Intersects(a.g, {point})"
+        elif t == "w":
+            rows = self.elements(cand, "w", ["id", "nd_lat", "nd_lon"])
+            sel = (f"SELECT id FROM (SELECT id, {line} AS l FROM x WHERE len(list_filter(nd_lat, lambda v: v <> -2147483648)) > 0), "
+                   f"{area_tbl} a WHERE ST_Intersects(a.g, l) AND NOT ST_Touches(a.g, l)")
+        else:
+            members = self.elements(cand, "r", ["id", "members"])
+            node_ids = sorted({m["ref"] for _, ms in members for m in ms if m["type"] == "n"})
+            way_ids = sorted({m["ref"] for _, ms in members for m in ms if m["type"] == "w"})
+            inside_n = set(self._in_area("n", self._new(self._fetch("n", node_ids)), area_tbl)) if node_ids else set()
+            inside_w = set(self._in_area("w", self._new(self._fetch("w", way_ids)), area_tbl)) if way_ids else set()
+            return {i for i, ms in members
+                    if any((m["type"] == "n" and m["ref"] in inside_n) or (m["type"] == "w" and m["ref"] in inside_w)
+                           for m in ms)}
+        if not rows:
+            return set()
+        import pyarrow as pa
+        cols = ["id", "lat", "lon"] if t == "n" else ["id", "nd_lat", "nd_lon"]
+        self.con.register("x", pa.table({c: [r[i] for r in rows] for i, c in enumerate(cols)}))
+        try:
+            return {i for (i,) in self.con.sql(sel).fetchall()}
+        finally:
+            self.con.unregister("x")
+
+    def has_areas(self):
+        if not hasattr(self, "_has_areas"):
+            try:
+                self._sql("SELECT 1 FROM lake.areas LIMIT 0").fetchall()
+                self._has_areas = self.mode == "lake"
+            except duckdb.Error:
+                self._has_areas = False
+        return self._has_areas
+
+    def map_to_area_ids(self, s):
+        """map_to_area: relations -> area id + 3600000000 (ways -> + 2400000000) where the area exists."""
+        cand = [i + AREA_REL_OFFSET for i in self._ids_of(s, "r")] + [i + AREA_WAY_OFFSET for i in self._ids_of(s, "w")]
+        if not cand:
+            return []
+        return self._materialize_ids(f"SELECT id FROM lake.areas WHERE id IN ({','.join(map(str, cand))})")
+
+    def is_in_ids(self, pts):
+        """is_in: areas containing any of the (lat, lon) points (border included)."""
+        if not pts:
+            return []
+        conds = " OR ".join(f"(min_lat <= {round(la * 1e7)} AND max_lat >= {round(la * 1e7)} AND "
+                            f"min_lon <= {round(lo * 1e7)} AND max_lon >= {round(lo * 1e7)} AND "
+                            f"ST_Intersects(ST_GeomFromWKB(geom_wkb), ST_Point({lo}, {la})))" for la, lo in pts)
+        return self._materialize_ids(f"SELECT id FROM lake.areas WHERE {conds}")
+
+    def pivot_ids(self, s, t):
+        """(pivot): the relation (or way) an area was made from."""
+        ids = self._ids_of(s, "a")
+        if t == "r":
+            return [i - AREA_REL_OFFSET for i in ids if i >= AREA_REL_OFFSET]
+        if t == "w":
+            return [i - AREA_WAY_OFFSET for i in ids if AREA_WAY_OFFSET <= i < AREA_REL_OFFSET]
+        return []
 
     def _bbox_parts(self, t, b):
         s7, w7, n7, e7 = b.ints()
@@ -619,6 +734,10 @@ class Engine:
         if closure:
             rels = self._rel_closure(f"SELECT * FROM {rels}", down=False)
         return self.union(ways_t, rels)
+
+
+def ov_lat_f(lat_e7):
+    return (lat_e7 + 910000000) / 1e7 - 91.0
 
 
 def coalesce_ranges(ranges, k):

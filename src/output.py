@@ -22,7 +22,7 @@ MODES = {
 }
 GEOMS = {None: 0, "geom": GEOMETRY | BOUNDS, "bb": BOUNDS, "center": CENTER}
 NO_COORD = -2147483648
-TYPE_NAME = {"n": "node", "w": "way", "r": "relation"}
+TYPE_NAME = {"n": "node", "w": "way", "r": "relation", "a": "area"}
 COPYRIGHT = "The data included in this document is from www.openstreetmap.org. The data is made available under ODbL."
 GENERATOR = "Overpass API 0.7.62 lake-spike"
 
@@ -86,6 +86,7 @@ class Document:
         self.timestamp = timestamp or ""
         self.callback = json_callback
         self.items = []        # dicts in a format-neutral shape
+        self.with_areas = False
         self.remarks = []
 
     # ---- collecting ------------------------------------------------------------
@@ -94,17 +95,19 @@ class Document:
         bits = opts.bits()
         if bits & COUNT:
             counts = dict(engine._sql(f"SELECT type, count(*) FROM {set_name} GROUP BY type").fetchall())
-            n, w, r = counts.get("n", 0), counts.get("w", 0), counts.get("r", 0)
-            self.items.append({"type": "count", "id": 0, "tags": [
-                ("nodes", str(n)), ("ways", str(w)), ("relations", str(r)), ("total", str(n + w + r))]})
+            n, w, r, a = (counts.get(k, 0) for k in "nwra")
+            tags = [("nodes", str(n)), ("ways", str(w)), ("relations", str(r))]
+            if self.with_areas:  # make_count_tags lists areas when an area database exists
+                tags.append(("areas", str(a)))
+            self.items.append({"type": "count", "id": 0, "tags": tags + [("total", str(n + w + r + a))]})
             return
         geo = bits & (GEOMETRY | BOUNDS | CENTER)
         out = []
-        for t in "nwr":
+        for t in "nwra":
             ids = engine._ids_of(set_name, t)
             if not ids:
                 continue
-            meta = engine.meta(t, ids) if bits & META else {}
+            meta = engine.meta(t, ids) if bits & META and t != "a" else {}
             keys = engine.sort_keys(t, ids) if opts.order == "qt" else None
             for item in getattr(self, f"_items_{t}")(engine, set_name, bits, geo):
                 if meta:
@@ -112,7 +115,7 @@ class Document:
                 if keys is not None:
                     item["_key"] = keys.get(item["id"], 0)
                 out.append(item)
-        order = {"node": 0, "way": 1, "relation": 2}
+        order = {"node": 0, "way": 1, "relation": 2, "area": 3}
         if opts.order == "qt":
             out.sort(key=lambda it: (order[it["type"]], it["_key"], it["id"]))
         else:
@@ -192,6 +195,14 @@ class Document:
                 it["members"] = members
             if bits & TAGS:
                 it["tags"] = tag_items(r["tags"])
+            yield it
+
+    def _items_a(self, e, s, bits, geo):
+        cols = ["id"] + (["tags"] if bits & TAGS else [])
+        for row in e.elements(s, "a", cols):
+            it = {"type": "area", "id": row[0]}
+            if bits & TAGS:
+                it["tags"] = tag_items(row[1])
             yield it
 
     # ---- serialisation -----------------------------------------------------------
@@ -341,7 +352,7 @@ class Document:
         if key == "type":
             return it["type"]
         if key == "otype":
-            return {"node": "1", "way": "2", "relation": "3"}[it["type"]]
+            return {"node": "1", "way": "2", "relation": "3", "area": "4"}[it["type"]]
         if key in ("lat", "lon"):
             if "lat" in it:
                 v = it["lat"] if key == "lat" else it["lon"]

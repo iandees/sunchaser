@@ -2,10 +2,11 @@
 
 Supported:
   settings     [out:json|xml|csv(...)] [timeout:N] [maxsize:N] [bbox:s,w,n,e]
-  queries      node|way|rel|relation|nwr|nw|nr|wr  with .set inputs, tag filters
+  queries      node|way|rel|relation|nwr|nw|nr|wr|area  with .set inputs, tag filters
                [k] [!k] [k=v] [k!=v] [k~re] [k!~re] [~kre~vre] (",i" for case-insensitive),
                (s,w,n,e) (id) (id:1,2) (.set) (w) (r) (r:"role") (bn) (bw) (br) (with .set),
-               (around:radius,lat,lon) (around.set:radius)
+               (around:radius,lat,lon) (around.set:radius) (area) (area.set) (pivot) (pivot.set)
+  areas        map_to_area, is_in, is_in(lat,lon)  (areas come from build_areas.py)
   blocks       ( ... ) union, ( a; - b; ) difference, "-> .name" on every statement
   recursion    > >> < <<  (optionally ".set >")
   item         .set;
@@ -36,6 +37,8 @@ class Query:
     ids: list | None = None
     recurse: list = field(default_factory=list)      # (kind, set, role) e.g. ("w", "_", None)
     around: tuple | None = None                      # (radius, points or set name)
+    areas: list = field(default_factory=list)        # (area) / (area.x) set names
+    pivots: list = field(default_factory=list)       # (pivot) / (pivot.x) set names
     into: str = "_"
     line: int = 0
 
@@ -61,6 +64,19 @@ class Recurse:
 
 
 @dataclass
+class MapToArea:
+    src: str = "_"
+    into: str = "_"
+
+
+@dataclass
+class IsIn:
+    src: str = "_"
+    point: tuple | None = None
+    into: str = "_"
+
+
+@dataclass
 class Item:
     src: str
     into: str = "_"
@@ -80,9 +96,10 @@ class Script:
 
 # ---- parser ------------------------------------------------------------------------
 
-TYPE_WORDS = {"node": "n", "way": "w", "rel": "r", "relation": "r", "nwr": "nwr", "nw": "nw", "nr": "nr", "wr": "wr"}
-UNSUPPORTED = {"area", "foreach", "if", "for", "complete", "retro", "compare", "make", "convert", "timeline",
-               "local", "is_in", "map_to_area", "pivot", "derived", "changed", "newer"}
+TYPE_WORDS = {"node": "n", "way": "w", "rel": "r", "relation": "r", "nwr": "nwr", "nw": "nw", "nr": "nr", "wr": "wr",
+              "area": "a"}
+UNSUPPORTED = {"foreach", "if", "for", "complete", "retro", "compare", "make", "convert", "timeline",
+               "local", "derived", "changed", "newer"}
 
 
 class Parser:
@@ -269,6 +286,11 @@ class Parser:
                 return self.recurse(src)
             if self.peek(3) == "out":
                 return self.out(src)
+            save = self.i
+            w = self.word()
+            if w in ("map_to_area", "is_in"):
+                return self.area_stmt(w, src)
+            self.i = save
             into = self.into()
             self.expect(";")
             return Item(src, into)
@@ -283,6 +305,8 @@ class Parser:
             return self.out("_")
         if w in TYPE_WORDS:
             return self.query(TYPE_WORDS[w], line)
+        if w in ("map_to_area", "is_in"):
+            return self.area_stmt(w, "_")
         if w in UNSUPPORTED:
             raise QLError(f"line {line}: static error: the statement '{w}' is not supported yet.", line)
         self.err(f"unknown statement '{w}'")
@@ -302,6 +326,21 @@ class Parser:
         into = self.into()
         self.expect(";")
         return Union(body, into)
+
+    def area_stmt(self, w, src):
+        if w == "map_to_area":
+            into = self.into()
+            self.expect(";")
+            return MapToArea(src, into)
+        point = None
+        if self.eat("("):
+            lat = float(self.number())
+            self.expect(",")
+            point = (lat, float(self.number()))
+            self.expect(")")
+        into = self.into()
+        self.expect(";")
+        return IsIn(src, point, into)
 
     def recurse(self, src):
         for op in (">>", "<<", ">", "<"):
@@ -444,7 +483,9 @@ class Parser:
                     if not pts:
                         self.err("around needs a point or a set")
                     q.around = (radius, pts)
-            elif w in ("poly", "area", "pivot", "if", "user", "uid", "newer", "changed", "user_touched"):
+            elif w in ("area", "pivot"):
+                (q.areas if w == "area" else q.pivots).append(self.setname() or "_")
+            elif w in ("poly", "if", "user", "uid", "newer", "changed", "user_touched"):
                 raise QLError(f"line {self.line()}: static error: the filter '({w}...)' is not supported yet.")
             else:
                 self.err(f"unknown filter '{w}'")
@@ -468,6 +509,7 @@ class Executor:
                        json_callback=json_callback)
         self.global_bbox = st.get("bbox")
         self.sets = {"_": self.e._new("SELECT NULL::VARCHAR AS type, NULL::BIGINT AS id WHERE false")}
+        doc.with_areas = self.e.has_areas()
         self.doc = doc
         for stmt in script.body:
             self.exec(stmt)
@@ -496,6 +538,14 @@ class Executor:
             res = self.e.difference(a, b)
         elif isinstance(st, Query):
             res = self.query(st)
+        elif isinstance(st, MapToArea):
+            res = self._area_set(self.e.map_to_area_ids(self.get(st.src)))
+        elif isinstance(st, IsIn):
+            if st.point is not None:
+                pts = [st.point]
+            else:
+                pts = [(a / 1e7, b / 1e7) for _, a, b in self.e.elements(self.get(st.src), "n", ["id", "lat", "lon"])]
+            res = self._area_set(self.e.is_in_ids(pts))
         else:
             raise QLError(f"unsupported statement {st!r}")
         self.sets[st.into] = res
@@ -522,11 +572,18 @@ class Executor:
                 elif kind == "br":
                     cand = e.parent_rel_ids(s, "r", role) if t == "r" else []
                 ids = self._meet(ids, cand)
+            for src in q.pivots:
+                ids = self._meet(ids, e.pivot_ids(self.get(src), t))
             bbox = q.bbox
             if self.global_bbox is not None and bbox is None:
                 bbox = self.global_bbox
             elif self.global_bbox is not None:
                 bbox = intersect_bbox(bbox, self.global_bbox)
+            if q.areas and t != "a":
+                area_ids = sorted({i for src in q.areas for i in e._ids_of(self.get(src), "a")})
+                ids = self._meet(ids, e.in_area_ids(t, area_ids, q.filters, bbox) if area_ids else [])
+                if not ids:
+                    continue
             if q.around is not None:
                 ids, bbox = self._around(q, t, ids, bbox)
                 if ids is not None and not ids:
@@ -539,6 +596,11 @@ class Executor:
         if not parts:
             return e._new("SELECT NULL::VARCHAR AS type, NULL::BIGINT AS id WHERE false")
         return e._new(" UNION ALL ".join(parts))
+
+    def _area_set(self, ids):
+        if not ids:
+            return self.e._new("SELECT NULL::VARCHAR AS type, NULL::BIGINT AS id WHERE false")
+        return self.e._new(f"SELECT 'a' AS type, unnest([{','.join(map(str, ids))}]::BIGINT[]) AS id")
 
     @staticmethod
     def _meet(ids, cand):

@@ -46,3 +46,19 @@ QL += [
     ("not_equal_missing", f"[out:json];way[highway][bridge!=yes]{b(TINY)};out ids;"),
     ("multiple_outs", f"[out:json];node[amenity=cafe]{b(TINY)};out ids;out count;out tags;"),
 ]
+
+# Areas: the reference needs its area rules run first (osm3s_query --rules < rules/areas.osm3s).
+QL_AREAS = [
+    ("area_by_tags", '[out:json];area[name="Mitte"][admin_level];out;'),
+    ("area_nodes", '[out:json];area[name="Mitte"][admin_level=10]->.a;node(area.a)[amenity=cafe];out ids;'),
+    ("area_ways", '[out:json];area[name="Mitte"][admin_level=10]->.a;way(area.a)[highway=primary];out ids;'),
+    ("area_nwr_turbo", '[out:json][timeout:25];area(id:3600016566)->.searchArea;'
+                       'nwr["amenity"="drinking_water"](area.searchArea);out geom;'),
+    ("area_rels", '[out:json];area[name="Kreuzberg"][admin_level=10]->.a;rel(area.a)[type=multipolygon];out ids;'),
+    ("map_to_area", "[out:json];rel(16566);map_to_area;out ids;"),
+    ("is_in_point", "[out:json];is_in(52.5163,13.3777);out ids;"),
+    ("is_in_set", "[out:json];node(253846340);is_in;out ids;"),
+    ("pivot", '[out:json];area[name="Mitte"][admin_level=10];rel(pivot);out ids;'),
+    ("area_count", '[out:json];area[admin_level=10];out count;'),
+]
+QL += QL_AREAS
