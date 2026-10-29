@@ -219,7 +219,10 @@ class Updater:
                 self.sql(f"UPDATE lake.state SET value = '{sequence}' WHERE key = 'sequence'")
             self.sql("COMMIT")
         except Exception:
-            self.sql("ROLLBACK")
+            try:
+                self.sql("ROLLBACK")
+            except duckdb.TransactionException:
+                pass  # a failed COMMIT has already ended the transaction
             raise
         self.e._locator_memo.clear()
         return {"changes": len(ch), "nodes": len(nodes), "ways": len(ways), "rels": len(rels),
@@ -460,6 +463,18 @@ class Maintenance:
             print(f"maintenance {name} {time.time() - t:.1f}s", flush=True)
 
 
+def apply_with_retry(up, blob, ts, sequence, attempts=5):
+    """A batch is one transaction, so a failed commit (e.g. catalog lock contention) can be retried."""
+    for i in range(attempts):
+        try:
+            return up.apply([blob], osm_base=ts, sequence=sequence)
+        except duckdb.TransactionException as e:
+            if i == attempts - 1:
+                raise
+            print(f"{sequence}: commit failed ({str(e).splitlines()[-1][:100]}), retrying", flush=True)
+            time.sleep(2 ** i)
+
+
 def follow(up, once=False, poll=30, kinds=("hour", "minute"), maintenance=None):
     """Catch up with coarse diffs (hourly by default: a planet day diff is ~100 MB, too much to hold
     in one batch), then minute diffs; then poll the minutely feed."""
@@ -474,7 +489,7 @@ def follow(up, once=False, poll=30, kinds=("hour", "minute"), maintenance=None):
         seq = start + 1
         while seq <= cur:
             s, ts = state_of(kind, seq)
-            stats = up.apply([osc(kind, seq)], osm_base=ts, sequence=f"{kind}/{seq}")
+            stats = apply_with_retry(up, osc(kind, seq), ts, f"{kind}/{seq}")
             print(f"{kind}/{seq} -> {ts} {stats}", flush=True)
             if maintenance is not None:
                 maintenance.tick()

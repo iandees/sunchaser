@@ -205,6 +205,10 @@ def main():
           ('osm_base', '{args.osm_base}'), ('sequence', '{args.sequence}')) v(key, value)""")
     # Minutely updates are small: let them inline into the catalog until the next flush/compaction.
     con.sql("CALL lake.set_option('data_inlining_row_limit', 100000)")
+    if catalog.startswith("sqlite:"):
+        # WAL: API readers must not block the updater's commits ("database is locked")
+        import sqlite3
+        sqlite3.connect(catalog[len("sqlite:"):], timeout=30).execute("PRAGMA journal_mode=WAL").fetchall()
 
     for tbl, files, mb in con.sql("""
             SELECT table_name, file_count, round(file_size_bytes / 1e6, 1)

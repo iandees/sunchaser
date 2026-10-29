@@ -132,7 +132,26 @@ def error_page(msg):
     return Response(body, status_code=400, media_type="text/html; charset=utf-8")
 
 
-def run_query(text, callback=None):
+def reopen():
+    """Replace the shared connection (e.g. the catalog was rebuilt or replaced under us)."""
+    global DB
+    fresh = open_lake()
+    with DB_LOCK:
+        DB = fresh
+
+
+def run_query(text, callback=None, retried=False):
+    try:
+        return _run_query(text, callback)
+    except (duckdb.CatalogException, duckdb.InvalidInputException) as e:
+        if retried or "ducklake" not in str(e).lower():
+            raise
+        print(f"catalog changed under us, reopening: {str(e).splitlines()[0][:120]}", flush=True)
+        reopen()
+        return run_query(text, callback, retried=True)
+
+
+def _run_query(text, callback=None):
     cur = db().cursor()
     try:
         script = ql.parse(text)
