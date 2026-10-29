@@ -176,9 +176,16 @@ class Updater:
         mem_w = {m["ref"] for r in by["r"].values() if not r["deleted"] for m in r["members"] if m["type"] == "w"}
         mem_r = {m["ref"] for r in by["r"].values() if not r["deleted"] for m in r["members"] if m["type"] == "r"}
         present = {"n": set(self.existing("n", mem_n)) | node_kept, "w": set(self.existing("w", mem_w)) | way_kept,
-                   "r": set(self.existing("r", mem_r)) | {i for i, r in by["r"].items() if not r["deleted"]}}
-        rels = {i: r for i, r in by["r"].items()
-                if i in ex["r"] or (not r["deleted"] and any(m["ref"] in present[m["type"]] for m in r["members"]))}
+                   "r": set(self.existing("r", mem_r))}
+        # fixpoint: a new relation is kept if it has a kept member, including relations kept this round
+        rels = {}
+        while True:
+            added = {i: r for i, r in by["r"].items() if i not in rels and
+                     (i in ex["r"] or (not r["deleted"] and any(m["ref"] in present[m["type"]] for m in r["members"])))}
+            if not added:
+                break
+            rels.update(added)
+            present["r"] |= {i for i, r in added.items() if not r["deleted"]}
 
         # 2. cascade: ways using changed nodes, relations using changed nodes/ways
         moved = [i for i, r in nodes.items() if i in ex["n"]]
