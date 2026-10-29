@@ -65,3 +65,12 @@ QL_AREAS = [
     ("area_count", '[out:json];area[admin_level=10];out count;'),
 ]
 QL += QL_AREAS
+
+QL_EVAL = [
+    ("if_length", "[out:json];way[highway=primary](52.51,13.38,52.525,13.41)(if: length() > 100);out ids;"),
+    ("if_count_tags", '[out:json];node[amenity](52.515,13.385,52.52,13.395)(if: count_tags() > 10 && t["amenity"] == "cafe");out ids;'),
+    ("if_closed_levels", '[out:json];way[building](52.516,13.377,52.5175,13.38)(if: is_closed() && number(t["building:levels"]) >= 5);out ids;'),
+    ("if_count_members", "[out:json];rel[type=route](52.51,13.38,52.525,13.41)(if: count_members() > 100);out ids;"),
+    ("foreach_around", "[out:json];node[amenity=cafe](52.5160,13.3770,52.5175,13.3800);foreach->.c(node(around.c:30)[amenity=bench];out ids;);"),
+]
+QL += QL_EVAL

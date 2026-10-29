@@ -10,6 +10,7 @@ union, difference. Two backends:
                reference oracle for the lake plans.
 """
 import itertools
+import math
 import re
 from dataclasses import dataclass, field
 
@@ -663,13 +664,8 @@ class Engine:
         return sorted(found)
 
     def _within_distance(self, t, cand, pts, radius):
-        import math
-        R = 6371000.0  # Overpass uses a spherical earth for great-circle distances
-
         def d_pt(a, b):
-            la1, lo1, la2, lo2 = map(math.radians, (a[0], a[1], b[0], b[1]))
-            h = math.sin((la2 - la1) / 2) ** 2 + math.cos(la1) * math.cos(la2) * math.sin((lo2 - lo1) / 2) ** 2
-            return 2 * R * math.asin(min(1.0, math.sqrt(h)))
+            return great_circle_dist(a[0], a[1], b[0], b[1])
 
         def d_seg(p, a, b):
             # local equirectangular projection around p (adequate at Overpass radii)
@@ -797,6 +793,19 @@ class Engine:
         if closure:
             rels = self._rel_closure(f"SELECT * FROM {rels}", down=False)
         return self.union(ways_t, rels)
+
+
+DEG_TO_ARC = math.acos(0) / 90.0
+ARC_TO_METER = 10 * 1000 * 1000 / math.acos(0)  # Overpass's earth: a 10,000 km quarter meridian
+
+
+def great_circle_dist(lat1, lon1, lat2, lon2):
+    """core/geometry.cc great_circle_dist, exactly."""
+    if lat1 == lat2 and lon1 == lon2:
+        return 0.0
+    sp = (math.cos((lat2 - lat1) * DEG_TO_ARC)
+          + math.cos(lat1 * DEG_TO_ARC) * math.cos(lat2 * DEG_TO_ARC) * (math.cos((lon2 - lon1) * DEG_TO_ARC) - 1))
+    return math.acos(min(1.0, sp)) * ARC_TO_METER
 
 
 def ov_lat_f(lat_e7):

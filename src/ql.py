@@ -8,6 +8,9 @@ Supported:
                (around:radius,lat,lon) (around.set:radius) (area) (area.set) (pivot) (pivot.set)
                (poly:"lat lon lat lon ...")
   areas        map_to_area, is_in, is_in(lat,lon)  (areas come from build_areas.py)
+  evaluators   (if: ...) with t[], is_tag, count_tags, count_members, id, type, length, is_closed, number,
+               is_number, arithmetic, comparisons, && || ! ?:  (src/evaluator.py)
+  foreach      foreach[.src][->.var](...); and {...}
   blocks       ( ... ) union, ( a; - b; ) difference, "-> .name" on every statement
   recursion    > >> < <<  (optionally ".set >")
   item         .set;
@@ -17,6 +20,7 @@ Unsupported statements raise QLError (HTTP 400), matching how Overpass reports s
 import re
 from dataclasses import dataclass, field
 
+import evaluator
 from engine import Bbox, Filter
 from output import CsvSettings, Document, OutOptions
 
@@ -41,6 +45,7 @@ class Query:
     areas: list = field(default_factory=list)        # (area) / (area.x) set names
     pivots: list = field(default_factory=list)       # (pivot) / (pivot.x) set names
     poly: list | None = None                         # (poly:"lat lon ...") vertices
+    ifs: list = field(default_factory=list)          # (if: ...) evaluator source texts
     into: str = "_"
     line: int = 0
 
@@ -79,6 +84,13 @@ class IsIn:
 
 
 @dataclass
+class ForEach:
+    src: str
+    var: str
+    body: list
+
+
+@dataclass
 class Item:
     src: str
     into: str = "_"
@@ -100,7 +112,7 @@ class Script:
 
 TYPE_WORDS = {"node": "n", "way": "w", "rel": "r", "relation": "r", "nwr": "nwr", "nw": "nw", "nr": "nr", "wr": "wr",
               "area": "a"}
-UNSUPPORTED = {"foreach", "if", "for", "complete", "retro", "compare", "make", "convert", "timeline",
+UNSUPPORTED = {"if", "for", "complete", "retro", "compare", "make", "convert", "timeline",
                "local", "derived", "changed", "newer"}
 
 
@@ -309,6 +321,8 @@ class Parser:
             return self.query(TYPE_WORDS[w], line)
         if w in ("map_to_area", "is_in"):
             return self.area_stmt(w, "_")
+        if w == "foreach":
+            return self.foreach()
         if w in UNSUPPORTED:
             raise QLError(f"line {line}: static error: the statement '{w}' is not supported yet.", line)
         self.err(f"unknown statement '{w}'")
@@ -328,6 +342,41 @@ class Parser:
         into = self.into()
         self.expect(";")
         return Union(body, into)
+
+    def foreach(self):
+        """foreach[.src][->.var](...);  or  foreach[.src][->.var]{...}"""
+        src = self.setname() or "_"
+        var = self.into()
+        if self.eat("{"):
+            body = self.statements(end="}")
+            self.expect("}")
+        else:
+            self.expect("(")
+            body = self.statements(end=")")
+            self.expect(")")
+        self.eat(";")
+        return ForEach(src, var, body)
+
+    def raw_until_close(self):
+        """Source text up to the ')' closing the current filter (strings and nesting respected)."""
+        depth, start, j = 0, self.i, self.i
+        while j < len(self.s):
+            c = self.s[j]
+            if c in "\"'":
+                k = j + 1
+                while k < len(self.s) and self.s[k] != c:
+                    k += 2 if self.s[k] == "\\" else 1
+                j = k + 1
+                continue
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                if depth == 0:
+                    self.i = j
+                    return self.s[start:j]
+                depth -= 1
+            j += 1
+        self.err("unterminated (if: ...)")
 
     def area_stmt(self, w, src):
         if w == "map_to_area":
@@ -487,13 +536,21 @@ class Parser:
                     q.around = (radius, pts)
             elif w in ("area", "pivot"):
                 (q.areas if w == "area" else q.pivots).append(self.setname() or "_")
+            elif w == "if":
+                self.expect(":")
+                text = self.raw_until_close()
+                try:
+                    evaluator.compile_expr(text)
+                except evaluator.EvalError as e:
+                    raise QLError(f"line {self.line()}: static error: {e}")
+                q.ifs.append(text)
             elif w == "poly":
                 self.expect(":")
                 nums = [float(v) for v in self.string().split()]
                 if len(nums) < 6 or len(nums) % 2:
                     self.err("poly needs at least three \"lat lon\" pairs")
                 q.poly = list(zip(nums[0::2], nums[1::2]))
-            elif w in ("if", "user", "uid", "newer", "changed", "user_touched"):
+            elif w in ("user", "uid", "newer", "changed", "user_touched"):
                 raise QLError(f"line {self.line()}: static error: the filter '({w}...)' is not supported yet.")
             else:
                 self.err(f"unknown filter '{w}'")
@@ -546,6 +603,14 @@ class Executor:
             res = self.e.difference(a, b)
         elif isinstance(st, Query):
             res = self.query(st)
+        elif isinstance(st, ForEach):
+            src = self.get(st.src)
+            for t, i in sorted(self.e._sql(f"SELECT type, id FROM {src}").fetchall(),
+                               key=lambda r: ("nwra".index(r[0]), r[1])):
+                self.sets[st.var] = self.e.id_set(t, [i])
+                for s in st.body:
+                    self.exec(s)
+            return None
         elif isinstance(st, MapToArea):
             res = self._area_set(self.e.map_to_area_ids(self.get(st.src)))
         elif isinstance(st, IsIn):
@@ -604,10 +669,39 @@ class Executor:
                 continue
             if bbox is None and ids is None and not q.filters:
                 raise QLError(f"line {q.line}: static error: a query needs at least one condition.")
-            parts.append(e._query_one(t, bbox, list(q.filters), None if ids is None else sorted(ids), None))
+            if bbox is None and ids is None and not q.filters and q.ifs:
+                raise QLError(f"line {q.line}: static error: (if:) needs another condition in the same query.")
+            part = e._query_one(t, bbox, list(q.filters), None if ids is None else sorted(ids), None)
+            if q.ifs:
+                part = self._apply_ifs(t, e._new(part), q.ifs)
+            parts.append(part)
         if not parts:
             return e._new("SELECT NULL::VARCHAR AS type, NULL::BIGINT AS id WHERE false")
         return e._new(" UNION ALL ".join(parts))
+
+    def _apply_ifs(self, t, cand, exprs):
+        """(if: ...) filters, evaluated per element in Python on the candidates of the other filters."""
+        fns = [evaluator.compile_expr(x) for x in exprs]
+        need = {k: any(evaluator.needs(x)[k] for x in exprs) for k in ("coords", "nds", "members")}
+        name = {"n": "node", "w": "way", "r": "relation", "a": "area"}[t]
+        cols = ["id", "tags"]
+        if t == "w" and (need["coords"] or need["nds"]):
+            cols += ["nds", "nd_lat", "nd_lon"]
+        if t == "r" and need["members"]:
+            cols += ["members"]
+        keep = []
+        for row in self.e.elements(cand, t, cols):
+            r = dict(zip(cols, row))
+            el = {"type": name, "id": r["id"], "tags": dict(r["tags"] or {})}
+            if "nds" in r:
+                el["nds"] = r["nds"]
+                el["coords"] = [None if a == -2147483648 else ((a + 910000000) / 1e7 - 91.0, b / 1e7)
+                                for a, b in zip(r["nd_lat"], r["nd_lon"])]
+            if "members" in r:
+                el["members"] = r["members"]
+            if all(evaluator.truthy(f(el)) for f in fns):
+                keep.append(r["id"])
+        return f"SELECT '{t}' AS type, id FROM {self.e._ids_table(keep)}"
 
     def _area_set(self, ids):
         if not ids:
