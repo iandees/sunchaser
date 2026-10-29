@@ -71,6 +71,14 @@ def fmt_of(query):
     return "json" if "[out:json]" in query else "csv" if "[out:csv" in query else "xml"
 
 
+def inject_bbox(query, bbox):
+    setting = f"[bbox:{bbox}]"
+    if query.lstrip().startswith("["):
+        i = query.index(";")
+        return query[:i] + setting + query[i:]
+    return setting + ";" + query
+
+
 def overpass(db_dir, query):
     r = subprocess.run(["/home/user/overpass-ref/bin/osm3s_query", f"--db-dir={db_dir}"],
                        input=query, capture_output=True, text=True, timeout=600)
@@ -86,6 +94,8 @@ def main():
     ap.add_argument("--db-dir", default="/home/user/overpass-db")
     ap.add_argument("--only", nargs="*")
     ap.add_argument("--out", default="results/overpass_diff.json")
+    ap.add_argument("--global-bbox", help="s,w,n,e: inject [bbox:...] into every request (a regional lake "
+                                          "compared with a reference holding planet-wide updates)")
     args = ap.parse_args()
     con = duckdb.connect()
     lakeconn.attach(con, read_only=True)
@@ -93,6 +103,8 @@ def main():
     for name, query in QL:
         if args.only and name not in args.only:
             continue
+        if args.global_bbox and "[bbox:" not in query:
+            query = inject_bbox(query, args.global_bbox)
         fmt = fmt_of(query)
         t = time.perf_counter()
         ref_text = overpass(args.db_dir, query)
