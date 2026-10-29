@@ -135,3 +135,87 @@ pub fn calc_index(idxs: &[u32]) -> u32 {
     }
     0x8000_0080
 }
+
+/// One index's contribution to `calc_index`: (lat_min, lon_min, lat_max, lon_max) in masked index
+/// space; None for the planet-wide compound index 0x80000080 (which forces that result).
+pub fn components(idx: u32) -> Option<(u32, u32, u32, u32)> {
+    if idx & 0x8000_0000 != 0 {
+        compound_bounds(idx)
+    } else {
+        let (la, lo) = (idx & 0x2AAA_AAAA, idx & 0x5555_5555);
+        Some((la, lo, la, lo))
+    }
+}
+
+/// `calc_index` from aggregates: the smallest distinct index and the extremes of `components`
+/// over all of them (for incremental maintenance; equal to calc_index on the same set).
+pub fn calc_index_from(first: u32, lat_min: u32, lon_min: u32, lat_max: u32, lon_max: u32) -> u32 {
+    if lat_max == lat_min && lon_max == lon_min {
+        return first;
+    }
+    let (a, b, c, d) = (upper_ilat(lat_min), upper_ilat(lat_max), upper_ilon(lon_min), upper_ilon(lon_max));
+    const STEPS: [(u32, u32, u32, u32); 7] = [
+        (0xFFFE, 4, 0xFFFF_FFFC, 0x8000_0001),
+        (0xFFF8, 0x10, 0xFFFF_FFC0, 0x8000_0002),
+        (0xFFE0, 0x40, 0xFFFF_FC00, 0x8000_0004),
+        (0xFF80, 0x100, 0xFFFF_C000, 0x8000_0008),
+        (0xFE00, 0x400, 0xFFFC_0000, 0x8000_0010),
+        (0xF800, 0x1000, 0xFFC0_0000, 0x8000_0020),
+        (0xE000, 0x4000, 0xFC00_0000, 0x8000_0040),
+    ];
+    for (m16, lim, m32, flag) in STEPS {
+        if (b & m16).wrapping_sub(a & m16) < lim && (d & m16).wrapping_sub(c & m16) < lim {
+            return ((lon_min | lat_min) & m32) | flag;
+        }
+    }
+    0x8000_0080
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// calc_index_from over the aggregates equals calc_index on random sorted distinct sets.
+    #[test]
+    fn aggregate_form_matches() {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut rnd = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..200_000 {
+            let n = (rnd() % 6) as usize + 1;
+            let base = node_index(((rnd() % 1_800_000_000) as i64 - 900_000_000) as i32, ((rnd() % 3_600_000_000) as i64 - 1_800_000_000) as i32);
+            let mut idxs: Vec<u32> = (0..n)
+                .map(|_| {
+                    let r = rnd();
+                    match r % 4 {
+                        0 => base ^ ((r >> 8) as u32 & 0xFFFF), // nearby plain index
+                        1 => calc_index(&[base, base ^ ((r >> 12) as u32 & 0xF_FFFF)]), // a compound
+                        2 => node_index(((r >> 3) % 1_800_000_000) as i32 - 900_000_000, ((r >> 9) % 3_600_000_000) as i64 as i32),
+                        _ => base,
+                    }
+                })
+                .collect();
+            idxs.sort_unstable();
+            idxs.dedup();
+            let comps: Vec<_> = idxs.iter().map(|&i| components(i)).collect();
+            let want = calc_index(&idxs);
+            let got = if comps.iter().any(|c| c.is_none()) {
+                0x8000_0080
+            } else {
+                let c: Vec<_> = comps.into_iter().map(|c| c.unwrap()).collect();
+                calc_index_from(
+                    idxs[0],
+                    c.iter().map(|c| c.0).min().unwrap(),
+                    c.iter().map(|c| c.1).min().unwrap(),
+                    c.iter().map(|c| c.2).max().unwrap(),
+                    c.iter().map(|c| c.3).max().unwrap(),
+                )
+            };
+            assert_eq!(want, got, "{idxs:x?}");
+        }
+    }
+}

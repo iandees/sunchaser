@@ -14,6 +14,7 @@
 //! Timelines (node positions, way keys/bboxes over time) are kept in RAM or, with --dense-index,
 //! in files indexed by id.
 
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -454,31 +455,95 @@ fn way_group(vs: Vec<Version>, nodes: &Timeline<16>) -> Out {
     out
 }
 
-fn rel_key(members: &[(u8, i64, String)], nodes: &Timeline<16>, ways: &Timeline<32>, t: i64) -> (u32, [i32; 4]) {
-    let mut b = MISSING_BBOX;
-    let mut idxs = Vec::new();
-    for (mt, r, _) in members {
-        match mt {
-            b'n' => {
-                if let Some((la, lo)) = at(nodes.get(*r), t).and_then(npos_dec) {
-                    idxs.push(quadtile::node_index(la, lo));
-                    extend_bbox(&mut b, la, la, lo, lo);
-                }
-            }
-            b'w' => {
-                if let Some((q, wb)) = at(ways.get(*r), t).and_then(wrec_dec) {
-                    idxs.push(q);
-                    if wb[0] != i32::MAX {
-                        extend_bbox(&mut b, wb[0], wb[1], wb[2], wb[3]);
+/// A relation's key and bbox under member changes, in O(log n) per change instead of recomputing
+/// over all members (big boundaries have thousands of members and thousands of member moves).
+#[derive(Default)]
+struct RelState {
+    idx: BTreeMap<u32, u32>,     // distinct member indexes (with multiplicity)
+    comp: [BTreeMap<u32, u32>; 4], // their calc_index components: lat_min, lon_min, lat_max, lon_max
+    global: u32,                 // members with the planet-wide index 0x80000080
+    bb: [BTreeMap<i32, u32>; 4], // member bboxes: min_lat, max_lat, min_lon, max_lon
+}
+
+type Contrib = (Option<u32>, Option<[i32; 4]>);
+
+fn bump<K: Ord + Copy>(m: &mut BTreeMap<K, u32>, k: K, add: bool) {
+    if add {
+        *m.entry(k).or_insert(0) += 1;
+    } else if let Some(c) = m.get_mut(&k) {
+        *c -= 1;
+        if *c == 0 {
+            m.remove(&k);
+        }
+    }
+}
+
+impl RelState {
+    fn apply(&mut self, c: &Contrib, add: bool) {
+        if let Some(i) = c.0 {
+            let before = self.idx.get(&i).copied().unwrap_or(0);
+            bump(&mut self.idx, i, add);
+            let after = self.idx.get(&i).copied().unwrap_or(0);
+            if (before == 0) != (after == 0) {
+                // the distinct set changed: add or remove this index's components
+                match quadtile::components(i) {
+                    Some((a, b, c2, d)) => {
+                        for (m, k) in self.comp.iter_mut().zip([a, b, c2, d]) {
+                            bump(m, k, after > 0);
+                        }
+                    }
+                    None => {
+                        if after > 0 { self.global += 1 } else { self.global -= 1 }
                     }
                 }
             }
-            _ => {}
+        }
+        if let Some(b) = c.1 {
+            for (m, k) in self.bb.iter_mut().zip(b) {
+                bump(m, k, add);
+            }
         }
     }
-    idxs.sort_unstable();
-    idxs.dedup();
-    (quadtile::calc_index(&idxs), b)
+
+    fn key(&self) -> (u32, [i32; 4]) {
+        let qt = match self.idx.keys().next() {
+            None => 0xFE,
+            Some(_) if self.global > 0 => 0x8000_0080,
+            Some(&first) => quadtile::calc_index_from(
+                first,
+                *self.comp[0].keys().next().unwrap(),
+                *self.comp[1].keys().next().unwrap(),
+                *self.comp[2].keys().next_back().unwrap(),
+                *self.comp[3].keys().next_back().unwrap(),
+            ),
+        };
+        let bbox = if self.bb[0].is_empty() {
+            MISSING_BBOX
+        } else {
+            [
+                *self.bb[0].keys().next().unwrap(),
+                *self.bb[1].keys().next_back().unwrap(),
+                *self.bb[2].keys().next().unwrap(),
+                *self.bb[3].keys().next_back().unwrap(),
+            ]
+        };
+        (qt, bbox)
+    }
+}
+
+/// What a member contributes at time t: its index and bbox (None while it doesn't exist).
+fn contrib(mt: u8, r: i64, nodes: &Timeline<16>, ways: &Timeline<32>, t: i64) -> Contrib {
+    match mt {
+        b'n' => match at(nodes.get(r), t).and_then(npos_dec) {
+            Some((la, lo)) => (Some(quadtile::node_index(la, lo)), Some([la, la, lo, lo])),
+            None => (None, None),
+        },
+        b'w' => match at(ways.get(r), t).and_then(wrec_dec) {
+            Some((q, wb)) => (Some(q), if wb[0] != i32::MAX { Some(wb) } else { None }),
+            None => (None, None),
+        },
+        _ => (None, None),
+    }
 }
 
 fn rel_group(vs: Vec<Version>, nodes: &Timeline<16>, ways: &Timeline<32>) -> Out {
@@ -496,30 +561,43 @@ fn rel_group(vs: Vec<Version>, nodes: &Timeline<16>, ways: &Timeline<32>) -> Out
             continue;
         }
         let Body::Rel(members) = &v.body else { unreachable!() };
-        let mut bps = vec![t];
-        for (mt, r, _) in members {
-            let times: Vec<i64> = match mt {
-                b'n' => nodes.get(*r).iter().map(rec_time).collect(),
-                b'w' => ways.get(*r).iter().map(rec_time).collect(),
-                _ => vec![],
+        // state at the version's start, then member changes in time order
+        let mut state = RelState::default();
+        let mut cur: Vec<Contrib> = Vec::with_capacity(members.len());
+        let mut events: Vec<(i64, usize)> = Vec::new();
+        for (i, (mt, r, _)) in members.iter().enumerate() {
+            let c = contrib(*mt, *r, nodes, ways, t);
+            state.apply(&c, true);
+            cur.push(c);
+            let times: Box<dyn Iterator<Item = i64>> = match mt {
+                b'n' => Box::new(nodes.get(*r).iter().map(rec_time)),
+                b'w' => Box::new(ways.get(*r).iter().map(rec_time)),
+                _ => Box::new(std::iter::empty()),
             };
-            bps.extend(times.into_iter().filter(|&x| x > t && end.is_none_or(|e| x < e)));
+            events.extend(times.filter(|&x| x > t && end.is_none_or(|e| x < e)).map(|x| (x, i)));
         }
-        bps.sort_unstable();
-        bps.dedup();
-        let mut starts: Vec<(i64, u32, [i32; 4])> = Vec::new();
-        for (i, &s) in bps.iter().enumerate() {
-            let (qt, b) = rel_key(members, nodes, ways, s);
-            if i == 0 {
-                version_change(&mut out, v, prev);
+        events.sort_unstable();
+        version_change(&mut out, v, prev);
+        let (qt, b) = state.key();
+        let mut starts: Vec<(i64, u32, [i32; 4])> = vec![(t, qt, b)];
+        let mut e = 0;
+        while e < events.len() {
+            let s = events[e].0;
+            while e < events.len() && events[e].0 == s {
+                let i = events[e].1;
+                let (mt, r, _) = &members[i];
+                let c = contrib(*mt, *r, nodes, ways, s);
+                state.apply(&cur[i], false);
+                state.apply(&c, true);
+                cur[i] = c;
+                e += 1;
+            }
+            // every member move is a change of the relation (updater cascade / Overpass)...
+            out.changes.push(Change { ts: s, kind: 2, id: v.id, old: Some(v.meta.version), new: Some(v.meta.version), action: "geometry" });
+            // ...but a new row only when what the row stores changes
+            let (qt, b) = state.key();
+            if starts.last().is_some_and(|l| (l.1, l.2) != (qt, b)) {
                 starts.push((s, qt, b));
-            } else {
-                // every member move is a change of the relation (updater cascade / Overpass)...
-                out.changes.push(Change { ts: s, kind: 2, id: v.id, old: Some(v.meta.version), new: Some(v.meta.version), action: "geometry" });
-                // ...but a new row only when what the row stores changes
-                if starts.last().is_some_and(|l| (l.1, l.2) != (qt, b)) {
-                    starts.push((s, qt, b));
-                }
             }
         }
         for (i, &(s, qt, b)) in starts.iter().enumerate() {

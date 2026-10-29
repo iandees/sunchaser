@@ -250,6 +250,29 @@ fn rel_block(block: &PrimitiveBlock, kept: &[[&RoaringTreemap; 3]]) -> (Stats, V
     (st, vs, ids)
 }
 
+fn write_stats(out: &std::path::Path, planet: &Stats, blobs: u64, blocks: u64, secs: f64, partial: bool) -> Result<()> {
+    let tmp = out.join("planet_stats.json.tmp");
+    let mut f = File::create(&tmp)?;
+    writeln!(
+        f,
+        "{{\"partial\": {partial}, \"versions\": {:?}, \"deleted\": {:?}, \"ids\": {:?}, \"tags\": {:?}, \
+         \"node_moves\": {}, \"way_refs\": {}, \"rel_members\": {}, \"max_id\": {:?}, \"blobs\": {blobs}, \
+         \"blocks\": {blocks}, \"seconds\": {secs:.0}{}}}",
+        planet.versions,
+        planet.deleted,
+        planet.ids,
+        planet.tags,
+        planet.node_moves,
+        planet.way_refs,
+        planet.rel_members,
+        planet.max_id,
+        crate::header_fields()
+    )?;
+    drop(f);
+    std::fs::rename(tmp, out.join("planet_stats.json"))?;
+    Ok(())
+}
+
 pub fn run(args: &Args) -> Result<()> {
     let t0 = Instant::now();
     std::fs::create_dir_all(&args.out)?;
@@ -326,6 +349,8 @@ pub fn run(args: &Args) -> Result<()> {
         }
         if last_report.elapsed().as_secs() >= 60 || last {
             last_report = Instant::now();
+            // totals so far, rewritten as the pass goes: a crash keeps what was counted
+            write_stats(&args.out, &planet, blobs_n, bytes, t0.elapsed().as_secs_f64(), true)?;
             let s = t0.elapsed().as_secs_f64();
             println!(
                 "{:.0}s blobs={blobs_n} versions n={} w={} r={} | {}",
@@ -348,22 +373,7 @@ pub fn run(args: &Args) -> Result<()> {
         let name = r.name.clone();
         summary.push(format!("{name}: {}", r.pipeline.finish(&extra)?));
     }
-    let mut f = File::create(args.out.join("planet_stats.json"))?;
-    writeln!(
-        f,
-        "{{\"versions\": {:?}, \"deleted\": {:?}, \"ids\": {:?}, \"tags\": {:?}, \"node_moves\": {}, \
-         \"way_refs\": {}, \"rel_members\": {}, \"max_id\": {:?}, \"blobs\": {blobs_n}, \"blocks\": {bytes}, \
-         \"seconds\": {secs:.0}{}}}",
-        planet.versions,
-        planet.deleted,
-        planet.ids,
-        planet.tags,
-        planet.node_moves,
-        planet.way_refs,
-        planet.rel_members,
-        planet.max_id,
-        crate::header_fields()
-    )?;
+    write_stats(&args.out, &planet, blobs_n, bytes, secs, false)?;
     println!("cut: {secs:.0}s; planet versions n={} w={} r={}", planet.versions[0], planet.versions[1], planet.versions[2]);
     for s in summary {
         println!("  {s}");
