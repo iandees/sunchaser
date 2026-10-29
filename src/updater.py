@@ -3,6 +3,7 @@
   python src/updater.py run [--region s,w,n,e] [--once]    follow replication (day -> hour -> minute catch-up)
   python src/updater.py apply FILE.osc.gz ...               apply local diffs
   python src/updater.py compact                             flush inlined data, merge files, expire snapshots
+  python src/updater.py publish s3://bucket/lake/catalog.ducklake     publish a frozen catalog (src/publish.py)
 
 The updater is the lake's single writer (like Overpass's update_database). Each batch commits as one
 DuckLake transaction, so API readers see either the whole diff or none of it. Per batch:
@@ -432,12 +433,14 @@ def compact(con):
 class Maintenance:
     """Periodic jobs between batches: areas (like Overpass's rules loop) and compaction."""
 
-    def __init__(self, con, areas_every=3600, compact_every=3600):
-        self.con, self.jobs = con, []
+    def __init__(self, con, areas_every=3600, compact_every=3600, publish_to=None, publish_every=300):
+        self.con, self.jobs, self.publish_to = con, [], publish_to
         if areas_every:
             self.jobs.append(["areas", areas_every, time.time()])
         if compact_every:
             self.jobs.append(["compact", compact_every, time.time()])
+        if publish_to and publish_every:
+            self.jobs.append(["publish", publish_every, 0])  # publish right after the first batch
 
     def tick(self):
         for job in self.jobs:
@@ -448,6 +451,9 @@ class Maintenance:
             if name == "areas":
                 import build_areas
                 build_areas.build(self.con)
+            elif name == "publish":
+                import publish
+                publish.publish(self.con, self.publish_to)
             else:
                 compact(self.con)
             job[2] = time.time()
@@ -486,23 +492,29 @@ def follow(up, once=False, poll=30, kinds=("hour", "minute"), maintenance=None):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["run", "apply", "compact"])
+    ap.add_argument("cmd", choices=["run", "apply", "compact", "publish"])
     ap.add_argument("files", nargs="*")
     ap.add_argument("--region", help="s,w,n,e: keep a regional extract consistent (omit for a planet lake)")
     ap.add_argument("--once", action="store_true", help="catch up and exit instead of following")
     ap.add_argument("--areas-every", type=int, default=3600, help="seconds between area rebuilds (0: never)")
     ap.add_argument("--compact-every", type=int, default=3600, help="seconds between compactions (0: never)")
+    ap.add_argument("--publish-to", help="publish a frozen catalog here (e.g. s3://bucket/lake/catalog.ducklake)")
+    ap.add_argument("--publish-every", type=int, default=300, help="seconds between frozen-catalog publications")
     args = ap.parse_args()
     con = duckdb.connect()
     lakeconn.attach(con)
     if args.cmd == "compact":
         return compact(con)
+    if args.cmd == "publish":
+        import publish
+        return publish.publish(con, args.publish_to or args.files[0])
     region = tuple(map(float, args.region.split(","))) if args.region else None
     up = Updater(con, region)
     if args.cmd == "apply":
         print(up.apply([pathlib.Path(f).read_bytes() for f in args.files]))
     else:
-        follow(up, once=args.once, maintenance=Maintenance(con, args.areas_every, args.compact_every))
+        follow(up, once=args.once, maintenance=Maintenance(con, args.areas_every, args.compact_every,
+                                                           args.publish_to, args.publish_every))
 
 
 if __name__ == "__main__":

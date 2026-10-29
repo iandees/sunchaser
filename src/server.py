@@ -51,6 +51,48 @@ def open_lake():
     return con
 
 
+def remote_catalog():
+    cat = env("CATALOG", "")
+    return cat if cat.startswith(("s3://", "http://", "https://")) else None
+
+
+def catalog_version(url):
+    """ETag (or Last-Modified) of a published frozen catalog."""
+    if url.startswith("s3://"):
+        import boto3
+        bucket, _, key = url[5:].partition("/")
+        endpoint = env("S3_ENDPOINT")
+        if endpoint and not endpoint.startswith("http"):
+            endpoint = ("https://" if env("S3_USE_SSL", "true") == "true" else "http://") + endpoint
+        s3 = boto3.client("s3", endpoint_url=endpoint, aws_access_key_id=env("S3_KEY_ID"),
+                          aws_secret_access_key=env("S3_SECRET"), region_name=env("S3_REGION", "auto"))
+        h = s3.head_object(Bucket=bucket, Key=key)
+        return h.get("ETag") or str(h.get("LastModified"))
+    import urllib.request
+    with urllib.request.urlopen(urllib.request.Request(url, method="HEAD"), timeout=30) as r:
+        return r.headers.get("ETag") or r.headers.get("Last-Modified")
+
+
+def refresher():
+    """Frozen catalogs are replaced by the publisher; reopen the lake when a new one appears.
+    Requests in flight keep their cursor on the previous connection."""
+    global DB
+    url, every = remote_catalog(), float(env("CATALOG_REFRESH", "30"))
+    seen = None
+    while True:
+        try:
+            v = catalog_version(url)
+            if seen is not None and v != seen:
+                fresh = open_lake()
+                with DB_LOCK:
+                    DB = fresh
+                print(f"reloaded frozen catalog {url} ({v})", flush=True)
+            seen = v
+        except Exception as e:  # keep serving the last good catalog
+            print(f"catalog refresh failed: {e}", flush=True)
+        time.sleep(every)
+
+
 DB = None
 DB_LOCK = threading.Lock()
 
@@ -176,6 +218,9 @@ app = Starlette(
                 Middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET", "POST", "OPTIONS"],
                            allow_headers=["*"])],
 )
+
+if remote_catalog():
+    threading.Thread(target=refresher, daemon=True).start()
 
 if __name__ == "__main__":
     import uvicorn
