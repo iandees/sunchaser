@@ -19,7 +19,7 @@ that shaped it.
 
 | | |
 |---|---|
-| Differential test vs. a real Overpass (Berlin extract) | See `results/overpass_diff*.json`. At the extract snapshot: 57/58 element-identical. After 5 days of replayed diffs: 66/69 non-area and 9/10 area-related queries identical; the rest come from the reference's state (planet-wide diffs, missing extract members), not from the engine |
+| Differential test vs. a real Overpass (Berlin extract) | See `results/overpass_diff*.json`. At the extract snapshot: 57/58 element-identical. After 5 days of replayed diffs: 66/69 non-area and 9/10 area-related queries identical; the rest come from the reference's state (planet-wide diffs, missing extract members), not from the engine. Fixed 24-hour window with both sides given the same edits: 68/69, plus 13/13 history queries (`[date:]`, `newer`, `changed`) against an attic Overpass |
 | Overpass Turbo | The real overpass-turbo.eu loads and renders results from the service (`tools/turbo_check.js`, `results/turbo.png`) |
 | Live updates | The updater follows OSMF replication (hourly catch-up, then minutely) with the node → way → relation cascade. Readers stay consistent while it commits |
 | QL coverage | Settings `[out:json\|xml\|csv]`, `[timeout]`, `[maxsize]`, `[bbox]`, `[date]`; `(newer)`, `(changed)`; `node/way/rel/nwr/nw/nr/wr/area`; tag filters incl. regex and `,i`; `(bbox)`, `(id:…)`, `(.set)`, `(w)`, `(r[:role])`, `(bn)`, `(bw)`, `(br)`, `(around:…)`, `(around.set:…)`, `(poly:…)`, `(area[.x])`, `(pivot[.x])`, `(if: …)` evaluators; unions, differences, named sets, `> >> < <<`, `foreach`, `map_to_area`, `is_in`; `out ids/skel/body/tags/meta/count` × `geom[(bbox)]/bb/center` × `asc/qt`, limit, `noids` |

@@ -192,7 +192,8 @@ class Engine:
         return self._materialize_ids(f"SELECT id FROM lake.{name}_meta WHERE ts > TIMESTAMPTZ '{ts}'")
 
     def changed_ids(self, t, t1, t2=None):
-        """(changed:"T1"[,"T2"]): elements with any change (version, deletion, or geometry) in (T1, T2]."""
+        """(changed:"T1"[,"T2"]): elements with a new version, a deletion or a geometry change (a member
+        node moved; tags-only node edits don't cascade) in (T1, T2]."""
         upper = f" AND ts <= TIMESTAMPTZ '{t2}'" if t2 else ""
         return self._materialize_ids(
             f"SELECT DISTINCT id FROM lake.changes WHERE type = '{t}' AND ts > TIMESTAMPTZ '{t1}'{upper}")

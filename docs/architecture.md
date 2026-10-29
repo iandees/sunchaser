@@ -73,7 +73,7 @@ Keys:
 The updater, per replication diff:
 1. **Parse:** read the osmChange and keep the newest version per element.
 2. **Regional filter** (only for extracts): keep existing elements, nodes in the region, ways using kept nodes, and relations with kept members (a fixpoint, so relation-of-relation works).
-3. **Cascade:** moved nodes → ways using them (`node_parent_ways`) → relations containing either (`member_parent_rels`). Coordinates, bboxes and Overpass keys are recomputed with the build's macros.
+3. **Cascade:** moved nodes → ways using them (`node_parent_ways`) → relations containing either (`member_parent_rels`). As in Overpass, only real geometry changes cascade: a moved or deleted node, or a way whose coordinates changed; tags-only edits don't. Cascaded rows are logged as `geometry` changes, which `(changed)` counts, as Overpass does. Coordinates, bboxes and Overpass keys are recomputed with the build's macros.
 4. **Rewrite:** delete and re-insert every affected row in all tables. Deletes are pruned by the rows' old keys. Then advance `state`, all in one transaction.
 
 Catch-up uses hourly diffs (a planet day diff is about 100 MB, too much for one batch), then minutely.
@@ -124,6 +124,7 @@ Catch-up uses hourly diffs (a planet day diff is about 100 MB, too much for one 
 | Index math (`tests/test_quadtile.py`) | bit-identical to Overpass's C++ |
 | Engine regression (`tests/test_corpus.py`) | the indexed lake equals a brute-force evaluator on 24 queries |
 | After 5 days of replayed diffs | 66/69 non-area and 9/10 area-related queries identical; the differences come from the reference's state |
+| Fixed 24-hour window (both sides given the lake's edits) | 68/69 current-data queries; 13/13 history queries (`[date:]` incl. `out meta`/`geom`, `newer`, `changed`) vs Overpass with `--keep-attic` |
 | Bucketed vs flat build | identical tables, files in key order (`osm-extract --bucket-bits 12`, 16 groups) |
 
 ## Known gaps

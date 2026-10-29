@@ -188,8 +188,12 @@ class Updater:
             rels.update(added)
             present["r"] |= {i for i, r in added.items() if not r["deleted"]}
 
-        # 2. cascade: ways using changed nodes, relations using changed nodes/ways
-        moved = [i for i, r in nodes.items() if i in ex["n"]]
+        # 2. cascade: ways using moved nodes, relations using moved nodes/changed ways. Like Overpass, a
+        # tags-only node edit leaves its ways and relations alone.
+        old_pos = {i: (la, lo) for i, la, lo in self.e.elements_by_id(
+            "n", [i for i in nodes if i in ex["n"]], ["id", "lat", "lon"])} if ex["n"] else {}
+        moved = [i for i, r in nodes.items() if i in old_pos and
+                 (r["deleted"] or (r["lat"], r["lon"]) != old_pos[i])]
         cascade_w = set()
         if moved:
             pairs = self.sql(f"SELECT DISTINCT node_id, way_id FROM lake.node_parent_ways "
@@ -201,7 +205,6 @@ class Updater:
         else:
             way_moves = {}
         cascade_w -= set(ways)
-        geo_ways = set(ways) | cascade_w
         # change time per element (valid_from of the new row, valid_to of the replaced one): its own version
         # timestamp, or for geometry-only changes the latest move that caused it
         ct = {("n", i): r["ts"] for i, r in nodes.items()}
@@ -209,8 +212,19 @@ class Updater:
         ct.update((("r", i), r["ts"]) for i, r in rels.items())
         for w, times in way_moves.items():
             ct[("w", w)] = max(times + ([ct[("w", w)]] if ("w", w) in ct else []))
+        # stage nodes and ways now: a relation cascades only from member ways whose coordinates changed
+        # (a tags-only way edit leaves its relations alone, as in Overpass)
+        self.batch = {"n": nodes}
+        self._stage_nodes(nodes)
+        self._stage_ways(ways, cascade_w)
+        mod_w = sorted(i for i, r in ways.items() if i in ex["w"] and not r["deleted"])
+        new_xy = {i: (la, lo) for i, la, lo in self.sql(
+            f"SELECT id, nd_lat, nd_lon FROM upd_w WHERE id IN ({self.ids_sql(mod_w)})").fetchall()} if mod_w else {}
+        old_xy = {i: (la, lo) for i, la, lo in self.e.elements_by_id("w", mod_w, ["id", "nd_lat", "nd_lon"])}
+        geo_ways = (cascade_w | {i for i, r in ways.items() if i in ex["w"] and r["deleted"]}
+                    | {i for i in mod_w if new_xy.get(i) != old_xy.get(i)})
         cascade_r, rel_moves = set(), {}
-        for mt, ids in (("n", [i for i in nodes if i in ex["n"]]), ("w", sorted(geo_ways))):
+        for mt, ids in (("n", moved), ("w", sorted(geo_ways))):
             if ids:
                 for mid, rel in self.sql(f"SELECT DISTINCT mid, rel_id FROM lake.member_parent_rels WHERE mtype = '{mt}' "
                                          f"AND {self.e._id_pred('mid', sorted(ids))}").fetchall():
@@ -222,10 +236,7 @@ class Updater:
             ct[("r", r_)] = max(times + ([ct[("r", r_)]] if ("r", r_) in ct else []))
         self.change_time = ct
 
-        # 3. stage new rows in build-compatible temp tables
-        self.batch = {"n": nodes}
-        self._stage_nodes(nodes)
-        self._stage_ways(ways, cascade_w)
+        # 3. stage the relations (nodes and ways are staged above)
         self._stage_relations(rels, cascade_r)
 
         # 4. one transaction rewrites everything touched

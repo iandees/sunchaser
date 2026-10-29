@@ -85,18 +85,20 @@ QL += [
 # the same diffs (tools/compare_overpass.py --history). Times assume the extract snapshot of
 # 2026-10-24T00:00:00Z replayed to 2026-10-25T00:00:00Z.
 T_MID, T_LATE, T_OLD = "2026-10-24T12:00:00Z", "2026-10-24T20:00:00Z", "2026-09-01T00:00:00Z"
+# Overpass 0.7.62's attic queries report an elapsed time of hundreds of hours and time out at once;
+# a huge [timeout] sidesteps that (it changes nothing else).
 QL_HISTORY = [
-    ("date_nodes_mid", f'[out:json][date:"{T_MID}"];node[amenity]{b(MITTE)};out meta;'),
-    ("date_ways_mid", f'[out:json][date:"{T_MID}"];way[highway]{b(MITTE)};out meta;'),
-    ("date_ways_geom", f'[out:json][date:"{T_LATE}"];way[building]{b(TINY)};out geom;'),
-    ("date_rels_mid", f'[out:json][date:"{T_MID}"];rel[type=route]{b(KREUZBERG)};out ids;'),
-    ("date_before_snapshot", f'[out:json][date:"{T_OLD}"];nwr[shop]{b(MITTE)};out ids;'),
-    ("date_recurse", f'[out:json][date:"{T_MID}"];way[highway=primary]{b(MITTE)};>;out ids;'),
-    ("date_xml_meta", f'[date:"{T_LATE}"];node[shop]{b(KREUZBERG)};out meta;'),
+    ("date_nodes_mid", f'[out:json][timeout:1000000000][date:"{T_MID}"];node[amenity]{b(MITTE)};out meta;'),
+    ("date_ways_mid", f'[out:json][timeout:1000000000][date:"{T_MID}"];way[highway]{b(MITTE)};out meta;'),
+    ("date_ways_geom", f'[out:json][timeout:1000000000][date:"{T_LATE}"];way[building]{b(TINY)};out geom;'),
+    ("date_rels_mid", f'[out:json][timeout:1000000000][date:"{T_MID}"];rel[type=route]{b(KREUZBERG)};out ids;'),
+    ("date_before_snapshot", f'[out:json][timeout:1000000000][date:"{T_OLD}"];nwr[shop]{b(MITTE)};out ids;'),
+    ("date_recurse", f'[out:json][timeout:1000000000][date:"{T_MID}"];way[highway=primary]{b(MITTE)};>;out ids;'),
+    ("date_xml_meta", f'[timeout:1000000000][date:"{T_LATE}"];node[shop]{b(KREUZBERG)};out meta;'),
     ("newer_nodes", f'[out:json];node(newer:"{T_MID}"){b(CITY)};out ids;'),
     ("newer_ways_tagged", f'[out:json];way[highway](newer:"{T_MID}"){b(CITY)};out ids;'),
     ("newer_rels", f'[out:json];rel(newer:"{T_MID}"){b(CITY)};out ids;'),
     ("changed_nodes", f'[out:json];node(changed:"{T_MID}","{T_LATE}"){b(CITY)};out ids;'),
     ("changed_ways", f'[out:json];way(changed:"2026-10-24T00:00:00Z","2026-10-25T00:00:00Z"){b(CITY)};out ids;'),
-    ("changed_date", f'[out:json][date:"{T_LATE}"];nwr(changed){b(CITY)};out ids;'),
+    ("changed_date", f'[out:json][timeout:1000000000][date:"{T_LATE}"];nwr(changed){b(CITY)};out ids;'),
 ]
