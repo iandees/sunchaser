@@ -80,7 +80,7 @@ mkfs.xfs /dev/md0 && mkdir -p /nvme && mount -o noatime /dev/md0 /nvme
 ```
 
 ```bash
-apt-get update && apt-get install -y build-essential git python3-venv python3-dev awscli osmium-tool
+apt-get update && apt-get install -y build-essential git awscli osmium-tool
 ```
 
 ```bash
@@ -92,7 +92,11 @@ cd /nvme && git clone https://github.com/iandees/sunchaser.git && cd sunchaser
 ```
 
 ```bash
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+curl -LsSf https://astral.sh/uv/install.sh | sh && . ~/.local/bin/env
+```
+
+```bash
+uv sync --locked
 ```
 
 ```bash
@@ -161,7 +165,7 @@ The time estimate scales Berlin by file size (15 M versions in 67 s on 4 threads
 ## 5. Build the lake (≈ 4–8 h)
 
 ```bash
-.venv/bin/python -I src/build_lake.py --raw /nvme/raw --lake /nvme/build --catalog /nvme/catalog.ducklake --data-path $LAKE/data/ --lance $LAKE/lance --group-rows 200000000 2>&1 | tee /nvme/build.log
+uv run python src/build_lake.py --raw /nvme/raw --lake /nvme/build --catalog /nvme/catalog.ducklake --data-path $LAKE/data/ --lance $LAKE/lance --group-rows 200000000 2>&1 | tee /nvme/build.log
 ```
 
 - **What it does:** sorts and writes each table one bucket group at a time, about 200 M rows per sort, straight to S3.
@@ -172,7 +176,7 @@ The time estimate scales Berlin by file size (15 M versions in 67 s on 4 threads
 Then build the areas in full (≈ 1–2 h; DuckDB spatial over about 1.2 M pivot relations):
 
 ```bash
-SUNCHASER_CATALOG=/nvme/catalog.ducklake .venv/bin/python -I src/build_areas.py --full
+SUNCHASER_CATALOG=/nvme/catalog.ducklake uv run python src/build_areas.py --full
 ```
 
 Expected lake size (≈): current tables 330 GB, history and changes 0.6–1.2 TB, Lance 350–400 GB. That is roughly $35–45 a month in S3 Standard; Intelligent-Tiering lowers it for the cold history files.
@@ -182,13 +186,13 @@ Expected lake size (≈): current tables 330 GB, history and changes 0.6–1.2 T
 Upload the catalog. This makes the lake live for readers:
 
 ```bash
-.venv/bin/python -I src/objcatalog.py put /nvme/catalog.ducklake $LAKE/catalog.ducklake
+uv run python src/objcatalog.py put /nvme/catalog.ducklake $LAKE/catalog.ducklake
 ```
 
 The history file is days old by now. Catch up from the build box with one long job, using hourly diffs, then minutely ones:
 
 ```bash
-.venv/bin/python -I src/updater.py job --catalog-url $LAKE/catalog.ducklake --max-seconds 21600 --lease-seconds 25200 --keep-versions --workdir /nvme
+uv run python src/updater.py job --catalog-url $LAKE/catalog.ducklake --max-seconds 21600 --lease-seconds 25200 --keep-versions --workdir /nvme
 ```
 
 A planet hour measured 11–22 s to apply on 4 cores against a small lake. Against the full tables, budget ≈ 1 min per hour of backlog, so a week of backlog takes a few hours. Re-run until the job reports `nothing new` or only a few diffs.
@@ -196,7 +200,7 @@ A planet hour measured 11–22 s to apply on 4 cores against a small lake. Again
 Check the result with a reader on the box:
 
 ```bash
-SUNCHASER_CATALOG=$LAKE/catalog.ducklake .venv/bin/python -I src/server.py &
+SUNCHASER_CATALOG=$LAKE/catalog.ducklake uv run python src/server.py &
 ```
 
 ```bash
@@ -215,7 +219,7 @@ The updater is a job, not a service. Each run:
 
 Overlapping runs exit on the lease, and the conditional PUT makes a lost race harmless. Between runs nothing runs.
 
-Image: build a container from the repo, with Python, `requirements.txt` and `src/`. The Rust extractor isn't needed here. Two ways to schedule it:
+Image: build a container from the repo with `uv sync --locked --no-dev` and `src/`. The Rust extractor isn't needed here. Two ways to schedule it:
 
 | | Lambda (recommended) | ECS Fargate scheduled task |
 |---|---|---|

@@ -1,0 +1,24 @@
+[project]
+name = "sunchaser"
+version = "0.1.0"
+description = "Overpass API-compatible queries over an OpenStreetMap lakehouse on object storage"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "boto3>=1.43",
+    "duckdb>=2.0.0",
+    "numpy>=2.5",
+    "osmium>=4.3",
+    "pyarrow>=26.0",
+    "pylance>=14.0.1",
+    "python-multipart>=0.0.32",
+    "pytz>=2026.5",
+    "starlette>=1.10",
+    "uvicorn>=0.54",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.uv]
+package = false  # scripts under src/ and tools/, run with `uv run python src/...`

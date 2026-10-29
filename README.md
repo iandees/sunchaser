@@ -52,9 +52,10 @@ that shaped it.
 
 ## Running it
 
+Python dependencies are managed with [uv](https://docs.astral.sh/uv/) (`pyproject.toml`, `uv.lock`):
+
 ```bash
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
+uv sync
 ```
 
 Extract and build. The Rust extractor is the fast path; it needs `cargo` and outputs the same Parquet:
@@ -78,26 +79,26 @@ Configure storage. `deploy/local.env` targets the local test store; for R2, set
 ```
 
 ```bash
-.venv/bin/python -I src/build_lake.py --raw data/raw --lake /tmp/build --osm-base 2026-10-24T00:00:00Z
+uv run python src/build_lake.py --raw data/raw --lake /tmp/build --osm-base 2026-10-24T00:00:00Z
 ```
 
 Follow replication (omit `--region` for a planet lake):
 
 ```bash
-.venv/bin/python -I src/updater.py run --region 52.23,12.76,52.82,13.98
+uv run python src/updater.py run --region 52.23,12.76,52.82,13.98
 ```
 
 Serve. Point Overpass Turbo's server setting at `http://localhost:8080/api/`:
 
 ```bash
-SUNCHASER_PORT=8080 .venv/bin/python -I src/server.py
+SUNCHASER_PORT=8080 uv run python src/server.py
 ```
 
 Compact periodically, e.g. hourly. This flushes inlined rows to sorted Parquet, merges small files
 and expires old snapshots:
 
 ```bash
-.venv/bin/python -I src/updater.py compact
+uv run python src/updater.py compact
 ```
 
 ## Differential testing
@@ -107,7 +108,7 @@ Build Overpass from source, load the same extract (`update_database --meta
 for a city), then:
 
 ```bash
-.venv/bin/python -I tools/compare_overpass.py --db-dir /path/to/overpass-db
+uv run python tools/compare_overpass.py --db-dir /path/to/overpass-db
 ```
 
 For history queries, load the reference with `--keep-attic`, replay the lake's diffs over a fixed window, and compare with `--history`. The window is set with `updater.py run --once --until T`, and the reference is synced with `tools/sync_reference.py --keep-attic`.
