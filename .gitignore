@@ -3,3 +3,4 @@ data
 tools/qt_oracle
 __pycache__/
 rust/*/target/
+.env
