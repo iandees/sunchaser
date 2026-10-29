@@ -122,14 +122,16 @@ class Plan:
 class Engine:
     _ids = itertools.count()
 
-    def __init__(self, con, mode="lake", raw_dir="data/raw", plan=None, lance=None):
-        """lance: optional callable name -> lance.LanceDataset; routes node/way scans to Lance."""
+    def __init__(self, con, mode="lake", raw_dir="data/raw", plan=None, lance=None, init_macros=True):
+        """lance: optional callable name -> lance.LanceDataset; routes node/way scans to Lance.
+        init_macros=False when the macros were created once on the shared database (server)."""
         self.con = con
         self.lance = lance
         self.mode = mode
         self.plan = plan or Plan()
         self._locator_memo = {}
-        con.sql(SQL_MACROS)
+        if init_macros:
+            con.sql(SQL_MACROS)
         if mode == "raw":
             con.sql(f"""
               CREATE OR REPLACE TEMP VIEW nodes AS SELECT * FROM '{raw_dir}/nodes.parquet';

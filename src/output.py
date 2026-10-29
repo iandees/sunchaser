@@ -313,7 +313,9 @@ class Document:
         sep = self.csv.separator
         lines = []
         if self.csv.header:
-            lines.append(sep.join(name if special else name for name, special in self.csv.fields))
+            # Output_CSV::write_payload_header: special fields print as "@id", "@lat", ...
+            lines.append(sep.join("@" + name[2:] if special else self._csv_escape(name)
+                                  for name, special in self.csv.fields))
         for it in self.items:
             lines.append(sep.join(self._csv_field(it, name, special) for name, special in self.csv.fields))
         return "text/csv", "\n".join(lines) + "\n"
