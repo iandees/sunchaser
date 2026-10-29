@@ -15,6 +15,8 @@ Configuration (environment):
   SUNCHASER_MAX_OUTPUT   cap for a response in bytes (default 2 GiB); [maxsize:N] can lower it
   SUNCHASER_MAX_QUERIES  queries executed concurrently (default 16); more wait in line
   SUNCHASER_LANCE        "off" to ignore a lake's Lance id store (default: use it when the lake has one)
+  SUNCHASER_LOG_QUERIES  1: one line per query (time, bytes, outcome, query text); 2: also each SQL statement
+                         the query ran, with its time (default 0: only uvicorn's access log)
 
 Each request runs on its own DuckDB cursor (temp tables are per cursor) in a worker thread and
 streams its output as it is produced, so large results never sit in memory; a slow client pauses
@@ -50,6 +52,7 @@ COPYRIGHT = "The data included in this document is from www.openstreetmap.org. T
 
 env = lakeconn.env
 MAX_OUTPUT = int(env("MAX_OUTPUT", str(2 << 30)))       # bytes; [maxsize:N] can only lower it
+LOG_QUERIES = int(env("LOG_QUERIES", "0"))
 STREAM_AHEAD = 16                                          # unsent 64 KB chunks before the query waits
 WORKERS = concurrent.futures.ThreadPoolExecutor(int(env("MAX_QUERIES", "16")))  # concurrent queries
 
@@ -197,6 +200,7 @@ class Chunker:
         self.loop, self.queue, self.cancelled = loop, queue, cancelled
         self.slots = threading.Semaphore(STREAM_AHEAD)
         self.parts, self.n, self.sent_any = [], 0, False
+        self.query, self.total = "", 0  # for SUNCHASER_LOG_QUERIES
 
     def __call__(self, text):
         self.parts.append(text)
@@ -207,6 +211,7 @@ class Chunker:
     def flush(self):
         if self.parts:
             self.put("data", "".join(self.parts))
+            self.total += self.n
             self.parts, self.n, self.sent_any = [], 0, True
 
     def put(self, kind, value):
@@ -218,9 +223,24 @@ class Chunker:
         self.loop.call_soon_threadsafe(self.queue.put_nowait, (kind, value))
 
 
+def _log_query(sink, started, ran, outcome, steps):
+    """SUNCHASER_LOG_QUERIES: where a query's time went (statement times exclude lazily fetched results)."""
+    q = " ".join(getattr(sink, "query", "").split())
+    setup = f"setup {ran - started:5.2f}s" if ran else "setup    n/a"
+    print(f"query {time.time() - started:6.2f}s ({setup}) {getattr(sink, 'total', 0) >> 10:7} KiB {outcome:<9} {q[:300]}",
+          flush=True)
+    if LOG_QUERIES > 1:
+        for secs, sql in steps:
+            print(f"    {secs:6.2f}s {' '.join(sql.split())[:160]}", flush=True)
+        # result SELECTs are lazy: their work happens while the output is written, not in the statement
+        print(f"    {time.time() - (ran or started) - sum(t for t, _ in steps):6.2f}s fetching results / writing output",
+              flush=True)
+
+
 def _execute(script, callback, sink):
     """Run a parsed script, streaming into `sink` (a Chunker). Errors before anything was sent
     propagate (error page / catalog retry); later ones become Overpass runtime-error remarks."""
+    started, ran, steps, outcome = time.time(), None, [], "ok"
     cur = db().cursor()
     try:
         st = script.settings
@@ -230,21 +250,33 @@ def _execute(script, callback, sink):
                           json_callback=callback, sink=sink, maxsize=maxsize)
         timer = threading.Timer(timeout, cur.interrupt)
         timer.start()
-        started = time.time()
         try:
             store = lance_store(cur)
             engine = Engine(cur, "lake", init_macros=False, lance=store,
                             plan=Plan(lance_scope="ids") if store else None)
+            if LOG_QUERIES > 1:
+                def timed(sql, fn):
+                    t = time.time()
+                    rel = fn()
+                    steps.append((time.time() - t, sql))
+                    return rel
+                engine.trace = timed
+            ran = time.time()
             ql.Executor(engine, doc.timestamp).run(script, doc=doc)
         except duckdb.InterruptException:
             if sink.cancelled.is_set():
+                outcome = "cancelled"
                 raise ClientGone()
+            outcome = "timeout"
             doc.remarks.append(f"runtime error: Query timed out after {int(time.time() - started)} seconds.")
         except ql.OutputTooLarge:
+            outcome = "too-large"
             doc.remarks.append(f"runtime error: Query run out of memory using about {-(-maxsize >> 20)} MB of RAM.")
         except (ClientGone, ql.QLError):
+            outcome = "error"
             raise
         except Exception as e:
+            outcome = "error"
             if not sink.sent_any:
                 raise
             traceback.print_exc()
@@ -255,6 +287,8 @@ def _execute(script, callback, sink):
         sink.flush()
     finally:
         cur.close()
+        if LOG_QUERIES:
+            _log_query(sink, started, ran, outcome, steps)
 
 
 def run_stream(script, callback, sink):
@@ -321,6 +355,7 @@ async def interpreter(request):
     content_type = ql.Document(fmt=script.settings.get("out", "xml"), json_callback=callback).content_type
     queue, cancelled = asyncio.Queue(), threading.Event()
     sink = Chunker(asyncio.get_running_loop(), queue, cancelled)
+    sink.query = text
     WORKERS.submit(run_stream, script, callback, sink)
     kind, value = await queue.get()
     sink.slots.release()
