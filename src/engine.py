@@ -122,6 +122,7 @@ class Plan:
     locator: bool = True          # route id fetches through elem_locator -> qt ranges
     max_or_ranges: int = 32       # zone-map ranges per predicate; more ranges prune better but cost CPU per row
     postings_max: int = 20000     # bbox+tag: drive from tag_postings if at most this many candidates
+    rel_member_probe_max: int = 5000  # bbox relations: test members directly up to this many
     lance_scope: str = "all"      # with a Lance store: "all" node/way scans, or only id-driven ones ("ids")
     log: list = field(default_factory=list)
 
@@ -314,7 +315,7 @@ class Engine:
         drive = next((f for f in filters if f.postings_sql()), None) if lake_postings else None
         if bbox is not None:
             if t == "r":
-                local.append(self._bbox_pred_rel(bbox))
+                push += self._rel_overlap(bbox)
             else:
                 p, l = self._bbox_parts(t, bbox)
                 push += p
@@ -329,8 +330,12 @@ class Engine:
             p, l = self._postings_parts(t, drive)
             push += p
             local += l
-        if not push and not local:
+        if not push and not local and bbox is None:
             raise ValueError("Overpass rejects unconstrained queries")
+        if t == "r" and bbox is not None:
+            # candidates first (bbox overlap, keys, tags), then the member test on those only
+            cand = self._new(self._scan(t, push, local, cols=cols, tbl=tbl))
+            return f"SELECT 'r' AS type, id FROM {self._ids_table(self._rels_with_member_in(cand, bbox))}"
         return self._scan(t, push, local, cols=cols, tbl=tbl)
 
     # ---- areas (statements/area_query.cc, map_to_area.cc, coord_query.cc, pivot.cc) ----
@@ -468,20 +473,46 @@ class Engine:
             push.append(self._ranges_sql("qt_key31", qt.calc_parents(qt.calc_ranges(b.s, b.n, b.w, b.e))))
         return push, [f"ov_way_in_bbox(nd_lat, nd_lon, {b.s}, {b.n}, {b.w}, {b.e})"]
 
-    def _bbox_pred_rel(self, b):
-        """Relations: any member node inside, or any member way intersecting (filter_relations_expensive)."""
+    def _rel_overlap(self, b):
         s7, w7, n7, e7 = b.ints()
-        overlap = f"max_lat >= {s7} AND min_lat <= {n7} AND max_lon >= {w7} AND min_lon <= {e7}"
         if self.mode == "raw":
-            overlap = "true"  # brute force: no precomputed relation bbox in the raw data
-        if self.mode == "lake" and self.plan.qt_ranges:
-            overlap += " AND " + self._ranges_sql("qt_key31", qt.calc_parents(qt.calc_ranges(b.s, b.n, b.w, b.e)))
-        node_hits = self._query_one("n", b, [], None, None)
-        way_hits = self._query_one("w", b, [], None, None)
-        return (overlap + f""" AND id IN (
-            SELECT r.id FROM (SELECT id, unnest(members, recursive := true) FROM {self.t['r']} WHERE {overlap}) r
-            WHERE (r.type = 'n' AND r.ref IN (SELECT id FROM ({node_hits})))
-               OR (r.type = 'w' AND r.ref IN (SELECT id FROM ({way_hits}))))""")
+            return []  # brute force: no precomputed relation bbox in the raw data
+        push = [f"max_lat >= {s7} AND min_lat <= {n7} AND max_lon >= {w7} AND min_lon <= {e7}"]
+        if self.plan.qt_ranges:
+            push.append(self._ranges_sql("qt_key31", qt.calc_parents(qt.calc_ranges(b.s, b.n, b.w, b.e))))
+        return push
+
+    def _rels_with_member_in(self, cand, b):
+        """filter_relations_expensive: relations of set cand with a member node inside the bbox or a
+        member way intersecting it."""
+        rows = self.elements(cand, "r", ["id", "members"])
+        if not rows:
+            return []
+        node_ids = sorted({m["ref"] for _, ms in rows for m in ms if m["type"] == "n"})
+        way_ids = sorted({m["ref"] for _, ms in rows for m in ms if m["type"] == "w"})
+        s7, w7, n7, e7 = b.ints()
+        hit_n, hit_w = set(), set()
+        if len(node_ids) + len(way_ids) > self.plan.rel_member_probe_max:
+            # many candidate members (big relations around a small box): elements in the box are fewer
+            hit_n = set(node_ids) & set(self._materialize_ids(self._query_one("n", b, [], None, None).replace(
+                "SELECT 'n' AS type, id", "SELECT id", 1)))
+            hit_w = set(way_ids) & set(self._materialize_ids(self._query_one("w", b, [], None, None).replace(
+                "SELECT 'w' AS type, id", "SELECT id", 1)))
+            node_ids = way_ids = []
+        if node_ids:
+            push, local = self._id_parts("n", node_ids)
+            hit_n = set(self._materialize_ids(self._scan(
+                "n", push + [f"lat BETWEEN {s7} AND {n7} AND lon BETWEEN {w7} AND {e7}"], local, select="id")))
+        if way_ids:
+            push, local = self._id_parts("w", way_ids)
+            if self.mode == "lake":
+                push.append(f"max_lat >= {s7} AND min_lat <= {n7} AND max_lon >= {w7} AND min_lon <= {e7}")
+            hit_w = set(self._materialize_ids(self._scan(
+                "w", push, local + [f"ov_way_in_bbox(nd_lat, nd_lon, {b.s}, {b.n}, {b.w}, {b.e})"],
+                cols=("id", "nd_lat", "nd_lon", "min_lat", "max_lat", "min_lon", "max_lon"), select="id")))
+        return sorted(i for i, ms in rows
+                      if any((m["type"] == "n" and m["ref"] in hit_n) or (m["type"] == "w" and m["ref"] in hit_w)
+                             for m in ms))
 
     def _postings_parts(self, t, f, bbox=None):
         """tags_global equivalent: the (qt, id) pairs come from the postings, so the element fetch can
