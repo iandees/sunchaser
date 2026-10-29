@@ -646,8 +646,12 @@ def job(args):
     runs. --loop: keep running and keep the catalog on local disk, uploading after each batch of
     diffs (no download per run; for an always-on host)."""
     import objcatalog
+    import signal
     t0 = time.time()
     ttl = args.lease_seconds or args.max_seconds + 600
+    # systemd stops a service with SIGTERM: exit through the `finally` so the lease is released and
+    # the restarted job doesn't wait out the old one's TTL
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     lease = objcatalog.acquire_lease(args.catalog_url, ttl=ttl)
     if not lease:
         print("job: another run holds the lease; exiting", flush=True)
