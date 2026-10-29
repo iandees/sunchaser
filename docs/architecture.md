@@ -136,7 +136,7 @@ Catch-up uses hourly diffs (a planet day diff is about 100 MB, too much for one 
   - Ways as areas: this Overpass version's rules build areas from relations only.
 - **Performance:**
   - Single queries take 0.3–3 s on a 4-core box, against 0.1–2.4 s for local-disk Overpass.
-  - Large outputs are bound by Python serialisation, at about 10 MB/s.
+  - Large outputs: JSON nodes and ways are serialised in SQL (about 32 MB/s); other formats and modes in Python (about 10 MB/s).
   - Lance as an id-lookup store (`results/NOTES.md`) is not wired into the live path.
 - **Areas** are rebuilt in full, not incrementally.
 - **Planet scale:** see `docs/planet.md` for the build and update plan, and what is measured vs extrapolated.

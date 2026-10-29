@@ -211,6 +211,53 @@ class Document:
         self.n_elements += 1
         self._write(text)
 
+    def emit_text(self, text):
+        """An element already serialised in this document's format (see _sql_json)."""
+        self.start()
+        if self.maxsize is not None and self.size + len(text) > self.maxsize:
+            raise OutputTooLarge(self.size + len(text))
+        if self.fmt == "json" and self.n_elements:
+            text = ",\n" + text
+        self.n_elements += 1
+        self._write(text)
+
+    def _sql_json(self, t, bits, geo):
+        """(columns, SQL expression) rendering a node or way as its JSON line, the same text as
+        _line_json, or None where the Python path is needed (other formats, meta, clipping).
+        Serialising in DuckDB is vectorised and skips building Python objects per element."""
+        if self.fmt != "json" or bits & META or self.clip is not None or t not in ("n", "w"):
+            return None
+        f7 = lambda x: f"printf('%.7f', ({x}) / 1e7)"
+        tags = (", CASE WHEN cardinality(tags) > 0 THEN ', \"tags\": ' || replace(replace(to_json(tags)::VARCHAR, "
+                "'\":\"', '\": \"'), '\",\"', '\", \"') ELSE '' END") if bits & TAGS else ""
+        idf = ", ', \"id\": ' || id" if bits & ID else ""
+        if t == "n":
+            cols = ["id", "lat", "lon"] + (["tags"] if bits & TAGS else [])
+            pos = (f", ', \"lat\": ' || {f7('lat')} || ', \"lon\": ' || {f7('lon')}"
+                   if bits & (COORDS | geo) else "")
+            return cols, f"concat('    {{\"type\": \"node\"'{idf}{pos}{tags}, '}}')"
+        cols = ["id", "nds"] + (["nd_lat", "nd_lon"] if geo else []) + (["tags"] if bits & TAGS else [])
+        parts = []
+        if geo:
+            la = f"list_filter(nd_lat, lambda x: x <> {NO_COORD})"
+            lo = f"list_filter(nd_lon, lambda x: x <> {NO_COORD})"
+            if bits & BOUNDS:
+                parts.append(f"CASE WHEN len({la}) > 0 THEN ', \"bounds\": {{\"minlat\": ' || {f7(f'list_min({la})')} || "
+                             f"', \"minlon\": ' || {f7(f'list_min({lo})')} || ', \"maxlat\": ' || {f7(f'list_max({la})')} || "
+                             f"', \"maxlon\": ' || {f7(f'list_max({lo})')} || '}}' ELSE '' END")
+            elif bits & CENTER:
+                parts.append(f"CASE WHEN len({la}) > 0 THEN ', \"center\": {{\"lat\": ' || "
+                             f"{f7(f'(list_min({la}) + list_max({la})) / 2')} || ', \"lon\": ' || "
+                             f"{f7(f'(list_min({lo}) + list_max({lo})) / 2')} || '}}' ELSE '' END")
+        if bits & NDS:
+            parts.append("CASE WHEN len(nds) > 0 THEN ', \"nodes\": [' || array_to_string(nds, ', ') || ']' ELSE '' END")
+        if geo and bits & GEOMETRY:
+            parts.append(f"', \"geometry\": [' || array_to_string(list_transform(list_zip(nd_lat, nd_lon), "
+                         f"lambda p: CASE WHEN p[1] = {NO_COORD} THEN 'null' ELSE '{{\"lat\": ' || {f7('p[1]')} || "
+                         f"', \"lon\": ' || {f7('p[2]')} || '}}' END), ', ') || ']'")
+        body = "".join(f", {x}" for x in parts)
+        return cols, f"concat('    {{\"type\": \"way\"'{idf}{body}{tags}, '}}')"
+
     def finish(self):
         if not self.finished:
             self.start()
@@ -248,8 +295,20 @@ class Document:
                 ids = sorted(ids, key=lambda i: (keys.get(i, 0), i))
             else:
                 ids = sorted(ids)
+            fast = self._sql_json(t, bits, geo)
             for k in range(0, len(ids), self.CHUNK):
                 chunk = ids[k:k + self.CHUNK]
+                if fast is not None:  # elements serialised by DuckDB
+                    cols, select = fast
+                    found = dict(engine.elements_by_id(t, chunk, cols, select=f"id, {select}"))
+                    for i in chunk:
+                        if i in found:
+                            self.emit_text(found[i])
+                            if left is not None:
+                                left -= 1
+                                if left <= 0:
+                                    return
+                    continue
                 meta = engine.meta(t, chunk) if bits & META and t != "a" else {}
                 found = {it["id"]: it for it in getattr(self, f"_items_{t}")(engine, chunk, bits, geo)}
                 for i in chunk:

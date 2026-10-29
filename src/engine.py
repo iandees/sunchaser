@@ -626,11 +626,12 @@ class Engine:
         push, local = self._id_parts(t, ids)
         return self._sql(self._scan(t, push, local, cols=tuple(cols), select=", ".join(cols))).fetchall()
 
-    def elements_by_id(self, t, ids, cols):
+    def elements_by_id(self, t, ids, cols, select=None):
+        """Rows of the type-t elements with these ids: `cols`, or the `select` expressions over them."""
         if not ids:
             return []
         push, local = self._id_parts(t, sorted(set(ids)))
-        return self._sql(self._scan(t, push, local, cols=tuple(cols), select=", ".join(cols))).fetchall()
+        return self._sql(self._scan(t, push, local, cols=tuple(cols), select=select or ", ".join(cols))).fetchall()
 
     META_TABLE = {"n": "nodes_meta", "w": "ways_meta", "r": "relations_meta"}
 

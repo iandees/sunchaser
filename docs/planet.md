@@ -86,11 +86,11 @@ One large machine with local NVMe, for example 32–64 vCPU, 128–256 GB RAM an
 - **API servers** are stateless: `src/server.py` behind a load balancer, autoscaled on CPU. Each one needs only object storage plus either the Postgres catalog (minutely freshness) or the frozen catalog file (freshness of a few minutes, no database).
 - **Cache:** the hot set is the Parquet footers and row groups of popular areas. DuckDB's external file cache, and a local NVMe cache in front of R2/S3, cut first-byte latency. R2 has no egress fees, which suits a public API.
 - **Streaming:** responses stream as they are produced, so large results never sit in memory twice, and a slow client pauses its query. `SUNCHASER_MAX_QUERIES`, `SUNCHASER_MAX_OUTPUT` and `SUNCHASER_MAX_TIMEOUT` bound one server.
-- **Output speed:** about 10 MB/s of JSON per query in Python today. A whole-city `out geom` (250 MB) takes about 25 s. Moving serialisation into DuckDB SQL (string building per element), or Rust, is the main remaining lever for large outputs.
+- **Output speed:** JSON for nodes and ways (without `meta` or clipping) is built in DuckDB SQL, at about 32 MB/s per query on 4 cores. A whole-city `out geom` (250 MB) takes 8 s, against 24 s in Python. XML, CSV, `meta`, relations and clipped geometry still serialise in Python, at about 10 MB/s.
 
 ## Open items for planet scale
 
 - **Areas:** incremental rebuild, only for relations that changed or whose members moved (the updater's `changes` log has them). Today it is a full rebuild.
 - **Update cost against planet-sized tables:** delete lookups, the compaction cadence and the size of the catalog's inlined data all need measuring.
-- **Serialisation speed** for large outputs (above).
+- **Serialisation:** move XML, `out meta` and relation geometry into SQL as well.
 - **Antimeridian-crossing boxes** in the query engine.
