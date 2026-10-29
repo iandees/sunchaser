@@ -422,7 +422,32 @@ def compact(con):
             print(f"{q:<90} skipped: {str(e).splitlines()[0][:80]}")
 
 
-def follow(up, once=False, poll=30, kinds=("hour", "minute")):
+class Maintenance:
+    """Periodic jobs between batches: areas (like Overpass's rules loop) and compaction."""
+
+    def __init__(self, con, areas_every=3600, compact_every=3600):
+        self.con, self.jobs = con, []
+        if areas_every:
+            self.jobs.append(["areas", areas_every, time.time()])
+        if compact_every:
+            self.jobs.append(["compact", compact_every, time.time()])
+
+    def tick(self):
+        for job in self.jobs:
+            name, every, last = job
+            if time.time() - last < every:
+                continue
+            t = time.time()
+            if name == "areas":
+                import build_areas
+                build_areas.build(self.con)
+            else:
+                compact(self.con)
+            job[2] = time.time()
+            print(f"maintenance {name} {time.time() - t:.1f}s", flush=True)
+
+
+def follow(up, once=False, poll=30, kinds=("hour", "minute"), maintenance=None):
     """Catch up with coarse diffs (hourly by default: a planet day diff is ~100 MB, too much to hold
     in one batch), then minute diffs; then poll the minutely feed."""
     base = up.sql("SELECT value FROM lake.state WHERE key = 'osm_base'").fetchall()[0][0]
@@ -438,6 +463,8 @@ def follow(up, once=False, poll=30, kinds=("hour", "minute")):
             s, ts = state_of(kind, seq)
             stats = up.apply([osc(kind, seq)], osm_base=ts, sequence=f"{kind}/{seq}")
             print(f"{kind}/{seq} -> {ts} {stats}", flush=True)
+            if maintenance is not None:
+                maintenance.tick()
             base = ts
             seq += 1
             if kind == "minute" and seq > cur and not once:
@@ -456,6 +483,8 @@ def main():
     ap.add_argument("files", nargs="*")
     ap.add_argument("--region", help="s,w,n,e: keep a regional extract consistent (omit for a planet lake)")
     ap.add_argument("--once", action="store_true", help="catch up and exit instead of following")
+    ap.add_argument("--areas-every", type=int, default=3600, help="seconds between area rebuilds (0: never)")
+    ap.add_argument("--compact-every", type=int, default=3600, help="seconds between compactions (0: never)")
     args = ap.parse_args()
     con = duckdb.connect()
     lakeconn.attach(con)
@@ -466,7 +495,7 @@ def main():
     if args.cmd == "apply":
         print(up.apply([pathlib.Path(f).read_bytes() for f in args.files]))
     else:
-        follow(up, once=args.once)
+        follow(up, once=args.once, maintenance=Maintenance(con, args.areas_every, args.compact_every))
 
 
 if __name__ == "__main__":

@@ -154,10 +154,26 @@ async def timestamp(request):
         cur.close()
 
 
+class PrivateNetworkAccess:
+    """Chrome's Private Network Access: https pages (e.g. overpass-turbo.eu) may call a server on a
+    private address only if its preflight answers Access-Control-Allow-Private-Network."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        async def send_wrapper(message):
+            if message["type"] == "http.response.start":
+                message.setdefault("headers", []).append((b"access-control-allow-private-network", b"true"))
+            await send(message)
+        await self.app(scope, receive, send_wrapper)
+
+
 app = Starlette(
     routes=[Route("/api/interpreter", interpreter, methods=["GET", "POST"]),
             Route("/api/status", status), Route("/api/timestamp", timestamp)],
-    middleware=[Middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET", "POST", "OPTIONS"],
+    middleware=[Middleware(PrivateNetworkAccess),
+                Middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET", "POST", "OPTIONS"],
                            allow_headers=["*"])],
 )
 
