@@ -176,8 +176,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--raw", default="data/raw")
     ap.add_argument("--lake", default="data/lake", help="local working dir (and default catalog/data location)")
-    ap.add_argument("--catalog", help="DuckLake catalog (sqlite:..., postgres:..., or a .ducklake file); "
-                                      "default <lake>/osm.ducklake or $SUNCHASER_CATALOG")
+    ap.add_argument("--catalog", help="DuckLake catalog file (.ducklake); default <lake>/osm.ducklake or $SUNCHASER_CATALOG")
     ap.add_argument("--data-path", help="where Parquet goes (s3://bucket/prefix/ for S3/R2); default <lake>/data")
     ap.add_argument("--osm-base", default="", help="timestamp of the source data (state.osm_base); default: "
                                                    "the PBF header's replication timestamp (bucketed input)")
@@ -197,8 +196,6 @@ def main():
     lake.mkdir(parents=True)
     catalog = args.catalog or lakeconn.env("CATALOG") or f"{lake}/osm.ducklake"
     data_path = args.data_path or lakeconn.env("DATA_PATH") or f"{lake}/data"
-    if catalog.startswith("sqlite:"):
-        pathlib.Path(catalog[7:]).unlink(missing_ok=True)
 
     con = duckdb.connect(str(lake / "build.duckdb"))
     con.sql("SET preserve_insertion_order = false")
@@ -355,10 +352,6 @@ def main():
           ('osm_base', '{args.osm_base}'), ('sequence', '{args.sequence}'), ('batch', '0')) v(key, value)""")
     # Minutely updates are small: let them inline into the catalog until the next flush/compaction.
     con.sql("CALL lake.set_option('data_inlining_row_limit', 100000)")
-    if catalog.startswith("sqlite:"):
-        # WAL: API readers must not block the updater's commits ("database is locked")
-        import sqlite3
-        sqlite3.connect(catalog[len("sqlite:"):], timeout=30).execute("PRAGMA journal_mode=WAL").fetchall()
 
     if args.lance:
         import lancestore

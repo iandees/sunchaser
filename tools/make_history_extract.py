@@ -9,7 +9,7 @@ Only elements the lake's changes log has are taken from the diffs (the same filt
 tools/sync_reference.py --lake-changes), so a regional lake and the history file agree.
 
   python tools/make_history_extract.py --pbf Berlin.osm.pbf --log updater.log --from 2026-10-24T00:00:00Z \
-      --lake-changes sqlite:/path/lake.sqlite --out berlin.osh.pbf
+      --lake-changes /path/lake.ducklake --out berlin.osh.pbf
 """
 import argparse
 import gzip

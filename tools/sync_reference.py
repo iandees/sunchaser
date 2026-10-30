@@ -23,7 +23,7 @@ def lake_changed(catalog):
     """(type, id) of every element the lake created, modified or deleted (its changes log)."""
     import duckdb
     con = duckdb.connect()
-    con.sql("LOAD ducklake; LOAD sqlite")
+    con.sql("LOAD ducklake")
     con.sql(f"ATTACH 'ducklake:{catalog}' AS lake (READ_ONLY)")
     rows = con.sql("SELECT DISTINCT type, id FROM lake.changes WHERE action <> 'geometry'").fetchall()
     return {("node" if t == "n" else "way" if t == "w" else "relation", i) for t, i in rows}
@@ -49,7 +49,7 @@ def main():
     ap.add_argument("--bin", default="/home/user/overpass-ref/bin/update_database")
     ap.add_argument("--keep-attic", action="store_true", help="the reference was loaded with --keep-attic")
     ap.add_argument("--lake-changes", metavar="CATALOG",
-                    help="apply only the elements this lake's changes log has (e.g. sqlite:/path/lake.sqlite)")
+                    help="apply only the elements this lake's changes log has (a .ducklake file)")
     args = ap.parse_args()
     keep = lake_changed(args.lake_changes) if args.lake_changes else None
     batches = re.findall(r"^(hour|minute)/(\d+) -> (\S+)", pathlib.Path(args.log).read_text(), re.M)

@@ -1,8 +1,7 @@
 """Shared DuckDB/DuckLake connection setup for the builder, the API server and the updater.
 
 Environment:
-  SUNCHASER_CATALOG     DuckLake catalog: "sqlite:/path/catalog.sqlite", "postgres:dbname=... host=...",
-                        or a .ducklake file path (default data/lake/osm.ducklake)
+  SUNCHASER_CATALOG     DuckLake catalog: a .ducklake file path or an s3:// URL (default data/lake/osm.ducklake)
   SUNCHASER_DATA_PATH   data path for new lakes, or an override for readers (s3://bucket/prefix/, https://...)
   SUNCHASER_S3_ENDPOINT, SUNCHASER_S3_KEY_ID, SUNCHASER_S3_SECRET, SUNCHASER_S3_REGION,
   SUNCHASER_S3_URL_STYLE (path|vhost), SUNCHASER_S3_USE_SSL (true|false)
@@ -51,10 +50,6 @@ def attach(con, catalog=None, data_path=None, read_only=False, override_data_pat
     catalog = catalog or env("CATALOG", "data/lake/osm.ducklake")
     data_path = data_path if data_path is not None else env("DATA_PATH")
     load(con, "ducklake", "httpfs")
-    if catalog.startswith("sqlite:"):
-        load(con, "sqlite")
-    elif catalog.startswith("postgres:"):
-        load(con, "postgres")
     configure_s3(con)
     opts = []
     if read_only:

@@ -3,7 +3,6 @@
   python src/updater.py run [--region s,w,n,e] [--once]    follow replication (day -> hour -> minute catch-up)
   python src/updater.py apply FILE.osc.gz ...               apply local diffs
   python src/updater.py compact                             flush inlined data, merge files, expire snapshots
-  python src/updater.py publish s3://bucket/lake/catalog.ducklake     publish a frozen catalog (src/publish.py)
 
 The updater is the lake's single writer (like Overpass's update_database). Each batch commits as one
 DuckLake transaction, so API readers see either the whole diff or none of it. Per batch:
@@ -131,23 +130,12 @@ def read_osc(blobs):
 
 # ---- applying ----------------------------------------------------------------------------
 
-def migrate(con):
-    """Bring an older lake's schema up to date (idempotent)."""
-    cols = {c for (c,) in con.sql("SELECT column_name FROM duckdb_columns() WHERE database_name = 'lake' "
-                                  "AND table_name = 'changes'").fetchall()}
-    if "batch" not in cols:  # monotonic per applied diff: lets the area build process only new changes
-        con.sql("ALTER TABLE lake.changes ADD COLUMN batch BIGINT")
-    if not con.sql("SELECT 1 FROM lake.state WHERE key = 'batch'").fetchall():
-        con.sql("INSERT INTO lake.state VALUES ('batch', '0')")
-
-
 class Updater:
     def __init__(self, con, region=None):
         self.con = con
         con.sql(MACROS)
         self.e = Engine(con, "lake")
         self.region = region  # (s, w, n, e) or None for a planet lake
-        migrate(con)
 
     def sql(self, q):
         return self.con.sql(q)
@@ -602,14 +590,12 @@ def compact_due(con, args, state):
 class Maintenance:
     """Periodic jobs between batches: areas (like Overpass's rules loop) and compaction."""
 
-    def __init__(self, con, areas_every=3600, compact_every=3600, publish_to=None, publish_every=300):
-        self.con, self.jobs, self.publish_to = con, [], publish_to
+    def __init__(self, con, areas_every=3600, compact_every=3600):
+        self.con, self.jobs = con, []
         if areas_every:
             self.jobs.append(["areas", areas_every, time.time()])
         if compact_every:
             self.jobs.append(["compact", compact_every, time.time()])
-        if publish_to and publish_every:
-            self.jobs.append(["publish", publish_every, 0])  # publish right after the first batch
 
     def tick(self):
         for job in self.jobs:
@@ -620,25 +606,10 @@ class Maintenance:
             if name == "areas":
                 import build_areas
                 build_areas.build(self.con)
-            elif name == "publish":
-                import publish
-                publish.publish(self.con, self.publish_to)
             else:
                 compact(self.con)
             job[2] = time.time()
             print(f"maintenance {name} {time.time() - t:.1f}s", flush=True)
-
-
-def apply_with_retry(up, blob, ts, sequence, attempts=5):
-    """A batch is one transaction, so a failed commit (e.g. catalog lock contention) can be retried."""
-    for i in range(attempts):
-        try:
-            return up.apply([blob], osm_base=ts, sequence=sequence)
-        except duckdb.TransactionException as e:
-            if i == attempts - 1:
-                raise
-            print(f"{sequence}: commit failed ({str(e).splitlines()[-1][:100]}), retrying", flush=True)
-            time.sleep(2 ** i)
 
 
 def follow(up, once=False, poll=30, kinds=("hour", "minute"), maintenance=None, until=None, deadline=None):
@@ -661,7 +632,7 @@ def follow(up, once=False, poll=30, kinds=("hour", "minute"), maintenance=None, 
                 return applied  # reached the requested point (tests replay a fixed window, not up to now)
             if STOP.is_set() or (deadline is not None and time.time() > deadline):
                 return applied  # the next job continues from state.osm_base
-            stats = apply_with_retry(up, osc(kind, seq), ts, f"{kind}/{seq}")
+            stats = up.apply([osc(kind, seq)], osm_base=ts, sequence=f"{kind}/{seq}")
             applied += 1
             print(f"{kind}/{seq} -> {ts} {stats}", flush=True)
             if maintenance is not None:
@@ -789,15 +760,13 @@ def _loop(args, lease, ttl):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["run", "job", "apply", "compact", "publish"])
+    ap.add_argument("cmd", choices=["run", "job", "apply", "compact"])
     ap.add_argument("files", nargs="*")
     ap.add_argument("--region", help="s,w,n,e: keep a regional extract consistent (omit for a planet lake)")
     ap.add_argument("--once", action="store_true", help="catch up and exit instead of following")
     ap.add_argument("--until", help="stop before the first diff ending after this timestamp (fixed test windows)")
     ap.add_argument("--areas-every", type=int, default=300, help="seconds between incremental area updates (0: never)")
     ap.add_argument("--compact-every", type=int, default=3600, help="seconds between compactions (0: never)")
-    ap.add_argument("--publish-to", help="publish a frozen catalog here (e.g. s3://bucket/lake/catalog.ducklake)")
-    ap.add_argument("--publish-every", type=int, default=300, help="seconds between frozen-catalog publications")
     ap.add_argument("--catalog-url", help="job: the catalog on object storage (s3://bucket/lake/catalog.ducklake)")
     ap.add_argument("--max-seconds", type=float, default=240, help="job: stop applying diffs after this long")
     ap.add_argument("--keep-versions", nargs="?", type=int, const=24, default=0, metavar="N",
@@ -818,16 +787,12 @@ def main():
     lakeconn.attach(con)
     if args.cmd == "compact":
         return compact(con)
-    if args.cmd == "publish":
-        import publish
-        return publish.publish(con, args.publish_to or args.files[0])
     region = tuple(map(float, args.region.split(","))) if args.region else None
     up = Updater(con, region)
     if args.cmd == "apply":
         print(up.apply([pathlib.Path(f).read_bytes() for f in args.files]))
     else:
-        follow(up, once=args.once, maintenance=Maintenance(con, args.areas_every, args.compact_every,
-                                                           args.publish_to, args.publish_every), until=args.until)
+        follow(up, once=args.once, maintenance=Maintenance(con, args.areas_every, args.compact_every), until=args.until)
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@ catalog's data path and Lance datasets use relative paths too, so only the two b
   python tools/relocate_lake.py --catalog /ssd/catalog.ducklake \
       --data-path s3://bucket/lake/data/ [--lance s3://bucket/lake/lance]
 
-Works on a DuckDB-format catalog file (the object-storage setup) or sqlite:/path.
+Works on a DuckDB-format catalog file (the object-storage setup).
 """
 import argparse
 import pathlib
@@ -22,7 +22,7 @@ import lakeconn  # noqa: E402
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--catalog", required=True, help="catalog file (.ducklake) or sqlite:/path")
+    ap.add_argument("--catalog", required=True, help="catalog file (.ducklake)")
     ap.add_argument("--data-path", required=True, help="new data path, ending in /")
     ap.add_argument("--lance", help="new Lance base (if the lake has a Lance store)")
     args = ap.parse_args()
@@ -30,11 +30,7 @@ def main():
 
     # 1. the catalog's data path: a metadata row, outside any DuckLake snapshot
     meta = duckdb.connect()
-    if args.catalog.startswith("sqlite:"):
-        meta.sql("LOAD sqlite")
-        meta.sql(f"ATTACH '{args.catalog[len('sqlite:'):]}' AS m (TYPE sqlite)")
-    else:
-        meta.sql(f"ATTACH '{args.catalog}' AS m")
+    meta.sql(f"ATTACH '{args.catalog}' AS m")
     old = meta.sql("SELECT value FROM m.ducklake_metadata WHERE key = 'data_path'").fetchall()
     meta.sql(f"UPDATE m.ducklake_metadata SET value = '{data_path}' WHERE key = 'data_path'")
     meta.close()
