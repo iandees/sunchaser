@@ -1,5 +1,7 @@
 # Single-region spike: results
 
+> **Spike record.** This is the October 2026 Berlin spike. Its durable findings (the optimisation table, the surprises, Lance vs Parquet, Lance in the live path) moved to `docs/architecture.md`, Measurements. The JSON result files it names (`corpus_*.json`, `idlookup_*.json`, `bench_*.json` and the `overpass_diff_*` variants other than the two that remain) and the scripts that made them (`tools/range_server.py`, `src/bench_idlookup.py`, `src/run_corpus.py`, `src/extract.py` and others) were removed. They were reproducible from the scripts at the time, and git history has them. Commands and file names below are as they were then.
+
 *Region: BBBike "Berlin" extract, snapshot 2026-10-24T00:00Z: 12.9 M nodes, 2.27 M ways, 30 K relations, 183 MB PBF.
 Machine: 4 vCPU and 15 GB RAM, in a container. Engine: DuckDB 2.0.0 + DuckLake 1.0, pylance 14.0.1.*
 
