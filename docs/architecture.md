@@ -17,7 +17,7 @@ now and why.
    │  s3://…/lake/catalog.ducklake   DuckLake catalog (DuckDB file)
    │  s3://…/lake/data/…             Parquet                 │
    └──────────────────────┬──────────────────────────────────┘
-                          │ read-only; reopen when the catalog's ETag changes
+                          │ read-only; fetch a local copy when the catalog's ETag changes
                 ┌─────────▼──────────┐
                 │  src/server.py     │  /api/interpreter  ← Overpass Turbo, scripts
                 │  ql → engine → out │  any number, stateless, can scale to zero
@@ -26,10 +26,10 @@ now and why.
 
 | Component | Role |
 |---|---|
-| **Updater** | The only writer, like Overpass's `update_database`. Each replication diff is one DuckLake transaction. Either `updater.py job` on a schedule, e.g. every minute (take the writer lease, download the catalog, apply what's pending, update areas incrementally, compact when due, upload with a conditional PUT), or `job --loop` on an always-on host (holds and renews the lease, keeps the catalog on local disk, uploads it after each batch). |
-| **Catalog** | A DuckDB-format DuckLake file stored in the bucket (`src/objcatalog.py`), so no database server is needed. The conditional PUT (If-Match on the downloaded ETag) means overlapping runs can't fork it: the later one is refused and discarded, and the Parquet files it wrote are orphans that compaction deletes after a grace period. SQLite (single host) and Postgres catalogs still work for always-on deployments. |
-| **Lance id store** | Lance copies of `nodes_tagged`, `nodes_untagged` and `ways` (BTree on `id`) for id-driven fetches: recursion, id queries, global tag lookups (up to 2.2× faster than DuckLake key ranges). Spatial scans stay on DuckLake. The updater deletes and re-appends touched ids and records the Lance versions in `lake.state` in the same transaction; readers open Lance at those versions, so both stores always show the same diff. Compaction merges Lance fragments and updates the index. Cost: about 1.25× the size of the whole lake's Parquet again. |
-| **Server** | Read-only and stateless. Attaches the catalog object directly and reopens it when its ETag changes (`SUNCHASER_CATALOG_REFRESH`). One DuckDB cursor per request; `[timeout:N]` interrupts the query; responses stream. |
+| **Updater** | The only writer, like Overpass's `update_database`. Each replication diff is one DuckLake transaction. Either `updater.py job` on a schedule, e.g. every minute (take the writer lease, download the catalog, apply what's pending, update areas incrementally, compact when due, upload with a conditional PUT), or `job --loop` on an always-on host (holds and renews the lease, keeps the catalog on local disk, uploads it at most every `--upload-every` seconds, default 120). `run` is `job --loop` on a local catalog. Compaction runs inside the job (default every 3600 s), one step per cycle. |
+| **Catalog** | A DuckDB-format DuckLake file stored in the bucket (`src/objcatalog.py`), so no database server is needed. The conditional PUT (If-Match on the downloaded ETag) means overlapping runs can't fork it: the later one is refused and discarded, and the Parquet files it wrote are orphans that compaction deletes after a grace period. A catalog is a `.ducklake` file or an `s3://` URL; SQLite and Postgres catalogs were removed. |
+| **Lance id store** | Lance copies of `nodes_tagged`, `nodes_untagged` and `ways` (BTree on `id`) for id-driven fetches: recursion, id queries, global tag lookups (up to 2.2× faster than DuckLake key ranges). Spatial scans stay on DuckLake. The updater deletes and re-appends touched ids and records the Lance versions in `lake.state` in the same transaction; readers open Lance at those versions, so both stores always show the same diff. Compaction merges Lance fragments and updates the index. Cost: extra storage, extra requests and a longer build; see Measurements for the ratios. |
+| **Server** | Read-only and stateless. Downloads the s3 catalog to a local file and attaches that, re-fetching when the object's ETag changes (`SUNCHASER_CATALOG_REFRESH` seconds, default 30). Attaching the object lazily over S3 failed mid-query with an ETag error whenever the updater uploaded a new catalog during the read; the local copy avoids that. `SUNCHASER_MAX_READ_MB` refuses a query before it scans when catalog file statistics estimate too many bytes. One DuckDB cursor per request; `[timeout:N]` interrupts the query; responses stream. |
 
 ## Data layout (one DuckLake schema)
 
@@ -74,7 +74,8 @@ Keys:
 - Each version is valid from its timestamp to the next version's; versions sharing a second collapse to the last.
 - A way gets a new row whenever a member node moves (`[date:]` needs its coordinates then).
 - A relation gets a new row only when what it stores changes (members, tags, key, bbox); every member move is still a `geometry` entry in `changes`, as Overpass reports it.
-- Node position and way geometry timelines are kept in RAM (extracts) or in id-indexed files (`--dense-index`, the planet).
+- Node position and way geometry timelines are kept in RAM (extracts) or in id-indexed, memory-mapped files (`--dense-index`, the planet). With `--dense-index` the process's resident size is mostly the mapped index, which the kernel can evict; Germany peaked at 84-98 GB RSS of which only about 11 GB was anonymous memory.
+- `--no-history` extracts a current-only file (an ordinary regional PBF); there is no separate snapshot mode.
 - The PBF header's replication timestamp becomes `state.osm_base`, so the updater continues from there.
 
 ## Updates
@@ -91,55 +92,23 @@ Catch-up uses hourly diffs (a planet day diff is about 100 MB, too much for one 
 - **`build_areas.py`:** Overpass's area rules, incrementally for the relations the last batches changed (`--full` rebuilds). Areas lag the data, as in Overpass.
 - **`compact`:** flush inlined rows to sorted Parquet, merge small files, compact Lance, expire snapshots, and delete files unreferenced for longer than the grace period.
 
-## Deployment on R2 / S3 (scale to zero)
-
-1. Create a bucket and an API token (R2: Object Read & Write).
-2. Set the environment variables. See `deploy/local.env` for the local stand-in. For R2:
-   - `SUNCHASER_S3_ENDPOINT=<account>.r2.cloudflarestorage.com`
-   - `SUNCHASER_S3_REGION=auto`
-   - `SUNCHASER_S3_USE_SSL=true`
-3. Build once into a local catalog file with the data on S3, then upload the catalog:
-
-   ```bash
-   rust/osm-extract/target/release/osm-extract planet.osm.pbf raw
-   ```
-
-   ```bash
-   python src/build_lake.py --raw raw --catalog catalog.ducklake --data-path s3://bucket/lake/data/ --lance s3://bucket/lake/lance --osm-base <pbf timestamp>
-   ```
-
-   ```bash
-   SUNCHASER_CATALOG=catalog.ducklake python src/build_areas.py
-   ```
-
-   ```bash
-   python src/objcatalog.py put catalog.ducklake s3://bucket/lake/catalog.ducklake
-   ```
-
-4. Schedule the updater, for example every minute (cron, EventBridge, Cloud Scheduler). A run that finds nothing new exits without writing:
-
-   ```bash
-   python src/updater.py job --catalog-url s3://bucket/lake/catalog.ducklake --max-seconds 50
-   ```
-
-5. Run read-only API servers anywhere, with `SUNCHASER_CATALOG=s3://bucket/lake/catalog.ducklake`.
-
-`docs/aws.md` has the full AWS walkthrough for a planet build with full history.
-
 ## Validation
+
+The oracle is a real Overpass: `tools/compare_overpass.py` runs `queries/ql_corpus.py` through a reference `osm3s_query` and through this engine, and compares elements. Unit tests: `tests/test_quadtile.py` (fuzz against the C++ header), `tests/test_evaluator.py`, `tests/test_output_json.py`, `tests/test_readbudget.py`, and `tests/test_ql_corpus.py` (every corpus request parses). The earlier brute-force engine evaluator and `tests/test_corpus.py` were deleted: their oracle was this project's own reading of the semantics.
 
 | What | Result |
 |---|---|
-| Differential test (`tools/compare_overpass.py`): 58 requests vs a real Overpass on the same extract | 57/58 element-identical. The exception is Overpass's `out bb` for relations with members missing from an extract |
-| Overpass Turbo (`tools/turbo_check.js`) | loads and renders results from the service |
 | Index math (`tests/test_quadtile.py`) | bit-identical to Overpass's C++ |
-| Engine regression (`tests/test_corpus.py`) | the indexed lake equals a brute-force evaluator on 24 queries |
+| First differential run (58 requests, `results/overpass_diff.json`) | 56/58 recorded in that file; the exceptions are Overpass's `out bb` for relations with members missing from an extract, and `buildings_city` |
 | After 5 days of replayed diffs | 66/69 non-area and 9/10 area-related queries identical; the differences come from the reference's state |
 | Fixed 24-hour window (both sides given the lake's edits) | 68/69 current-data queries; 13/13 history queries (`[date:]` incl. `out meta`/`geom`, `newer`, `changed`) vs Overpass with `--keep-attic` |
 | Object-storage catalog, updated only by scheduled jobs (24 h window) | 81/82 queries incl. 13/13 history; two overlapping jobs: one commits, the other is refused (412) and discarded |
 | Lance id store kept by jobs through 24 diffs and a compaction | pinned versions equal the lake tables row for row; 81/82 queries incl. 13/13 history with id fetches on Lance; a second concurrent job exits on the lease |
-| Full-history build (`osm-extract --history`) from a synthetic Berlin history file (snapshot + 24 h of the lake's diffs) | 81/82 queries incl. 13/13 history vs Overpass; identical to the incrementally updated lake on 32 `[date:]` queries (geometry, meta, bboxes, `newer`) at 8 times; RAM and disk timelines byte-identical |
-| Bucketed vs flat build | identical tables, files in key order (`osm-extract --bucket-bits 12`, 16 groups) |
+| Full-history build (`osm-extract --history`) from a synthetic Berlin history file (snapshot + 24 h of the lake's diffs) | 81/82 queries incl. 13/13 history vs Overpass (`results/overpass_diff_history_build.json`); identical to the incrementally updated lake on 32 `[date:]` queries at 8 times; RAM and disk timelines byte-identical |
+| Bucketed vs flat build | identical tables, files in key order (checked when the flat extractor still existed) |
+| Overpass Turbo | loaded and rendered results from the service (`results/turbo.png`; the checking script was removed) |
+
+The one exception in the 81/82 rows is Overpass's `out bb` placeholder for relation members missing from an extract.
 
 ## Known gaps
 
@@ -151,4 +120,75 @@ Catch-up uses hourly diffs (a planet day diff is about 100 MB, too much for one 
 - **Performance:**
   - Single queries take 0.3–3 s on a 4-core box, against 0.1–2.4 s for local-disk Overpass.
   - Large outputs: JSON nodes and ways are serialised in SQL (about 32 MB/s); other formats and modes in Python (about 10 MB/s).
-- **Planet scale:** see `docs/planet.md` for the build and update plan, and what is measured vs extrapolated.
+- **Planet scale:** not built yet; sizes come from scaling regional lakes and times were rehearsed on Germany. See `docs/runbook.md`, including the open risk that the planet extract's dense index does not fit in RAM.
+
+## Measurements
+
+Durable findings from the October 2026 Berlin spike (`results/NOTES.md` is the record). Conditions: BBBike Berlin extract (snapshot 2026-10-24, 12.9 M nodes, 2.27 M ways, 30 K relations), 4 vCPU and 15 GB RAM container, DuckDB 2.0.0 with DuckLake 1.0, reads through a local S3 stand-in that injected 30 ms per request (the stand-in has since been removed). These are not R2 numbers.
+
+### Query cost, 24-query corpus
+
+Scenarios: cold (new process), worker (long-lived process with catalog and footers cached, this query's data unread), hot (all cached).
+
+| | cold median / p90 / max | worker median / p90 / max | hot median / p90 |
+|---|---|---|---|
+| 0 ms/request | 0.80 / 1.60 / 3.99 s | 0.74 / 1.71 / 4.00 s | 0.36 / 0.80 s |
+| 30 ms/request | 1.92 / 4.30 / 7.68 s | 1.20 / 3.61 / 7.45 s | 0.35 / 0.84 s |
+
+Worker I/O is a median of about 92 requests and 17 MiB per query. The slowest are big recursions (`park_multipolygons_downrel`, `subway_routes_down`), at about 1,000-1,150 requests.
+
+### Optimisations that mattered
+
+| Change | Effect |
+|---|---|
+| Literal `IN (...)` id lists instead of `IN (subquery)` / join | 779 to 73 requests, 20 to 2 MiB. DuckDB turns a constant list into zone-map pruning; a join only pushes down min/max. |
+| Huge literal lists to at most 32 coalesced `BETWEEN` ranges + hash semi-join | 2.76 s to 0.28 s CPU for 9 K ids, at about 1.8× the bytes. DuckDB evaluates OR chains per row. |
+| `tag_postings.kv = 'key=value'` single column | 266 to 15 requests per tag lookup. Separate `k AND v` predicates made DuckDB probe `v` in every row group. |
+| Split tagged and untagged nodes, metadata in `*_meta` (Overpass's own layout) | `node[amenity=cafe](bbox)`: 19 to 2.2 MiB. `node[name~...,i](bbox)`: 190 to 13 MiB. |
+| bbox+tag planner: drive from `tag_postings` restricted to the bbox's key ranges when at most 20 K candidates (Overpass's `query.cc` choice) | `nwr[shop=bakery](bbox)`: 66 to 7 MiB. Global tag queries: 92 to 30 MiB. |
+| Locator memo per worker (Overpass keeps `.map` hot in page cache) | About 2× on repeated recursion. |
+
+### Things that surprised me
+
+- **DuckDB's Parquet prefetcher coalesces reads across skipped row groups.** For one bbox it read 14 MiB in 29 requests; with prefetch off it read the exact 2.2 MiB in 159 requests. Row-group pruning does not equal bytes read. The way to cut I/O is narrower tables, not finer row groups.
+- **Disabling DuckDB's external file cache multiplies bytes about 3×**, because each column pass re-fetches the same span. Keep it on in workers.
+- **`qt` is almost free.** The column is 68 KiB for 12.9 M nodes (sorted, RLE); lat and lon are the two largest columns at about 15 MB each.
+- **The spatial sort alone makes lat/lon zone maps prune** about as well as Overpass's `calc_ranges`. The `qt` ranges matter more for ways and relations (`calc_parents`) and for the tag and locator paths.
+- **Index overhead:** `tag_postings` 71 MB, `elem_locator` 29 MB, `node_parent_ways` + `member_parent_rels` 42 MB, of a 490 MB lake: about 29%.
+
+### Lance vs Parquet for id lookups
+
+Cold cache, 30 ms per request; fetching `(id, lat, lon)` for an id list:
+
+| ids | DuckLake locator to nodes | Lance, BTree on id |
+|---|---|---|
+| 5 | 0.42 s, 17 req, 1.7 MiB | 0.30 s, 43 req, 0.6 MiB |
+| 208 (a street) | 1.28 s, 166 req, 6.8 MiB | 0.51 s, 197 req, 4.6 MiB |
+| 8,957 (subway routes) | 3.68 s, 841 req, 41 MiB | 1.02 s, 601 req, 53 MiB |
+
+Lance wins id lookups by 1.4-3.6×, from higher request concurrency and a single hop. On bbox scans it loses (Mitte, 67 K nodes: 0.35 s against 0.27 s for Parquet with footers warm; up to 4.5× slower in the corpus, with 5-10× more requests), so spatial scans stay on DuckLake and Lance serves only id-driven fetches. Lance files are about 2× the size of zstd Parquet at default encodings (nodes: 306 MB against about 140 MB).
+
+### Lance in the live path
+
+Berlin, local S3 stand-in at 30 ms per request; the figure on real R2 is being measured. Engine as deployed (Lance for id-driven fetches, including the `out` element fetch; `out meta` still reads DuckLake). Lake updated by scheduled jobs through 24 diffs plus a compaction. The 69 current-data queries of the differential corpus, alternating Lance and no Lance twice, fresh process each, best of 2.
+
+| | No Lance | Lance |
+|---|---|---|
+| Sum of 69 queries | 148.2 s | 110.3 s |
+| Median query | 1.44 s | 0.81 s |
+| Geometric-mean speedup | 1.00× | 1.54× |
+| Faster by more than 1.2× / slower by more than 1.2× | – | 51 / 1 (`out meta` on a bbox) |
+| Object-store requests per run | about 6,170 | about 12,720 (2×) |
+| Bytes read per run | 0.53 GB | 1.24 GB |
+
+Wins reach 3.5× (`regex_value_icase` 0.87 to 0.25 s). On R2 the extra requests cost about $0.03 per thousand queries at $0.36 per million reads. Lance writing took 17 s on top of a 35 s build (+50%).
+
+**Lance storage ratio.** The ratio depends on what it is divided by:
+
+| Lance size over | Ratio | Source |
+|---|---|---|
+| the Berlin current-data lake's Parquet (645 MB over 512 MB) | 1.25× | measured |
+| the current-data tables it copies (nodes and ways) | about 2× | measured on nodes (306 vs 140 MB); planet estimate 490-550 GB over 240-265 GB |
+| the planet's full-history Parquet lake (610-620 GB) | 0.85× | sizing-run estimate |
+
+Planning figure for the full-history planet: Lance adds 490-550 GB next to 610-620 GB of Parquet. Germany's measured lake was 57 GB, of which 20 GB was Lance (37 GB Parquet), a ratio of 0.54× the Parquet; the sizing-run estimate has not been reconciled with that.
