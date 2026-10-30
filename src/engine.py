@@ -488,9 +488,9 @@ class Engine:
         hit_n, hit_w = set(), set()
         if len(node_ids) + len(way_ids) > REL_MEMBER_PROBE_MAX:
             # many candidate members (big relations around a small box): elements in the box are fewer
-            hit_n = set(node_ids) & set(self._materialize_ids(self._query_one("n", b, [], None, None).replace(
+            hit_n = set(node_ids) & set(self._materialize_ids(self._query_one("n", b, [], None).replace(
                 "SELECT 'n' AS type, id", "SELECT id", 1)))
-            hit_w = set(way_ids) & set(self._materialize_ids(self._query_one("w", b, [], None, None).replace(
+            hit_w = set(way_ids) & set(self._materialize_ids(self._query_one("w", b, [], None).replace(
                 "SELECT 'w' AS type, id", "SELECT id", 1)))
             node_ids = way_ids = []
         if node_ids:
