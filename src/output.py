@@ -202,18 +202,10 @@ class Document:
             self._write(getattr(self, f"_head_{self.fmt}")())
 
     def emit(self, it):
+        """One element: a dict built by out() (serialised per format), or text already serialised in
+        this document's format (see _sql_json)."""
         self.start()
-        text = getattr(self, f"_line_{self.fmt}")(it)
-        if self.maxsize is not None and self.size + len(text) > self.maxsize:
-            raise OutputTooLarge(self.size + len(text))
-        if self.fmt == "json" and self.n_elements:
-            text = ",\n" + text
-        self.n_elements += 1
-        self._write(text)
-
-    def emit_text(self, text):
-        """An element already serialised in this document's format (see _sql_json)."""
-        self.start()
+        text = it if isinstance(it, str) else getattr(self, f"_line_{self.fmt}")(it)
         if self.maxsize is not None and self.size + len(text) > self.maxsize:
             raise OutputTooLarge(self.size + len(text))
         if self.fmt == "json" and self.n_elements:
@@ -222,8 +214,8 @@ class Document:
         self._write(text)
 
     def _sql_json(self, t, bits, geo):
-        """(columns, SQL expression) rendering a node or way as its JSON line, the same text as
-        _line_json, or None where the Python path is needed (other formats, meta, clipping).
+        """(columns, SQL expression) rendering a node or way as its JSON line, byte for byte the same
+        text as _line_json (tests/test_output_json.py holds the two together), or None where the Python path is needed (other formats, meta, clipping).
         Serialising in DuckDB is vectorised and skips building Python objects per element."""
         if self.fmt != "json" or bits & META or self.clip is not None or t not in ("n", "w"):
             return None
@@ -303,7 +295,7 @@ class Document:
                     found = dict(engine.elements_by_id(t, chunk, cols, select=f"id, {select}"))
                     for i in chunk:
                         if i in found:
-                            self.emit_text(found[i])
+                            self.emit(found[i])
                             if left is not None:
                                 left -= 1
                                 if left <= 0:
@@ -428,7 +420,8 @@ class Document:
         """One element, built as text (json.dumps of nested dicts dominates large outputs).
         Coordinates print with 7 fixed decimals, like Overpass's JSON writer."""
         if it["type"] == "count":
-            return "    " + json.dumps(self._json_elem(it), ensure_ascii=False, separators=(", ", ": "))
+            return "    " + json.dumps({"type": "count", "id": 0, "tags": dict(it["tags"])}, ensure_ascii=False,
+                                          separators=(", ", ": "))
         bits = it["bits"]
         o = ['    {"type": "', it["type"], '"']
         if bits & ID:
@@ -473,49 +466,6 @@ class Document:
         if self.remarks:
             tail += ',\n  "remark": ' + json.dumps(" ".join(self.remarks), ensure_ascii=False)
         return tail + "\n}\n" + (");\n" if self.callback else "")
-
-    @staticmethod
-    def _json_pt(p):
-        return None if p[0] == NO_COORD else {"lat": f7(p[0]), "lon": f7(p[1])}
-
-    def _json_elem(self, it):
-        if it["type"] == "count":
-            return {"type": "count", "id": 0, "tags": dict(it["tags"])}
-        bits = it["bits"]
-        o = {"type": it["type"]}
-        if bits & ID:
-            o["id"] = it["id"]
-        if "lat" in it:
-            o["lat"], o["lon"] = f7(it["lat"]), f7(it["lon"])
-        m = it.get("meta")
-        if m:
-            version, ts, changeset, uid, user = m
-            o.update(timestamp=iso(ts), version=version, changeset=changeset)
-            if user:
-                o["user"] = user
-            o["uid"] = uid
-        if "bounds" in it:
-            b = it["bounds"]
-            o["bounds"] = {"minlat": f7(b[0]), "minlon": f7(b[1]), "maxlat": f7(b[2]), "maxlon": f7(b[3])}
-        elif "center" in it:
-            o["center"] = {"lat": f7(it["center"][0]), "lon": f7(it["center"][1])}
-        if it.get("nodes"):
-            o["nodes"] = list(it["nodes"])
-        if "geometry" in it:
-            o["geometry"] = [self._json_pt(p) for p in it["geometry"]]
-        if it.get("members"):
-            ms = []
-            for m in it["members"]:
-                mm = {"type": m["type"], "ref": m["ref"], "role": m["role"]}
-                if "lat" in m:
-                    mm["lat"], mm["lon"] = f7(m["lat"]), f7(m["lon"])
-                if "geometry" in m:
-                    mm["geometry"] = [self._json_pt(p) for p in m["geometry"]]
-                ms.append(mm)
-            o["members"] = ms
-        if it.get("tags"):
-            o["tags"] = dict(it["tags"])
-        return o
 
     def _head_xml(self):
         out = ['<?xml version="1.0" encoding="UTF-8"?>',
