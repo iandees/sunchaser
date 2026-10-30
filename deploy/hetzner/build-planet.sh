@@ -8,7 +8,7 @@
 #   publish  upload the catalog: the lake goes live
 # Then start the updater: systemctl enable --now sunchaser-updater
 # Usage: deploy/hetzner/build-planet.sh   (env from /etc/sunchaser.env; PLANET_URL, THREADS,
-#        BUCKET_BITS, GROUP_ROWS, WRITER_MEM_MB, LANCE=0 to skip Lance, CONSUME=0 to keep the raw buckets, DATA=/data)
+#        BUCKET_BITS, GROUP_ROWS, WRITER_MEM_MB, MEMORY_LIMIT, LANCE=0 to skip Lance, CONSUME=0 to keep the raw buckets, DATA=/data)
 # CONSUME=1 (default) deletes raw buckets as the build uses them, lowering peak disk, but a build
 # that fails part-way then needs the extract again (rm $DATA/state/extract.done). With room to
 # spare, CONSUME=0 makes the build stage re-runnable on its own.
@@ -20,6 +20,7 @@ PLANET_URL=${PLANET_URL:-https://osm-planet-eu-central-1.s3.dualstack.eu-central
 THREADS=${THREADS:-8}
 BUCKET_BITS=${BUCKET_BITS:-12}
 GROUP_ROWS=${GROUP_ROWS:-100000000}
+MEMORY_LIMIT=${MEMORY_LIMIT:-70GB}  # DuckDB's cap for the build: unset, Germany's build peaked at 109 GB, with 40GB at 42 GB
 WRITER_MEM_MB=${WRITER_MEM_MB:-256}  # extractor buffers per bucketed table (8 tables)
 LANCE=${LANCE:-1}
 CONSUME=${CONSUME:-1}
@@ -61,7 +62,7 @@ if stage build; then
   consume=(); [ "$CONSUME" = 1 ] && consume=(--consume)
   $M --label build --watch "$DATA/raw" --watch "$DATA/build" -- uv run python -I src/build_lake.py \
     --raw "$DATA/raw" --lake "$DATA/build" --catalog "$DATA/catalog.ducklake" --data-path "$LAKE/data/" \
-    "${lance[@]}" --group-rows "$GROUP_ROWS" "${consume[@]}" 2>&1 | tee "$DATA/logs/build.log"
+    "${lance[@]}" --group-rows "$GROUP_ROWS" --memory-limit "$MEMORY_LIMIT" "${consume[@]}" 2>&1 | tee "$DATA/logs/build.log"
   done_ build
 fi
 

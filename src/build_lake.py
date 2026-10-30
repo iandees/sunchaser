@@ -186,6 +186,7 @@ def main():
     ap.add_argument("--target-file-mb", type=int, default=64)
     ap.add_argument("--consume", action="store_true",
                     help="bucketed input: delete each raw bucket once no later step needs it (less peak disk)")
+    ap.add_argument("--memory-limit", help="DuckDB memory_limit, e.g. 40GB (default: 80%% of RAM)")
     ap.add_argument("--lance", metavar="BASE", help="also build the Lance id store here (e.g. s3://bucket/lake/lance)")
     ap.add_argument("--group-rows", type=int, default=50_000_000,
                     help="bucketed input: rows sorted per insert (bounds memory and temp disk)")
@@ -201,6 +202,8 @@ def main():
 
     con = duckdb.connect(str(lake / "build.duckdb"))
     con.sql("SET preserve_insertion_order = false")
+    if args.memory_limit:
+        con.sql(f"SET memory_limit = '{args.memory_limit}'")
     con.sql(MACROS)
     lakeconn.attach(con, catalog, data_path)
     for opt, val in (("parquet_compression", "'zstd'"), ("parquet_row_group_size", args.row_group),
