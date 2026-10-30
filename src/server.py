@@ -82,7 +82,7 @@ def remote_catalog():
 
 
 def catalog_version(url):
-    """ETag (or Last-Modified) of a published frozen catalog."""
+    """ETag (or Last-Modified) of the object-storage catalog the lake is attached through."""
     if url.startswith("s3://"):
         import boto3
         bucket, _, key = url[5:].partition("/")
@@ -99,7 +99,7 @@ def catalog_version(url):
 
 
 def refresher():
-    """Frozen catalogs are replaced by the publisher; reopen the lake when a new one appears.
+    """The catalog object is replaced in place by the updater; reopen the lake when its ETag changes.
     Requests in flight keep their cursor on the previous connection."""
     global DB
     url, every = remote_catalog(), float(env("CATALOG_REFRESH", "30"))
@@ -111,7 +111,7 @@ def refresher():
                 fresh = open_lake()
                 with DB_LOCK:
                     DB = fresh
-                print(f"reloaded frozen catalog {url} ({v})", flush=True)
+                print(f"reloaded catalog {url} ({v})", flush=True)
             seen = v
         except Exception as e:  # keep serving the last good catalog
             print(f"catalog refresh failed: {e}", flush=True)
@@ -325,7 +325,7 @@ def run_stream(script, callback, sink):
 
 
 def run_query(text, callback=None):
-    """Buffered execution (tests and tools): (content_type, body)."""
+    """Buffered execution (used by tests/test_readbudget.py): (content_type, body)."""
     script = ql.parse(text)
     out = []
 

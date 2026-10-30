@@ -1,7 +1,7 @@
 """Differential test: run each request through a reference Overpass (osm3s_query) and through our QL
 executor, and compare the outputs element by element (order and formatting ignored).
 
-  python tools/compare_overpass.py --db-dir /path/to/overpass-db [--only name ...]
+  python tools/compare_overpass.py --db-dir /path/to/overpass-db --osm3s-query /path/to/osm3s_query [--only name ...]
 
 JSON and XML outputs are parsed into normalised element dicts and compared as multisets; CSV is
 compared as a multiset of rows (header compared exactly).
@@ -9,6 +9,7 @@ compared as a multiset of rows (header compared exactly).
 import argparse
 import collections
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -101,8 +102,8 @@ def inject_bbox(query, bbox):
     return query[:end] + setting + query[end:]
 
 
-def overpass(db_dir, query):
-    r = subprocess.run(["/home/user/overpass-ref/bin/osm3s_query", f"--db-dir={db_dir}"],
+def overpass(osm3s_query, db_dir, query):
+    r = subprocess.run([osm3s_query, f"--db-dir={db_dir}"],
                        input=query, capture_output=True, text=True, timeout=600)
     return r.stdout
 
@@ -113,7 +114,9 @@ def multiset(items):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--db-dir", default="/home/user/overpass-db")
+    ap.add_argument("--db-dir", required=True, help="the reference Overpass database directory")
+    ap.add_argument("--osm3s-query", default=os.environ.get("OSM3S_QUERY"),
+                    help="path to the reference osm3s_query binary (or set OSM3S_QUERY)")
     ap.add_argument("--only", nargs="*")
     ap.add_argument("--out", default="results/overpass_diff.json")
     ap.add_argument("--no-lance", action="store_true", help="ignore the lake's Lance id store")
@@ -122,6 +125,8 @@ def main():
     ap.add_argument("--global-bbox", help="s,w,n,e: inject [bbox:...] into every request (a regional lake "
                                           "compared with a reference holding planet-wide updates)")
     args = ap.parse_args()
+    if not args.osm3s_query:
+        ap.error("--osm3s-query (or OSM3S_QUERY) is required")
     con = duckdb.connect()
     lakeconn.attach(con, read_only=True)
     import lancestore
@@ -136,7 +141,7 @@ def main():
             query = inject_bbox(query, args.global_bbox)
         fmt = fmt_of(query)
         t = time.perf_counter()
-        ref_text = overpass(args.db_dir, query)
+        ref_text = overpass(args.osm3s_query, args.db_dir, query)
         t_ref = time.perf_counter() - t
         t = time.perf_counter()
         try:
