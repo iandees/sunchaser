@@ -6,7 +6,7 @@ Environment:
   SUNCHASER_DATA_PATH   data path for new lakes, or an override for readers (s3://bucket/prefix/, https://...)
   SUNCHASER_S3_ENDPOINT, SUNCHASER_S3_KEY_ID, SUNCHASER_S3_SECRET, SUNCHASER_S3_REGION,
   SUNCHASER_S3_URL_STYLE (path|vhost), SUNCHASER_S3_USE_SSL (true|false)
-                        S3-compatible credentials (AWS S3, Cloudflare R2, MinIO, tools/range_server.py)
+                        S3-compatible credentials (AWS S3, Cloudflare R2, MinIO)
   SUNCHASER_S3_CREDENTIAL_CHAIN=true
                         on AWS: use the default credential chain (instance profile, task or function
                         role) instead of keys; set SUNCHASER_S3_REGION too
