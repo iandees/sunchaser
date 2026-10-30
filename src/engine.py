@@ -466,9 +466,9 @@ class Engine:
         without a row are out, as are ways within one such cell; inside cells are strictly interior, so both
         border modes agree there."""
         point = "ST_Point(lon / 1e7, ov_lat(lat))"
-        line = ("CASE WHEN len(nd_lat) = 1 THEN ST_Point(nd_lon[1] / 1e7, ov_lat(nd_lat[1])) ELSE "
-                "ST_MakeLine(list_transform(list_filter(range(1, len(nd_lat) + 1), lambda i: nd_lat[i] <> -2147483648), "
-                "lambda i: ST_Point(nd_lon[i] / 1e7, ov_lat(nd_lat[i])))) END")
+        ok = "list_filter(range(1, len(nd_lat) + 1), lambda i: nd_lat[i] <> -2147483648)"  # indexes of the nodes found
+        line = (f"CASE WHEN len({ok}) = 1 THEN ST_Point(nd_lon[{ok}[1]] / 1e7, ov_lat(nd_lat[{ok}[1]])) ELSE "
+                f"ST_MakeLine(list_transform({ok}, lambda i: ST_Point(nd_lon[i] / 1e7, ov_lat(nd_lat[i])))) END")
         if t == "n":
             rows = self.elements(cand, "n", ["id", "lat", "lon"])
             test = "ST_Intersects(a.g, p)" if add_border in (None, True) else "ST_Contains(a.g, p)"

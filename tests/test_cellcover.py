@@ -70,7 +70,7 @@ def _setup():
         pts = [(la + random.uniform(-step, step), lo + random.uniform(-step, step)) for _ in range(n)]
         lat = [round(p[0] * 1e7) for p in pts]
         lon = [round(p[1] * 1e7) for p in pts]
-        if i % 50 == 0 and n > 2:  # (a 2-node way with a missing node fails in the engine's ST_MakeLine, pre-existing)
+        if i % 50 == 0 and n > 1:  # a missing node; with 2 nodes one is left, which is a point, not a line
             lat[0] = -2147483648  # missing node
         ways.append((i, lat, lon))
     for k in range(300):  # along the border: consecutive vertices of the outer ring
