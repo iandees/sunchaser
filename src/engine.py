@@ -8,8 +8,7 @@ oracle for correctness is a reference Overpass (tools/compare_overpass.py), not 
 """
 import itertools
 import math
-import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import duckdb
 
@@ -112,23 +111,16 @@ AREA_REL_OFFSET = 3600000000
 AREA_WAY_OFFSET = 2400000000
 
 
-@dataclass
-class Plan:
-    """Knobs for the lake backend."""
-    qt_ranges: bool = True        # add Overpass calc_ranges / calc_parents predicates
-    use_postings: bool = True     # use tag_postings for tag-only queries
-    locator: bool = True          # route id fetches through elem_locator -> qt ranges
-    max_or_ranges: int = 32       # zone-map ranges per predicate; more ranges prune better but cost CPU per row
-    postings_max: int = 20000     # bbox+tag: drive from tag_postings if at most this many candidates
-    rel_member_probe_max: int = 5000  # bbox relations: test members directly up to this many
-    lance_scope: str = "all"      # with a Lance store: "all" node/way scans, or only id-driven ones ("ids")
-    log: list = field(default_factory=list)
+# Planner limits, each set by measurement:
+MAX_OR_RANGES = 32           # zone-map ranges per predicate: more prune better but cost CPU per row (DuckDB evaluates OR chains per row)
+POSTINGS_MAX = 20000         # bbox+tag: drive from tag_postings only if at most this many candidates; beyond it the spatial scan alone is cheaper
+REL_MEMBER_PROBE_MAX = 5000  # bbox relations: test members directly up to this many; beyond it the elements inside the box are fewer
 
 
 class Engine:
     _ids = itertools.count()
 
-    def __init__(self, con, mode="lake", plan=None, lance=None, init_macros=True):
+    def __init__(self, con, mode="lake", lance=None, init_macros=True):
         """lance: optional callable name -> lance.LanceDataset; routes node/way scans to Lance.
         init_macros=False when the macros were created once on the shared database (server).
         mode: only "lake" exists; the argument is kept for callers that still pass it."""
@@ -136,7 +128,6 @@ class Engine:
             raise ValueError(f"unknown mode {mode!r}")
         self.con = con
         self.lance = lance
-        self.plan = plan or Plan()
         self._locator_memo = {}
         if init_macros:
             con.sql(SQL_MACROS)
@@ -213,11 +204,11 @@ class Engine:
     # ---- range / id predicates ----------------------------------------------
 
     def _ranges_sql(self, col, ranges):
-        """OR of BETWEENs for zone-map pruning, coalesced to at most plan.max_or_ranges by merging the
+        """OR of BETWEENs for zone-map pruning, coalesced to at most MAX_OR_RANGES by merging the
         smallest gaps (DuckDB evaluates OR chains per row, so long chains are CPU-bound)."""
         if not ranges:
             return "false"
-        ranges = coalesce_ranges(ranges, self.plan.max_or_ranges)
+        ranges = coalesce_ranges(ranges, MAX_OR_RANGES)
         return "(" + " OR ".join(f"{col} BETWEEN {lo} AND {hi - 1}" for lo, hi in ranges) + ")"
 
     @staticmethod
@@ -266,7 +257,7 @@ class Engine:
     def _scan(self, t, push, local=(), cols=("id",), select=None, tbl=None):
         """SQL selecting from elements of type t. `push` predicates are range/id/bbox comparisons a
         storage layer can prune with; `local` ones (tags, exact geometry, semi-joins) run in DuckDB.
-        With plan.lance, node/way scans go to Lance (BTree indexes on id and qt), materialised as
+        With a Lance store, id-driven node/way scans go to Lance (BTree indexes on id and qt), materialised as
         Arrow and registered in DuckDB; otherwise everything runs against DuckLake."""
         select = select or f"'{t}' AS type, id"
         tbl = tbl or self.t[t]
@@ -282,11 +273,11 @@ class Engine:
     LANCE_ID = "id IN ("  # prefix of the literal id-list predicates produced for Lance
 
     def _lance_route(self, t, push=None):
-        """Whether a node/way scan goes to Lance. With scope "ids", only scans driven by an id list
-        (recursion, id queries, tag-postings fetches) do; spatial scans stay on DuckLake zone maps."""
+        """Whether a node/way scan goes to Lance: only scans driven by an id list (recursion, id
+        queries, tag-postings fetches) do; spatial scans stay on DuckLake zone maps."""
         if self.lance is None or t not in "nw":
             return False
-        if self.plan.lance_scope == "all" or push is None:
+        if push is None:
             return True
         return any(p.startswith(self.LANCE_ID) for p in push)
 
@@ -300,7 +291,6 @@ class Engine:
         self.con.register(f"{name}_arrow", arrow)
         self._sql(f"CREATE OR REPLACE TEMP TABLE {name} AS SELECT * FROM {name}_arrow")
         self.con.unregister(f"{name}_arrow")
-        self.plan.log.append(("lance", tables, arrow.num_rows))
         return name
 
     def _id_parts(self, t, ids):
@@ -517,7 +507,7 @@ class Engine:
         way_ids = sorted({m["ref"] for _, ms in rows for m in ms if m["type"] == "w"})
         s7, w7, n7, e7 = b.ints()
         hit_n, hit_w = set(), set()
-        if len(node_ids) + len(way_ids) > self.plan.rel_member_probe_max:
+        if len(node_ids) + len(way_ids) > REL_MEMBER_PROBE_MAX:
             # many candidate members (big relations around a small box): elements in the box are fewer
             hit_n = set(node_ids) & set(self._materialize_ids(self._query_one("n", b, [], None, None).replace(
                 "SELECT 'n' AS type, id", "SELECT id", 1)))
@@ -549,15 +539,14 @@ class Engine:
             key_ranges = ([(lo << 1, hi << 1) for lo, hi in node_ranges] if t == "n"
                           else qt.calc_parents(node_ranges))
             where += " AND " + self._ranges_sql("qt_key31", key_ranges)
-            limit = f" LIMIT {self.plan.postings_max + 1}"
+            limit = f" LIMIT {POSTINGS_MAX + 1}"
         rows = self._sql(f"SELECT qt_key31, id FROM lake.tag_postings WHERE {where}{limit}").fetchall()
-        self.plan.log.append(("postings", t, len(rows)))
-        if bbox is not None and len(rows) > self.plan.postings_max:
+        if bbox is not None and len(rows) > POSTINGS_MAX:
             return [], []  # not selective: the spatial scan alone is cheaper
         if not rows:
             return ["false"], []
         ids = sorted({i for _, i in rows})
-        if self._lance_route(t) and (bbox is None or self.plan.lance_scope == "all"):
+        if self._lance_route(t) and bbox is None:
             # global tag lookups scatter across the planet: id BTree; inside a bbox the candidates are
             # spatially clustered, so DuckLake's key ranges + zone maps do better
             return [f"id IN ({','.join(map(str, ids))})"], []
@@ -576,7 +565,6 @@ class Engine:
             rows = self._sql(f"SELECT id, qt FROM lake.elem_locator WHERE type = '{t}' AND {self._id_pred('id', todo)}").fetchall()
             memo.update(rows)
             memo.update((i, None) for i in todo if i not in memo)  # not in the extract
-            self.plan.log.append(("locator", t, len(rows)))
         keys = [memo[i] for i in ids if memo[i] is not None]
         if t != "n":
             keys = [qt.key31(q) for q in keys]

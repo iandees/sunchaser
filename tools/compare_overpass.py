@@ -20,7 +20,7 @@ sys.path[:0] = [str(ROOT / "src"), str(ROOT / "queries")]
 import duckdb  # noqa: E402
 import lakeconn  # noqa: E402
 import ql  # noqa: E402
-from engine import Engine, Plan  # noqa: E402
+from engine import Engine  # noqa: E402
 from ql_corpus import QL, QL_HISTORY  # noqa: E402
 
 
@@ -140,7 +140,7 @@ def main():
         t_ref = time.perf_counter() - t
         t = time.perf_counter()
         try:
-            _, ours_text = ql.Executor(Engine(con, "lake", lance=store, plan=Plan(lance_scope="ids") if store else None),
+            _, ours_text = ql.Executor(Engine(con, "lake", lance=store),
                                        "").run(ql.parse(query)).render()
             err = None
         except Exception as e:  # report and continue

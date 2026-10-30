@@ -48,7 +48,7 @@ import lakeconn  # noqa: E402
 import ql  # noqa: E402
 import readbudget  # noqa: E402
 import lancestore  # noqa: E402
-from engine import SQL_MACROS, Engine, Plan  # noqa: E402
+from engine import SQL_MACROS, Engine  # noqa: E402
 
 COPYRIGHT = "The data included in this document is from www.openstreetmap.org. The data is made available under ODbL."
 
@@ -256,8 +256,7 @@ def _execute(script, callback, sink):
         timer.start()
         try:
             store = lance_store(cur)
-            engine = Engine(cur, "lake", init_macros=False, lance=store,
-                            plan=Plan(lance_scope="ids") if store else None)
+            engine = Engine(cur, "lake", init_macros=False, lance=store)
             if LOG_QUERIES > 1:
                 def timed(sql, fn):
                     t = time.time()
