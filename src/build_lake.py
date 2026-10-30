@@ -1,13 +1,11 @@
 """Stage 2: raw Parquet -> DuckLake tables keyed and sorted like Overpass.
 
-Two inputs:
-- bucketed (rust/osm-extract, manifest.json format 2): keys, bboxes, the id locator and the
-  node -> way index are precomputed, and rows are split into key-range buckets. Each table is
-  filled bucket group by bucket group (sort a group, append it), so the build sorts at most
-  --group-rows rows at a time and its memory and temp disk stay bounded at planet scale. Only
-  tag_postings needs a global sort (by key=value), which DuckDB does out of core.
-- flat (src/extract.py): nodes/ways/relations.parquet; node/way keys are computed in SQL (macros
-  below) and relation keys with the Python port (src/quadtile.py).
+Input: the bucketed output of rust/osm-extract (manifest.json format 2): keys, bboxes, the id
+locator and the node -> way index are precomputed, and rows are split into key-range buckets. Each
+table is filled bucket group by bucket group (sort a group, append it), so the build sorts at most
+--group-rows rows at a time and its memory and temp disk stay bounded at planet scale. Only
+tag_postings needs a global sort (by key=value), which DuckDB does out of core.
+The SQL macros below are shared with the updater, which computes keys for changed rows.
 """
 import argparse
 import json
@@ -21,7 +19,6 @@ import duckdb
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 import lakeconn  # noqa: E402
-import quadtile as qt  # noqa: E402
 
 # Overpass bit tricks as DuckDB macros (all on UBIGINT so shifts never overflow).
 MACROS = """
@@ -74,9 +71,6 @@ CREATE OR REPLACE MACRO ov_level(idx) AS CASE
     WHEN idx & 32 <> 0 THEN 6 WHEN idx & 64 <> 0 THEN 7 ELSE 8 END::UTINYINT;
 """
 
-META_COLS = "version, ts, changeset, uid, \"user\""
-
-
 def union(sources):
     return sources[0] if len(sources) == 1 else "(" + " UNION ALL ".join(f"SELECT * FROM {x}" for x in sources) + ")"
 
@@ -111,57 +105,6 @@ def bucketed_sources(con, raw, manifest, group_rows):
     files["locator"] = [str(f) for f in sorted((raw / "locator").glob("*.parquet"))]
     src["files"] = files
     return src
-
-
-def stage_flat(con, raw, step):
-    """Flat extract (src/extract.py): compute keys and bboxes into temp tables n, w, r."""
-    step("stage nodes", f"""
-        CREATE TEMP TABLE n AS
-        SELECT ov_node_idx(lat, lon) AS qt, id, lat, lon, tags, {META_COLS}
-        FROM '{raw}/nodes.parquet'""")
-
-    # Way index: masked lat/lon extremes over member node indexes (calc_index for plain inputs).
-    step("stage ways", f"""
-        CREATE TEMP TABLE w AS
-        WITH m AS (
-          SELECT w.id, u.i AS seq, ov_node_idx(u.la, u.lo) AS nidx, u.la, u.lo
-          FROM '{raw}/ways.parquet' w,
-               LATERAL (SELECT unnest(range(len(w.nds))) AS i, unnest(w.nd_lat) AS la, unnest(w.nd_lon) AS lo) u
-          WHERE u.la <> -2147483648),
-        agg AS (
-          SELECT id, arg_min(nidx, seq) AS first_idx,
-                 min(nidx & 715827882) AS lat_min, max(nidx & 715827882) AS lat_max,
-                 min(nidx & 1431655765) AS lon_min, max(nidx & 1431655765) AS lon_max,
-                 min(la) AS min_lat, max(la) AS max_lat, min(lo) AS min_lon, max(lo) AS max_lon
-          FROM m GROUP BY id)
-        SELECT ov_way_idx(a.first_idx, a.lat_min, a.lat_max, a.lon_min, a.lon_max) AS qt,
-               w.id, a.min_lat, a.max_lat, a.min_lon, a.max_lon, w.nds, w.nd_lat, w.nd_lon, w.tags,
-               w.version, w.ts, w.changeset, w.uid, w."user"
-        FROM '{raw}/ways.parquet' w LEFT JOIN agg a USING (id)""")
-
-    t = time.time()
-    rel_members = con.sql(f"""
-        SELECT r.id, list(DISTINCT coalesce(n.qt, w.qt)) FILTER (WHERE coalesce(n.qt, w.qt) IS NOT NULL) AS idxs
-        FROM (SELECT id, unnest(members, recursive := true) FROM '{raw}/relations.parquet') r
-        LEFT JOIN n ON r.type = 'n' AND n.id = r.ref
-        LEFT JOIN w ON r.type = 'w' AND w.id = r.ref
-        GROUP BY r.id""").fetchall()
-    rel_idx = [(rid, qt.calc_index(sorted(idxs or []))) for rid, idxs in rel_members]
-    con.sql("CREATE TEMP TABLE rel_idx (id BIGINT, qt UINTEGER)")
-    con.executemany("INSERT INTO rel_idx VALUES (?, ?)", rel_idx)
-    print(f"{'relation idx (python)':<22} {time.time() - t:6.1f}s")
-    step("stage relations", f"""
-        CREATE TEMP TABLE r AS
-        WITH mb AS (
-          SELECT m.id, min(coalesce(n.lat, w.min_lat)) AS min_lat, max(coalesce(n.lat, w.max_lat)) AS max_lat,
-                 min(coalesce(n.lon, w.min_lon)) AS min_lon, max(coalesce(n.lon, w.max_lon)) AS max_lon
-          FROM (SELECT id, unnest(members, recursive := true) FROM '{raw}/relations.parquet') m
-          LEFT JOIN n ON m.type = 'n' AND n.id = m.ref
-          LEFT JOIN w ON m.type = 'w' AND w.id = m.ref
-          GROUP BY m.id)
-        SELECT coalesce(x.qt, 254)::UINTEGER AS qt, r.id, mb.min_lat, mb.max_lat, mb.min_lon, mb.max_lon,
-               r.members, r.tags, {META_COLS}
-        FROM '{raw}/relations.parquet' r LEFT JOIN rel_idx x USING (id) LEFT JOIN mb USING (id)""")
 
 
 def peak_rss_gb():
@@ -213,18 +156,16 @@ def main():
         print(f"{name:<22} {time.time() - t:6.1f}s  peak rss {peak_rss_gb():.1f} GB")
 
     manifest = raw / "manifest.json"
-    if manifest.exists():
-        man = json.loads(manifest.read_text())
-        args.osm_base = args.osm_base or man.get("osm_base", "")
-        args.sequence = args.sequence or str(man.get("sequence", ""))
-        if not args.osm_base:
-            sys.exit("error: the extract has no replication timestamp (its PBF header lacks one, as Geofabrik's "
-                     "files do), so the updater would have nowhere to start. Pass --osm-base: the extract's "
-                     "cut-off, e.g. the next hour boundary after `osmium fileinfo -e -g data.timestamp.last FILE`.")
-        src = bucketed_sources(con, raw, man, args.group_rows)
-    else:
-        stage_flat(con, raw, step)
-        src = {k: [k] for k in ("n", "w", "r")} | {"locator": None, "parents": None, "history": False}
+    if not manifest.exists():
+        sys.exit(f"error: {manifest} not found: --raw must be the output of osm-extract (bucketed, format 2)")
+    man = json.loads(manifest.read_text())
+    args.osm_base = args.osm_base or man.get("osm_base", "")
+    args.sequence = args.sequence or str(man.get("sequence", ""))
+    if not args.osm_base:
+        sys.exit("error: the extract has no replication timestamp (its PBF header lacks one, as Geofabrik's "
+                 "files do), so the updater would have nowhere to start. Pass --osm-base: the extract's "
+                 "cut-off, e.g. the next hour boundary after `osmium fileinfo -e -g data.timestamp.last FILE`.")
+    src = bucketed_sources(con, raw, man, args.group_rows)
     # current rows' valid_from: from a history extract the start of the row's last state (version or
     # geometry change); from a snapshot the version timestamp, as Overpass assumes without attic data
     vf = "valid_from" if src["history"] else "ts AS valid_from"
@@ -255,7 +196,7 @@ def main():
     def consume(*subs):
         """--consume: raw buckets no later step reads are deleted, so the build's peak disk use
         shrinks as it goes (the extract's raw output is the largest thing on disk)."""
-        if not args.consume or "files" not in src:
+        if not args.consume:
             return
         freed = 0
         for sub in subs:
@@ -328,24 +269,13 @@ def main():
              append=True)
         consume("changes")
 
-    if src["locator"]:  # already in id order: no sort
-        t = time.time()
-        con.sql("CREATE TABLE lake.elem_locator SORTED BY (type, id) AS " + " UNION ALL ".join(
-            f"SELECT * FROM (SELECT '{k}' AS type, id, qt FROM '{src['locator']}/{k}.parquet')" for k in "nwr"))
-        print(f"{'lake.elem_locator':<22} {time.time() - t:6.1f}s", flush=True)
-        consume("locator")
-    else:
-        step("lake.elem_locator", """
-            CREATE TABLE lake.elem_locator SORTED BY (type, id) AS
-            SELECT * FROM (SELECT 'n' AS type, id, qt FROM n UNION ALL SELECT 'w', id, qt FROM w
-                           UNION ALL SELECT 'r', id, qt FROM r) ORDER BY type, id""")
-    if src["parents"]:  # distinct per way already, bucketed by node id
-        fill("node_parent_ways", "node_id", "node_id, way_id", src["parents"])
-        consume("node_parent_ways")
-    else:
-        step("lake.node_parent_ways", """
-            CREATE TABLE lake.node_parent_ways SORTED BY (node_id) AS
-            SELECT DISTINCT unnest(nds) AS node_id, id AS way_id FROM w ORDER BY node_id""")
+    t = time.time()  # already in id order: no sort
+    con.sql("CREATE TABLE lake.elem_locator SORTED BY (type, id) AS " + " UNION ALL ".join(
+        f"SELECT * FROM (SELECT '{k}' AS type, id, qt FROM '{src['locator']}/{k}.parquet')" for k in "nwr"))
+    print(f"{'lake.elem_locator':<22} {time.time() - t:6.1f}s", flush=True)
+    consume("locator")
+    fill("node_parent_ways", "node_id", "node_id, way_id", src["parents"])  # distinct per way, bucketed by node id
+    consume("node_parent_ways")
 
     step("lake.state", f"""
         CREATE TABLE lake.state AS SELECT * FROM (VALUES

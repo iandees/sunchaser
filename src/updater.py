@@ -286,7 +286,7 @@ class Updater:
         new = lancestore.apply(self.con, base, versions, {"n": touched["n"], "w": touched["w"]}, rows)
         lancestore._set_state(self.con, base, new)
 
-    # -- staging (same column layout as extract.py output, then the build's key computation)
+    # -- staging (same column layout as the extractor output, then the build's key computation)
 
     def _register(self, name, cols, schema):
         self.con.register(f"{name}_arrow", pa.table(cols, schema=schema))
