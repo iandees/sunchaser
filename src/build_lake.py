@@ -166,9 +166,9 @@ def main():
                  "files do), so the updater would have nowhere to start. Pass --osm-base: the extract's "
                  "cut-off, e.g. the next hour boundary after `osmium fileinfo -e -g data.timestamp.last FILE`.")
     src = bucketed_sources(con, raw, man, args.group_rows)
-    # current rows' valid_from: from a history extract the start of the row's last state (version or
-    # geometry change); from a snapshot the version timestamp, as Overpass assumes without attic data
-    vf = "valid_from" if src["history"] else "ts AS valid_from"
+    # current rows' valid_from comes from the extractor: the start of the row's last state (version or
+    # geometry change), or with --no-history the version timestamp, as Overpass assumes without attic data
+    vf = "valid_from"
 
     def fill(table, sort, select, sources, where="", append=False, threads=0):
         """Create lake.<table> from the first source and append the rest, each sorted by `sort`.

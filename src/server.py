@@ -5,8 +5,8 @@
   GET      /api/timestamp     timestamp of the newest applied OSM data
 
 Configuration (environment):
-  SUNCHASER_CATALOG    DuckLake catalog, e.g. "sqlite:/srv/lake/catalog.sqlite",
-                       "postgres:dbname=lake host=...", or a .ducklake file (default data/lake/osm.ducklake)
+  SUNCHASER_CATALOG    DuckLake catalog: a .ducklake file, or s3://bucket/path/catalog.ducklake (the updater's
+                       upload, followed by ETag; default data/lake/osm.ducklake)
   SUNCHASER_DATA_PATH  override the catalog's data path (e.g. s3://bucket/lake/ or https://.../data/)
   SUNCHASER_S3_ENDPOINT, SUNCHASER_S3_KEY_ID, SUNCHASER_S3_SECRET, SUNCHASER_S3_REGION,
   SUNCHASER_S3_URL_STYLE (path|vhost), SUNCHASER_S3_USE_SSL (true|false)

@@ -46,7 +46,7 @@ def main():
     ap.add_argument("--log", required=True)
     ap.add_argument("--db-dir", required=True)
     ap.add_argument("--from", dest="start", required=True, help="timestamp the reference is at now")
-    ap.add_argument("--bin", default="/home/user/overpass-ref/bin/update_database")
+    ap.add_argument("--bin", required=True, help="the reference Overpass's update_database binary")
     ap.add_argument("--keep-attic", action="store_true", help="the reference was loaded with --keep-attic")
     ap.add_argument("--lake-changes", metavar="CATALOG",
                     help="apply only the elements this lake's changes log has (a .ducklake file)")
