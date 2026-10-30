@@ -22,7 +22,7 @@ Overpass is one hand-built storage engine (`src/template_db/`) plus about 25 OSM
 - **Nodes**: the key is `Uint32_Index = ll_upper`. The skeleton stores `(id, ll_lower)`, where `ll_lower` holds the low 16+16 bits.
 - **Ways and relations**: the key is `Uint31_Index`.
   - If the element's bbox fits in one tile, the key is that tile.
-  - Otherwise the high bit is set and the low bits `0x01…0x80` encode a coarser enclosing tile of 2×2, 4×4, … 128×128 tiles (`calc_index`, `index_computations.h:118`).
+  - Otherwise the high bit is set and the low bits encode a compound tile. There are 7 levels, flagged `0x01, 0x02, 0x04 … 0x40`. The extent grows by 4× per axis per level: 4, 16, 64, 256, 1024, 4096, 16384 tiles per axis (about 0.026° at level 1, up to about 107° at level 7). Each compound tile is anchored on an aligned corner, with the anchor's low 1, 3, 5 … 13 bits per axis cleared (2, 8, 32 … 8192 tile alignment). Flag `0x80` (`0x80000080`) means planet-wide and is always probed (`calc_index`, `index_computations.h:118`).
   - This is a **multi-level Z-order key**, much like an S2 or H3 cell-level hierarchy.
 - **Bbox queries**: `calc_ranges` turns a bbox into a set of Morton ranges. Ways and relations are also probed at every coarser parent level (`calc_parents`).
 
