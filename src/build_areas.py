@@ -133,9 +133,14 @@ def build(con, full=False):
 
 
 def main():
+    import argparse
+    ap = argparse.ArgumentParser(description="Build lake.areas (Overpass's area rules) on the catalog in SUNCHASER_CATALOG.")
+    ap.add_argument("--full", action="store_true", help="rebuild every area (first build); default: only the "
+                    "relations the updater changed since the last area build")
+    args = ap.parse_args()
     con = duckdb.connect()
     lakeconn.attach(con)
-    build(con, full="--full" in sys.argv[1:])
+    build(con, full=args.full)
 
 
 if __name__ == "__main__":
