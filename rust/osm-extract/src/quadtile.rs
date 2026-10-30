@@ -115,25 +115,7 @@ pub fn calc_index(idxs: &[u32]) -> u32 {
             }
         }
     }
-    if lat_max == lat_min && lon_max == lon_min {
-        return first;
-    }
-    let (a, b, c, d) = (upper_ilat(lat_min), upper_ilat(lat_max), upper_ilon(lon_min), upper_ilon(lon_max));
-    const STEPS: [(u32, u32, u32, u32); 7] = [
-        (0xFFFE, 4, 0xFFFF_FFFC, 0x8000_0001),
-        (0xFFF8, 0x10, 0xFFFF_FFC0, 0x8000_0002),
-        (0xFFE0, 0x40, 0xFFFF_FC00, 0x8000_0004),
-        (0xFF80, 0x100, 0xFFFF_C000, 0x8000_0008),
-        (0xFE00, 0x400, 0xFFFC_0000, 0x8000_0010),
-        (0xF800, 0x1000, 0xFFC0_0000, 0x8000_0020),
-        (0xE000, 0x4000, 0xFC00_0000, 0x8000_0040),
-    ];
-    for (m16, lim, m32, flag) in STEPS {
-        if (b & m16).wrapping_sub(a & m16) < lim && (d & m16).wrapping_sub(c & m16) < lim {
-            return ((lon_min | lat_min) & m32) | flag;
-        }
-    }
-    0x8000_0080
+    calc_index_from(first, lat_min, lon_min, lat_max, lon_max)
 }
 
 /// One index's contribution to `calc_index`: (lat_min, lon_min, lat_max, lon_max) in masked index

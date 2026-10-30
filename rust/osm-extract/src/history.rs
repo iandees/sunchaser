@@ -33,9 +33,11 @@ use osmpbf::{BlobDecode, PrimitiveBlock, RelMemberType};
 use parquet::arrow::ArrowWriter;
 use rayon::prelude::*;
 
-use crate::{
-    Args, Buckets, Kind, MISSING_BBOX, NO_COORD, extend_bbox, key31, locator_schema, map_names, member_struct_fields,
-    parents_schema, props, quadtile, schema,
+use crate::Args;
+use crate::quadtile;
+use crate::tables::{
+    Buckets, Kind, Layout, MISSING_BBOX, NO_COORD, extend_bbox, locator_batch, locator_schema, map_names,
+    member_struct_fields, parents_schema, props, schema,
 };
 
 const CHUNK_BLOBS: usize = 64;
@@ -611,21 +613,6 @@ fn rel_group(vs: Vec<Version>, nodes: &Timeline<16>, ways: &Timeline<32>) -> Out
 
 // ---- record batches -----------------------------------------------------------------
 
-fn hist_schema(kind: Kind, history: bool) -> Arc<Schema> {
-    let ts = || DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()));
-    let mut f: Vec<Field> = schema(kind).fields().iter().map(|f| f.as_ref().clone()).collect();
-    if kind == Kind::Nodes {
-        for c in ["min_lat", "max_lat", "min_lon", "max_lon"] {
-            f.retain(|x| x.name() != c);
-        }
-    }
-    f.push(Field::new("valid_from", ts(), true));
-    if history {
-        f.push(Field::new("valid_to", ts(), true));
-    }
-    Arc::new(Schema::new(f))
-}
-
 fn batch(kind: Kind, rows: &[&Row], history: bool) -> Result<RecordBatch> {
     let mut id = Int64Builder::new();
     let mut tags = MapBuilder::new(Some(map_names()), StringBuilder::new(), StringBuilder::new());
@@ -727,7 +714,7 @@ fn batch(kind: Kind, rows: &[&Row], history: bool) -> Result<RecordBatch> {
     if history {
         cols.push(Arc::new(vt.finish()));
     }
-    Ok(RecordBatch::try_new(hist_schema(kind, history), cols)?)
+    Ok(RecordBatch::try_new(schema(kind, history), cols)?)
 }
 
 fn changes_schema() -> Arc<Schema> {
@@ -788,17 +775,15 @@ fn kind_of(k: u8) -> Kind {
 }
 
 impl Writers {
-    fn write(&mut self, k: u8, outs: Vec<Out>, bits: u32, id_shift: u32, nb: usize) -> Result<()> {
+    fn write(&mut self, k: u8, outs: Vec<Out>, layout: Layout) -> Result<()> {
         let kind = kind_of(k);
         let rows: Vec<&Row> = outs.iter().flat_map(|o| o.rows.iter()).collect();
         let cur: Vec<&Row> = rows.iter().copied().filter(|r| r.to.is_none()).collect();
         let hist: Vec<&Row> = rows.iter().copied().filter(|r| r.to.is_some_and(|t| t > r.from)).collect();
-        let bucket = |q: u32| -> usize {
-            if k == 0 { (q >> (32 - bits)) as usize } else { (key31(q) >> (33 - bits)) as usize }
-        };
+        let bucket = |q: u32| layout.bucket(kind, q);
         if !cur.is_empty() {
             let b = batch(kind, &cur, false)?;
-            self.locator[k as usize].write(&crate::locator_batch(&b)?)?;
+            self.locator[k as usize].write(&locator_batch(&b)?)?;
             let keys: Vec<usize> = cur.iter().map(|r| bucket(r.qt)).collect();
             self.cur[k as usize].write_split(&[b], |_| keys.clone())?;
         }
@@ -822,7 +807,7 @@ impl Writers {
             let pb = RecordBatch::try_new(parents_schema(), vec![Arc::new(Int64Array::from(n)), Arc::new(Int64Array::from(w))])?;
             self.parents.write_split(&[pb], |b| {
                 let ids = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-                ids.values().iter().map(|&i| ((i.max(0) as u64 >> id_shift) as usize).min(nb - 1)).collect()
+                ids.values().iter().map(|&i| layout.parent_bucket(i)).collect()
             })?;
         }
         Ok(())
@@ -858,15 +843,14 @@ struct Pipeline {
     versions: u64,
     phase: u8,
     pending: Vec<Version>,
-    bits: u32,
-    nb: usize,
-    id_shift: u32,
+    layout: Layout,
 }
 
 impl Pipeline {
     fn new(out: &Path, bits: u32, history: bool, dense: Option<(&Path, u64, u64)>) -> Result<Self> {
         std::fs::create_dir_all(out)?;
-        let nb = 1usize << bits;
+        let layout = Layout::new(bits);
+        let nb = layout.count;
         let mk = |sub: &str, s: Arc<Schema>, n: usize| Buckets::new(out.join(sub), s, n);
         std::fs::create_dir_all(out.join("locator"))?;
         let mut locator = Vec::new();
@@ -876,16 +860,16 @@ impl Pipeline {
         }
         let w = Writers {
             cur: [
-                mk("nodes", hist_schema(Kind::Nodes, false), nb)?,
-                mk("ways", hist_schema(Kind::Ways, false), nb)?,
-                mk("relations", hist_schema(Kind::Relations, false), nb)?,
+                mk("nodes", schema(Kind::Nodes, false), nb)?,
+                mk("ways", schema(Kind::Ways, false), nb)?,
+                mk("relations", schema(Kind::Relations, false), nb)?,
             ],
             hist: if history {
                 Some((
                     [
-                        mk("nodes_history", hist_schema(Kind::Nodes, true), nb)?,
-                        mk("ways_history", hist_schema(Kind::Ways, true), nb)?,
-                        mk("relations_history", hist_schema(Kind::Relations, true), nb)?,
+                        mk("nodes_history", schema(Kind::Nodes, true), nb)?,
+                        mk("ways_history", schema(Kind::Ways, true), nb)?,
+                        mk("relations_history", schema(Kind::Relations, true), nb)?,
                     ],
                     mk("changes", changes_schema(), 1024)?,
                 ))
@@ -911,9 +895,7 @@ impl Pipeline {
             versions: 0,
             phase: 0,
             pending: Vec::new(),
-            bits,
-            nb,
-            id_shift: 34 - bits,
+            layout,
         })
     }
 
@@ -959,14 +941,14 @@ impl Pipeline {
                     }
                 }
             }
-            self.w.write(k, outs, self.bits, self.id_shift, self.nb)?;
+            self.w.write(k, outs, self.layout)?;
         }
         Ok(())
     }
 
     /// Close the files and write manifest.json; returns a summary line.
     fn finish(self) -> Result<String> {
-        let Pipeline { out, w, counts, versions, bits, id_shift, .. } = self;
+        let Pipeline { out, w, counts, versions, layout, .. } = self;
         let Writers { cur, hist, parents, locator } = w;
         for l in locator {
             l.close()?;
@@ -995,10 +977,10 @@ impl Pipeline {
         let mut m = File::create(out.join("manifest.json"))?;
         writeln!(
             m,
-            "{{\"format\": 2, \"history\": {history}, \"bucket_bits\": {bits}, \"node_id_shift\": {id_shift}, \
+            "{{\"format\": 2, \"history\": {history}, \"bucket_bits\": {}, \"node_id_shift\": {}, \
              \"versions\": {versions}, \"nodes\": {}, \"ways\": {}, \"relations\": {}{history_fields}, \
              \"node_parent_ways\": {n_parents}, {}}}",
-            counts[0], counts[1], counts[2], crate::header_fields()
+            layout.bits, layout.id_shift, counts[0], counts[1], counts[2], crate::header_fields()
         )?;
         Ok(format!(
             "{versions} versions -> current n={} w={} r={}, history n={} w={} r={}, changes={n_changes}",
