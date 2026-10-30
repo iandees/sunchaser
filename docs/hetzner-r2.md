@@ -26,7 +26,9 @@ planet totals, plus three regional full-history lakes scaled up. Times are still
 | Peak extra disk during the run | not measured | 64 GB (94 GB used, 30 GB before) | n/a |
 | Peak RSS, extract / build | not measured | 67.5 GB / 109.8 GB | n/a |
 
-Times scale linearly with the input size. Germany's build peaked at 110 GB of the box's 125 GB RAM with `--group-rows 100000000`, which leaves little headroom. A lower `--group-rows` does reduce it: on Minnesota the build peaked at 6.6 GB with 100 M and 3.8 GB with 2 M (one group per table versus 3–5), at the cost of more sorts. Germany with a lower value has not been run.
+Times scale linearly with the input size. Germany's build peaked at 110 GB of the box's 125 GB RAM with `--group-rows 100000000`, which leaves little headroom. A lower `--group-rows` does reduce it: on Minnesota the build peaked at 6.6 GB with 100 M and 3.8 GB with 2 M (one group per table versus 3–5), at the cost of more sorts. Germany with `--group-rows 50000000` made no difference (109.4 GB, 42:45): the memory is DuckDB's buffer cache growing across `nodes_untagged`, the second `tag_postings` step and `ways_history`, and not released between steps. `--memory-limit 40GB` held Germany's build to a 42.2 GB peak in 45:42 (about 7% slower) with identical row counts and areas, so cap it.
+
+Germany's extract with `--dense-index` took 44:05 (41:03 without) and peaked at 84 GB RSS, with a 102 GB index on disk and 253 GB used at the peak. That RSS counts the index's memory-mapped pages, which the kernel can evict, so it is not all pressure; the split between that and the extractor's own memory has not been measured. Germany's index nearly fits in RAM. The planet's (about 490 GB) does not, so the planet extract's random reads of it will hit NVMe and may be slower than this ratio suggests.
 
 Minnesota was then published to R2 (the lake copied in 4 min 39 s) and kept current by the updater service: one batch of 14–30 minutely diffs takes 340–570 s, about 12 s per diff with areas and Lance maintenance, which is faster than real time.
 
@@ -191,13 +193,14 @@ rm -rf /data/idx
 ## 5. Build into R2 (≈ 15–25 h on 6 cores)
 
 ```bash
-uv run python src/build_lake.py --raw /data/raw --lake /data/build --catalog /data/catalog.ducklake --data-path $LAKE/data/ --lance $LAKE/lance --group-rows 100000000 --consume 2>&1 | tee /data/build.log
+uv run python src/build_lake.py --raw /data/raw --lake /data/build --catalog /data/catalog.ducklake --data-path $LAKE/data/ --lance $LAKE/lance --group-rows 100000000 --memory-limit 70GB --consume 2>&1 | tee /data/build.log
 ```
 
 - **Upload:** Parquet goes straight to R2. 1 Gbit is about 400 GB an hour, faster than the build produces it.
 - **`--consume`:** deletes each raw bucket once the last table that needs it is built; `build.log` reports the GB freed.
 - **Progress:** each table's line ends with the process's peak memory so far, and a table sorted in many groups prints a line at most every 30 s (`lake.X: group 12/40 done`). The log is line-buffered, so `| tee build.log` shows it live.
-- **`--group-rows`:** sets how many rows each sort holds. 100 M suits 64–128 GB of RAM; use 50 M with 48 GB.
+- **`--memory-limit`:** DuckDB's cap (default 80% of RAM, and RSS ran about 10% above that). `build-planet.sh` sets `MEMORY_LIMIT=70GB`. Germany at 40GB: peak 42.2 GB, 7% slower.
+- **`--group-rows`:** sets how many rows each sort holds. It did not change Germany's peak memory; the limit does.
 - **`--lance`:** optional. It adds 490–550 GB in R2 (about 2× the current tables it copies) for queries 1.54× faster, mostly recursion and id lookups.
 
 Then build the areas in full:
