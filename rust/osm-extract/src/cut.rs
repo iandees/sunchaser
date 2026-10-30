@@ -281,7 +281,7 @@ pub fn run(args: &Args) -> Result<()> {
         let (name, bbox) = parse_region(spec)?;
         let out: PathBuf = args.out.join(&name);
         regions.push(Region {
-            pipeline: Pipeline::new(&out, args.bucket_bits, None)?,
+            pipeline: Pipeline::new(&out, args.bucket_bits, true, None)?,
             name,
             bbox,
             nodes: RoaringTreemap::new(),

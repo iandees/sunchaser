@@ -1,6 +1,6 @@
-//! `--history`: full-history PBF (every version, deletions as visible=false) -> current tables,
+//! Full-history PBF (every version, deletions as visible=false) -> current tables,
 //! *_history tables and the changes log, as if the updater had applied every change since the
-//! first version. Output (buckets as in the snapshot mode, plus):
+//! first version. Output (buckets as in the current tables, plus):
 //!   nodes_history/, ways_history/, relations_history/   rows with valid_from/valid_to and meta
 //!   changes/                                            ts, type, id, old/new version, action
 //!
@@ -777,8 +777,8 @@ fn changes_batch(cs: &[Change]) -> Result<RecordBatch> {
 
 struct Writers {
     cur: [Buckets; 3],
-    hist: [Buckets; 3],
-    changes: Buckets,
+    /// None with --no-history: no *_history tables and no changes log
+    hist: Option<([Buckets; 3], Buckets)>,
     parents: Buckets,
     locator: Vec<ArrowWriter<File>>,
 }
@@ -798,26 +798,23 @@ impl Writers {
         };
         if !cur.is_empty() {
             let b = batch(kind, &cur, false)?;
-            self.locator[k as usize].write(&RecordBatch::try_new(
-                locator_schema(),
-                vec![b.column(0).clone(), b.column_by_name("qt").unwrap().clone()],
-            )?)?;
+            self.locator[k as usize].write(&crate::locator_batch(&b)?)?;
             let keys: Vec<usize> = cur.iter().map(|r| bucket(r.qt)).collect();
             self.cur[k as usize].write_split(&[b], |_| keys.clone())?;
         }
-        if !hist.is_empty() {
+        if let Some((hw, _)) = self.hist.as_ref().filter(|_| !hist.is_empty()) {
             let keys: Vec<usize> = hist.iter().map(|r| bucket(r.qt)).collect();
-            self.hist[k as usize].write_split(&[batch(kind, &hist, true)?], |_| keys.clone())?;
+            hw[k as usize].write_split(&[batch(kind, &hist, true)?], |_| keys.clone())?;
         }
         let cs: Vec<&Change> = outs.iter().flat_map(|o| o.changes.iter()).collect();
-        if !cs.is_empty() {
+        if let Some((_, changes)) = self.hist.as_ref().filter(|_| !cs.is_empty()) {
             let owned: Vec<Change> = cs
                 .iter()
                 .map(|c| Change { ts: c.ts, kind: c.kind, id: c.id, old: c.old, new: c.new, action: c.action })
                 .collect();
             // ~48-day buckets of change time, so the build sorts the log one period at a time
             let keys: Vec<usize> = owned.iter().map(|c| ((c.ts.max(0) as u64 >> 22) as usize).min(1023)).collect();
-            self.changes.write_split(&[changes_batch(&owned)?], |_| keys.clone())?;
+            changes.write_split(&[changes_batch(&owned)?], |_| keys.clone())?;
         }
         let parents: Vec<(i64, i64)> = outs.iter().flat_map(|o| o.parents.iter().copied()).collect();
         if !parents.is_empty() {
@@ -868,7 +865,7 @@ pub(crate) struct Pipeline {
 }
 
 impl Pipeline {
-    pub(crate) fn new(out: &Path, bits: u32, dense: Option<(&Path, u64, u64)>) -> Result<Self> {
+    pub(crate) fn new(out: &Path, bits: u32, history: bool, dense: Option<(&Path, u64, u64)>) -> Result<Self> {
         std::fs::create_dir_all(out)?;
         let nb = 1usize << bits;
         let mk = |sub: &str, s: Arc<Schema>, n: usize| Buckets::new(out.join(sub), s, n);
@@ -884,12 +881,18 @@ impl Pipeline {
                 mk("ways", hist_schema(Kind::Ways, false), nb)?,
                 mk("relations", hist_schema(Kind::Relations, false), nb)?,
             ],
-            hist: [
-                mk("nodes_history", hist_schema(Kind::Nodes, true), nb)?,
-                mk("ways_history", hist_schema(Kind::Ways, true), nb)?,
-                mk("relations_history", hist_schema(Kind::Relations, true), nb)?,
-            ],
-            changes: mk("changes", changes_schema(), 1024)?,
+            hist: if history {
+                Some((
+                    [
+                        mk("nodes_history", hist_schema(Kind::Nodes, true), nb)?,
+                        mk("ways_history", hist_schema(Kind::Ways, true), nb)?,
+                        mk("relations_history", hist_schema(Kind::Relations, true), nb)?,
+                    ],
+                    mk("changes", changes_schema(), 1024)?,
+                ))
+            } else {
+                None
+            },
             parents: mk("node_parent_ways", parents_schema(), nb)?,
             locator,
         };
@@ -968,7 +971,7 @@ impl Pipeline {
     /// Close the files and write manifest.json; returns a summary line.
     pub(crate) fn finish(self, extra: &str) -> Result<String> {
         let Pipeline { out, w, counts, versions, bits, id_shift, busy, .. } = self;
-        let Writers { cur, hist, changes, parents, locator } = w;
+        let Writers { cur, hist, parents, locator } = w;
         for l in locator {
             l.close()?;
         }
@@ -976,19 +979,30 @@ impl Pipeline {
         for b in cur {
             b.close()?;
         }
-        for (i, b) in hist.into_iter().enumerate() {
-            hist_rows[i] = b.close()?;
+        let history = hist.is_some();
+        let mut n_changes = 0;
+        if let Some((hs, changes)) = hist {
+            for (i, b) in hs.into_iter().enumerate() {
+                hist_rows[i] = b.close()?;
+            }
+            n_changes = changes.close()?;
         }
-        let n_changes = changes.close()?;
         let n_parents = parents.close()?;
+        let history_fields = if history {
+            format!(
+                ", \"nodes_history\": {}, \"ways_history\": {}, \"relations_history\": {}, \"changes\": {n_changes}",
+                hist_rows[0], hist_rows[1], hist_rows[2]
+            )
+        } else {
+            String::new()
+        };
         let mut m = File::create(out.join("manifest.json"))?;
         writeln!(
             m,
-            "{{\"format\": 2, \"history\": true, \"bucket_bits\": {bits}, \"node_id_shift\": {id_shift}, \
-             \"versions\": {versions}, \"nodes\": {}, \"ways\": {}, \"relations\": {}, \"nodes_history\": {}, \
-             \"ways_history\": {}, \"relations_history\": {}, \"changes\": {n_changes}, \
+            "{{\"format\": 2, \"history\": {history}, \"bucket_bits\": {bits}, \"node_id_shift\": {id_shift}, \
+             \"versions\": {versions}, \"nodes\": {}, \"ways\": {}, \"relations\": {}{history_fields}, \
              \"node_parent_ways\": {n_parents}, \"process_seconds\": {busy:.1}{}{extra}}}",
-            counts[0], counts[1], counts[2], hist_rows[0], hist_rows[1], hist_rows[2], crate::header_fields()
+            counts[0], counts[1], counts[2], crate::header_fields()
         )?;
         Ok(format!(
             "{versions} versions -> current n={} w={} r={}, history n={} w={} r={}, changes={n_changes}",
@@ -1000,7 +1014,7 @@ impl Pipeline {
 pub fn run(args: &Args) -> Result<()> {
     let t0 = Instant::now();
     let dense = args.dense.as_deref().map(|d| (d, args.max_node_id, args.max_way_id));
-    let mut p = Pipeline::new(&args.out, args.bucket_bits, dense)?;
+    let mut p = Pipeline::new(&args.out, args.bucket_bits, !args.no_history, dense)?;
     let mut blobs = crate::open_input(&args.input)?.peekable();
     let mut progress = crate::Progress::new();
     loop {
