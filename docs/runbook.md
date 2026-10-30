@@ -51,15 +51,20 @@ without) and peaked at 84-98 GB RSS, of which only about 11 GB was anonymous mem
 the memory-mapped index, which the kernel can evict. Germany's index was 102 GB on disk and 253 GB
 of disk was in use at the peak.
 
-**Open risk: the planet extract may be far slower than 9 h.** When the index does not fit in the
-page cache, the ways phase slows about 25× from random index reads (measured by running Germany in a
-30 GB cgroup). A sorted-batch-lookup experiment made that 3× better, not enough, and is parked on
-the branch `extract-sorted-lookups`. The planet's dense index is about 490 GB (the sizing run's
-figure; see Disk), and this box has 125 GB of RAM, so the planet extract will run in the slow
-regime unless the index is made smaller, the lookups are made sequential, or the box gets much more
-RAM. The linear 9 h estimate does not account for this. Germany's measured 102 GB for a 12.4 GB PBF
-does not scale linearly to 490 GB (13× would be 1.3 TB); the two have not been reconciled, and the
-planet's index size is the least certain number here.
+**The ways phase when the index does not fit in RAM.** The planet's node index does not fit in 125 GB
+(run 1 had 332 GB of index on disk when its node section ended, at 10.97 G current nodes), so the
+ways phase reads it from NVMe at random. Two things decide its speed:
+- Each batch of ways now gathers the node timelines it needs in sorted id order on 64 threads
+  (`gather` in `history.rs`), so each index page is touched once per batch: 3× on Germany in a 30 GB
+  cgroup.
+- The index mappings are `MADV_RANDOM`. Without that, the kernel reads ahead around every page fault
+  by the block device's window, 2 MB on the md RAID0 here, and the first planet attempt ran its ways
+  phase at 2,500 ways/s with the array reading 1-2 GB/s for lookups that needed 4 KB each: about
+  five days for the planet's ways. Setting the device's `read_ahead_kb` does not help a running
+  process (an open file keeps the window it was opened with). In a lookup test on that run's index,
+  `MADV_RANDOM` gave 6.5× the lookups per second. The second attempt runs with it; its ways-phase
+  rate is recorded in `/data/logs/ways_rate.txt` on the box.
+The linear 9 h estimate does not include this phase's real cost; use the recorded rate.
 
 **Updater on R2** (Minnesota, a regional lake, copied to R2 in 4 min 39 s): a batch of 2-3 minutely
 diffs commits in 3-14 s; the hourly Lance compaction steps take 19-38 s each; the catalog upload is
