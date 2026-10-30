@@ -13,8 +13,10 @@ from dataclasses import dataclass
 import duckdb
 
 import quadtile as qt
+from geometry import NO_COORD, Bbox, great_circle_dist, ov_lat  # noqa: F401 (Bbox re-exported)
 
-# Bbox_Double::intersects (core/geometry.cc) for west <= east, no antimeridian handling.
+# SQL copies of geometry.ov_lat and geometry.segment_intersects (Bbox_Double::intersects, core/geometry.cc);
+# src/geometry.py is the reference and the two must change together.
 SQL_MACROS = r"""
 CREATE OR REPLACE MACRO ov_seg(flat, flon, tlat, tlon, s, n, w, e) AS
   CASE
@@ -43,20 +45,6 @@ CREATE OR REPLACE MACRO ov_way_in_bbox(lats, lons, s, n, w, e) AS
            ov_seg(ov_lat(lats[i - 1]), lons[i - 1] / 1e7, ov_lat(lats[i]), lons[i] / 1e7, s, n, w, e)))
   END;
 """
-
-
-@dataclass
-class Bbox:
-    s: float
-    w: float
-    n: float
-    e: float
-
-    def ints(self):
-        """Integer bounds the way filter_by_bbox compares node coordinates (ilat_/ilon_ rounding)."""
-        to7 = lambda v: int(v * 10000000 + (0.5 if v > 0 else -0.5))
-        return (int(round((self.s + 91.0) * 10000000 + 0.5)) - 910000000, to7(self.w),
-                int(round((self.n + 91.0) * 10000000 + 0.5)) - 910000000, to7(self.e))
 
 
 @dataclass
@@ -377,9 +365,9 @@ class Engine:
         with such a node or way member."""
         found = set()
         for aid, s7, n7, w7, e7, wkb in self._area_rows(area_ids):
-            box = Bbox(ov_lat_f(s7), w7 / 1e7, ov_lat_f(n7), e7 / 1e7)
+            box = Bbox(ov_lat(s7), w7 / 1e7, ov_lat(n7), e7 / 1e7)
             if bbox is not None:
-                box = Bbox(max(box.s, bbox.s), max(box.w, bbox.w), min(box.n, bbox.n), min(box.e, bbox.e))
+                box = box.intersect(bbox)
                 if box.s > box.n or box.w > box.e:
                     continue
             name = f"area{next(self._ids)}"
@@ -397,7 +385,7 @@ class Engine:
         self._sql(f"CREATE OR REPLACE TEMP TABLE {name} AS SELECT ST_GeomFromText('{wkt}') AS g")
         box = Bbox(min(p[0] for p in pts), min(p[1] for p in pts), max(p[0] for p in pts), max(p[1] for p in pts))
         if bbox is not None:
-            box = Bbox(max(box.s, bbox.s), max(box.w, bbox.w), min(box.n, bbox.n), min(box.e, bbox.e))
+            box = box.intersect(bbox)
             if box.s > box.n or box.w > box.e:
                 return []
         cand = self._new(self._query_one(t, box, list(filters), None))
@@ -652,7 +640,7 @@ class Engine:
         if pts is None:
             pts = [(a / 1e7, b / 1e7) for _, a, b in self.elements(src, "n", ["id", "lat", "lon"])]
             for _, la, lo in self.elements(src, "w", ["id", "nd_lat", "nd_lon"]):
-                pts += [(a / 1e7, b / 1e7) for a, b in zip(la, lo) if a != -2147483648]
+                pts += [(a / 1e7, b / 1e7) for a, b in zip(la, lo) if a != NO_COORD]
         if not pts:
             return []
         dlat = radius / 111_000 * 1.01
@@ -666,7 +654,7 @@ class Engine:
             dlon = dlat / max(0.01, math.cos(math.radians(max(abs(s_), abs(n_)))))
             box = Bbox(s_, min(p[1] for p in cell_pts) - dlon, n_, max(p[1] for p in cell_pts) + dlon)
             if bbox is not None:
-                box = Bbox(max(box.s, bbox.s), max(box.w, bbox.w), min(box.n, bbox.n), min(box.e, bbox.e))
+                box = box.intersect(bbox)
                 if box.s > box.n or box.w > box.e:
                     continue
             cand = self._new(self._query_one(t, box, list(filters), None))
@@ -689,7 +677,7 @@ class Engine:
             return d_pt(p, (p[0] + cy, p[1] + cx / k))
 
         def line_near(coords):
-            coords = [(a / 1e7, b / 1e7) for a, b in coords if a != -2147483648]
+            coords = [(a / 1e7, b / 1e7) for a, b in coords if a != NO_COORD]
             if len(coords) == 1:
                 return any(d_pt(p, coords[0]) <= radius for p in pts)
             return any(d_seg(p, coords[i], coords[i + 1]) <= radius
@@ -803,23 +791,6 @@ class Engine:
         if closure:
             rels = self._rel_closure(f"SELECT * FROM {rels}", down=False)
         return self.union(ways_t, rels)
-
-
-DEG_TO_ARC = math.acos(0) / 90.0
-ARC_TO_METER = 10 * 1000 * 1000 / math.acos(0)  # Overpass's earth: a 10,000 km quarter meridian
-
-
-def great_circle_dist(lat1, lon1, lat2, lon2):
-    """core/geometry.cc great_circle_dist, exactly."""
-    if lat1 == lat2 and lon1 == lon2:
-        return 0.0
-    sp = (math.cos((lat2 - lat1) * DEG_TO_ARC)
-          + math.cos(lat1 * DEG_TO_ARC) * math.cos(lat2 * DEG_TO_ARC) * (math.cos((lon2 - lon1) * DEG_TO_ARC) - 1))
-    return math.acos(min(1.0, sp)) * ARC_TO_METER
-
-
-def ov_lat_f(lat_e7):
-    return (lat_e7 + 910000000) / 1e7 - 91.0
 
 
 def coalesce_ranges(ranges, k):

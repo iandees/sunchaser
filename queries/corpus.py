@@ -1,15 +1,7 @@
 """Spike query corpus: Overpass QL (kept verbatim so it can be replayed against a real Overpass;
 queries/ql_corpus.py wraps each in a full request). Bboxes stay inside the BBBike Berlin extract.
 """
-from dataclasses import dataclass
-
-
-@dataclass
-class Bbox:
-    s: float
-    w: float
-    n: float
-    e: float
+from geometry import Bbox
 
 MITTE = Bbox(52.510, 13.380, 52.525, 13.410)          # ~1.6 x 2.0 km
 KREUZBERG = Bbox(52.490, 13.390, 52.505, 13.430)

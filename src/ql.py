@@ -22,7 +22,8 @@ import re
 from dataclasses import dataclass, field
 
 import evaluator
-from engine import Bbox, Filter
+from engine import Filter
+from geometry import NO_COORD, Bbox, ov_lat
 from output import CsvSettings, Document, OutOptions, OutputTooLarge  # noqa: F401 (re-exported)
 
 
@@ -719,7 +720,7 @@ class Executor:
             elif bbox is None:
                 bbox = self.global_bbox
             else:
-                bbox = intersect_bbox(bbox, self.global_bbox)
+                bbox = bbox.intersect(self.global_bbox)
             if q.areas and t != "a":
                 area_ids = sorted({i for src in q.areas for i in e._ids_of(self.get(src), "a")})
                 ids = self._meet(ids, e.in_area_ids(t, area_ids, q.filters, bbox) if area_ids else [])
@@ -767,7 +768,7 @@ class Executor:
             el = {"type": name, "id": r["id"], "tags": dict(r["tags"] or {})}
             if "nds" in r:
                 el["nds"] = r["nds"]
-                el["coords"] = [None if a == -2147483648 else ((a + 910000000) / 1e7 - 91.0, b / 1e7)
+                el["coords"] = [None if a == NO_COORD else (ov_lat(a), b / 1e7)
                                 for a, b in zip(r["nd_lat"], r["nd_lon"])]
             if "members" in r:
                 el["members"] = r["members"]
@@ -792,7 +793,3 @@ class Executor:
         src = None if pts is not None else self.get(where)
         cand = self.e.around_ids(t, radius, pts=pts, src=src, bbox=bbox, filters=q.filters)
         return self._meet(ids, cand), bbox
-
-
-def intersect_bbox(a, b):
-    return Bbox(max(a.s, b.s), max(a.w, b.w), min(a.n, b.n), min(a.e, b.e))

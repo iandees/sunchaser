@@ -11,6 +11,8 @@ An element is a dict: {"type": "node"|"way"|"relation"|"area", "id", "tags": {..
 import math
 import re
 
+from geometry import great_circle_dist
+
 TOKEN = re.compile(r"""\s*(?:(?P<num>\d+\.\d*|\.\d+|\d+(?:[eE][-+]?\d+)?)|(?P<str>"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')|
                      (?P<op>&&|\|\||==|!=|<=|>=|[!<>+\-*/?:()\[\],])|(?P<name>[A-Za-z_][A-Za-z0-9_]*))""", re.X)
 
@@ -253,7 +255,6 @@ def _number(v):
 
 def _length(el):
     """core/geometry.cc length(): sum of Overpass great-circle distances between vertices."""
-    from engine import great_circle_dist
     pts = [p for p in el.get("coords") or [] if p is not None]
     return f"{sum(great_circle_dist(*a, *b) for a, b in zip(pts, pts[1:])):.3f}"  # fixed_to_string(.., 3)
 

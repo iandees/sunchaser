@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from xml.sax.saxutils import quoteattr
 
 import quadtile
+from geometry import NO_COORD, ov_lat, segment_intersects
 
 # Output_Mode bits (frontend/output_handler.h)
 ID, COORDS, NDS, MEMBERS, TAGS, VERSION, META, GEOMETRY, BOUNDS, CENTER, COUNT = (
@@ -22,7 +23,6 @@ MODES = {
     "count": ID | COUNT,
 }
 GEOMS = {None: 0, "geom": GEOMETRY | BOUNDS, "bb": BOUNDS, "center": CENTER}
-NO_COORD = -2147483648
 TYPE_NAME = {"n": "node", "w": "way", "r": "relation", "a": "area"}
 COPYRIGHT = "The data included in this document is from www.openstreetmap.org. The data is made available under ODbL."
 GENERATOR = "Overpass API 0.7.62 lake-spike"
@@ -84,18 +84,10 @@ def _inside(p, clip):
 
 
 def _seg_hits(a, b, clip):
-    """Bbox_Double::intersects for west <= east, on Overpass-rounded coordinates."""
+    """Bbox_Double::intersects on Overpass-rounded coordinates."""
     if a[0] == NO_COORD or b[0] == NO_COORD:
         return False
-    s, n, w, e = clip.s, clip.n, clip.w, clip.e
-    flat, flon = (a[0] + 910000000) / 1e7 - 91.0, a[1] / 1e7
-    tlat, tlon = (b[0] + 910000000) / 1e7 - 91.0, b[1] / 1e7
-    if (flat < s and tlat < s) or (flat > n and tlat > n):
-        return False
-    df = (tlon - flon) * (s - flat) / (tlat - flat) if flat < s else (tlon - flon) * (n - flat) / (tlat - flat) if flat > n else 0
-    dt = (flon - tlon) * (s - tlat) / (flat - tlat) if tlat < s else (flon - tlon) * (n - tlat) / (flat - tlat) if tlat > n else 0
-    lo, hi = sorted((flon + df, tlon + dt))
-    return lo <= e and hi >= w
+    return segment_intersects(ov_lat(a[0]), a[1] / 1e7, ov_lat(b[0]), b[1] / 1e7, clip)
 
 
 def clip_way(coords, clip):
