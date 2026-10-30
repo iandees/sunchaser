@@ -447,15 +447,6 @@ class Engine:
         except duckdb.Error:
             return ""
 
-    def has_areas(self):
-        if not hasattr(self, "_has_areas"):
-            try:
-                self._sql("SELECT 1 FROM lake.areas LIMIT 0").fetchall()
-                self._has_areas = self.mode == "lake"
-            except duckdb.Error:
-                self._has_areas = False
-        return self._has_areas
-
     def map_to_area_ids(self, s):
         """map_to_area: relations -> area id + 3600000000 (ways -> + 2400000000) where the area exists."""
         cand = [i + AREA_REL_OFFSET for i in self._ids_of(s, "r")] + [i + AREA_WAY_OFFSET for i in self._ids_of(s, "w")]
@@ -622,11 +613,6 @@ class Engine:
 
     # ---- recurse statement ---------------------------------------------------
 
-    def _fetch_where(self, t, ids):
-        """DuckDB-only id predicate (used for relations)."""
-        push, local = self._id_parts(t, ids)
-        return " AND ".join(push + local)
-
     def _fetch(self, t, ids):
         """Elements of type t whose id is in ids, via the locator (DuckLake) or the id BTree (Lance)."""
         push, local = self._id_parts(t, ids)
@@ -650,9 +636,10 @@ class Engine:
         if not rel_ids:
             return []
         role_pred = f" AND role = {sq(role)}" if role is not None else ""
+        push, local = self._id_parts("r", rel_ids)
         return self._materialize_ids(
             f"SELECT ref FROM (SELECT unnest(members, recursive := true) FROM {self.t['r']} "
-            f"WHERE {self._fetch_where('r', rel_ids)}) WHERE type = '{mtype}'{role_pred}")
+            f"WHERE {' AND '.join(push + local)}) WHERE type = '{mtype}'{role_pred}")
 
     # ---- around ----------------------------------------------------------------------
 
