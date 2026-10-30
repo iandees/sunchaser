@@ -258,6 +258,20 @@ journalctl -u sunchaser-updater -f
 
 What the updater does each batch, checked on Minnesota: it copies the outgoing version of every modified or deleted element into `nodes_history` / `ways_history` (sampled: 2,000 of 2,000 modified nodes and ways, and all 2,000 deleted nodes), then commits. Hourly it flushes inlined rows to Parquet, merges small files, expires snapshots and deletes unreferenced files after a 1-hour grace period (every file in R2 was either live, superseded, or scheduled for deletion; none orphaned).
 
+## Drift check (periodic, off the live box)
+
+Nothing else reconciles a lake rolled forward by the updater with a fresh build of the same moment, and a short replay can't show bugs that only appear after weeks of cascades, compactions and restarts. `tools/drift_check.py` does: it attaches two catalogs read-only and compares them table by table (row counts, then keys only in one side, then keys whose row differs, with the first `--limit` keys printed).
+
+1. Take a frozen copy of the live catalog from `catalogs/` (`--keep-versions`) or the published one, and read its `state.sequence`/`osm_base`. That is lake A.
+2. Build lake B from the planet (or the region's extract) as in steps 4–5, into a scratch bucket prefix or local disk, then replay minutely diffs with `updater.py run --once --until <A's osm_base>` so B ends at A's moment. The check refuses (exit 2) if `osm_base`/`sequence` differ. Build B from a snapshot at least as old as the last check, so the replay is short. Replaying B with the same updater only tests the updater against its own history of cascades from the build onward; B must come from a source the updater did not touch, for the check to say anything about A's older batches.
+3. `uv run python tools/drift_check.py A.ducklake B.ducklake --data-path-a ... --data-path-b ...` (or `s3://` catalogs with the `SUNCHASER_S3_*` variables). Exit 0: no drift; 1: drift; 2: not the same moment. Add `--history` only if B came from a `--history` extract.
+
+Excluded because they legitimately differ (full list in the script's docstring): `valid_from` on current rows (version time in a snapshot build, change time after an update), the history tables and `changes` (a snapshot build has none), `state.batch`/`compacted_at`/`areas_batch`, the Lance store, file layout.
+
+Cost: B is a full build plus replay (the 15–25 h build in step 5 plus the extract, on a box that is not the live one), and the comparison is a full scan of both lakes (hash-joins on the biggest tables: `tag_postings`, `nodes_meta`). At planet scale run it in slices (`--shard 0/16` ... `15/16`, rows with `hash(key) % 16 == I`) with `SUNCHASER_DRIFT_TEMP` on a large disk. Run it quarterly, or after any updater change that touches the cascade, `_rewrite`, or compaction; a regional lake (a country) makes it a cheap weekly job.
+
+What it can't catch: bugs the build shares with the updater (both use the same SQL macros and `quadtile.py`, so a wrong index key is wrong on both sides); history tables, `changes` and `valid_from` on current rows (no snapshot reference); the Lance store; differences hidden by element versions that an extract and the replication feed disagree about (e.g. the extract is cut at a different instant than `osm_base`); and anything in a regional lake that the `--region` filter drops differently from a fresh extract. A clean run is evidence about the current-state tables, not about the lake as a whole. `tests/test_drift_check.py` shows the recipe on a five-element fixture: identical lakes pass, a corrupted row and a deleted index row fail.
+
 ## 7. API
 
 A read-only server: it attaches `$LAKE/catalog.ducklake` and reloads it when its ETag changes. Run it on the same box, or on a small VPS. Any host can read R2 without egress charges.
