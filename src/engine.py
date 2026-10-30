@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 
 import duckdb
 
+import cellcover
 import quadtile as qt
 
 # Bbox_Double::intersects (core/geometry.cc) for west <= east, no antimeridian handling.
@@ -423,8 +424,25 @@ class Engine:
             name = f"area{next(self._ids)}"
             self.con.execute(f"CREATE OR REPLACE TEMP TABLE {name} AS SELECT ST_GeomFromWKB(?::BLOB) AS g", [wkb])
             cand = self._new(self._query_one(t, box, list(filters), None, None))
-            found |= self._in_area(t, cand, name)
+            found |= self._in_area(t, cand, name, cover=self._cover_table(aid))
         return sorted(found)
+
+    def _cover_table(self, aid):
+        """Temp table (cell, kind) with the 0.1 degree cell cover of an area, or None when the lake has
+        no lake.area_cells or the area is too small to have one (then the exact test runs on everything)."""
+        if not hasattr(self, "_has_cells"):
+            try:
+                self._sql("SELECT 1 FROM lake.area_cells LIMIT 0").fetchall()
+                self._has_cells = self.mode == "lake"
+            except duckdb.Error:
+                self._has_cells = False
+        if not self._has_cells:
+            return None
+        name = f"cover{next(self._ids)}"
+        self._sql(f"CREATE OR REPLACE TEMP TABLE {name} AS SELECT cell, kind FROM lake.area_cells WHERE area_id = {int(aid)}")
+        if not self._sql(f"SELECT count(*) FROM {name}").fetchall()[0][0]:
+            return None
+        return name
 
     def in_poly_ids(self, t, pts, filters=(), bbox=None):
         """(poly:"lat lon ..."): like (area) but direct nodes and ways on the border count
@@ -441,9 +459,12 @@ class Engine:
         cand = self._new(self._query_one(t, box, list(filters), None, None))
         return sorted(self._in_area(t, cand, name, add_border=True))
 
-    def _in_area(self, t, cand, area_tbl, add_border=None):
+    def _in_area(self, t, cand, area_tbl, add_border=None, cover=None):
         """Elements of set cand inside the geometry in area_tbl. add_border: whether touching the
-        border counts (None = Overpass's area defaults: yes for nodes, no for ways)."""
+        border counts (None = Overpass's area defaults: yes for nodes, no for ways). cover: temp table of the
+        area's cell cover (cellcover.py): nodes in inside cells are in without the exact test, nodes in cells
+        without a row are out, as are ways within one such cell; inside cells are strictly interior, so both
+        border modes agree there."""
         point = "ST_Point(lon / 1e7, ov_lat(lat))"
         line = ("CASE WHEN len(nd_lat) = 1 THEN ST_Point(nd_lon[1] / 1e7, ov_lat(nd_lat[1])) ELSE "
                 "ST_MakeLine(list_transform(list_filter(range(1, len(nd_lat) + 1), lambda i: nd_lat[i] <> -2147483648), "
@@ -452,18 +473,35 @@ class Engine:
             rows = self.elements(cand, "n", ["id", "lat", "lon"])
             test = "ST_Intersects(a.g, p)" if add_border in (None, True) else "ST_Contains(a.g, p)"
             sel = f"SELECT id FROM (SELECT id, {point} AS p FROM x), {area_tbl} a WHERE {test}"
+            if cover:
+                sel = (f"SELECT id FROM (SELECT id, lat, lon, {cellcover.cell_sql('lat', 'lon')} AS c FROM x) "
+                       f"JOIN {cover} v ON v.cell = c WHERE v.kind = 1 UNION ALL "
+                       f"SELECT id FROM (SELECT id, {point} AS p FROM (SELECT id, lat, lon, "
+                       f"{cellcover.cell_sql('lat', 'lon')} AS c FROM x) JOIN {cover} v ON v.cell = c "
+                       f"WHERE v.kind = 0), {area_tbl} a WHERE {test}")
         elif t == "w":
             rows = self.elements(cand, "w", ["id", "nd_lat", "nd_lon"])
             test = "ST_Intersects(a.g, l)" + ("" if add_border else " AND NOT ST_Touches(a.g, l)")
             sel = (f"SELECT id FROM (SELECT id, {line} AS l FROM x WHERE len(list_filter(nd_lat, lambda v: v <> -2147483648)) > 0), "
                    f"{area_tbl} a WHERE {test}")
+            if cover:
+                # a way inside one cell: in if the cell is inside, out if it has no row; else exact
+                lat_ok = "list_filter(nd_lat, lambda v: v <> -2147483648)"
+                lon_ok = "list_filter(nd_lon, lambda v: v <> -2147483648)"
+                one = (f"SELECT id, {cellcover.cell_sql(f'list_min({lat_ok})', f'list_min({lon_ok})')} AS c1, "
+                       f"{cellcover.cell_sql(f'list_max({lat_ok})', f'list_max({lon_ok})')} AS c2, nd_lat, nd_lon "
+                       f"FROM x WHERE len({lat_ok}) > 0")
+                sel = (f"WITH w AS ({one}) "
+                       f"SELECT id FROM w JOIN {cover} v ON v.cell = w.c1 WHERE w.c1 = w.c2 AND v.kind = 1 UNION ALL "
+                       f"SELECT id FROM (SELECT id, {line} AS l FROM w WHERE c1 <> c2 OR c1 IN "
+                       f"(SELECT cell FROM {cover} WHERE kind = 0)), {area_tbl} a WHERE {test}")
         else:
             members = self.elements(cand, "r", ["id", "members"])
             node_ids = sorted({m["ref"] for _, ms in members for m in ms if m["type"] == "n"})
             way_ids = sorted({m["ref"] for _, ms in members for m in ms if m["type"] == "w"})
             # relation members never count on the border (collect_* with add_border=false)
-            inside_n = set(self._in_area("n", self._new(self._fetch("n", node_ids)), area_tbl, False)) if node_ids else set()
-            inside_w = set(self._in_area("w", self._new(self._fetch("w", way_ids)), area_tbl, False)) if way_ids else set()
+            inside_n = set(self._in_area("n", self._new(self._fetch("n", node_ids)), area_tbl, False, cover)) if node_ids else set()
+            inside_w = set(self._in_area("w", self._new(self._fetch("w", way_ids)), area_tbl, False, cover)) if way_ids else set()
             return {i for i, ms in members
                     if any((m["type"] == "n" and m["ref"] in inside_n) or (m["type"] == "w" and m["ref"] in inside_w)
                            for m in ms)}

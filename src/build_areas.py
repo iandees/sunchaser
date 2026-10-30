@@ -21,6 +21,7 @@ import time
 import duckdb
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import cellcover  # noqa: E402
 import lakeconn  # noqa: E402
 
 AREA_OFFSET_RELATION = 3600000000
@@ -38,6 +39,10 @@ def _state(con, key):
 
 def _has_areas(con):
     return bool(con.sql("SELECT 1 FROM duckdb_tables() WHERE database_name = 'lake' AND table_name = 'areas'").fetchall())
+
+
+def _has_cells(con):
+    return bool(con.sql("SELECT 1 FROM duckdb_tables() WHERE database_name = 'lake' AND table_name = 'area_cells'").fetchall())
 
 
 def build(con, full=False):
@@ -112,6 +117,7 @@ def build(con, full=False):
                a.min_lat, a.max_lat, a.min_lon, a.max_lon, ST_AsWKB(a.geom) AS geom_wkb
         FROM agg a JOIN lake.relations r ON r.id = a.rel_id
         WHERE a.geom IS NOT NULL AND NOT ST_IsEmpty(a.geom)""")
+    covered = cellcover.build_cells(con, "SELECT * FROM new_areas")
     con.sql("BEGIN TRANSACTION")
     con.sql("CREATE TABLE IF NOT EXISTS lake.state (key VARCHAR, value VARCHAR)")
     if incremental:
@@ -119,8 +125,16 @@ def build(con, full=False):
         # deleted, rings broken) just lose theirs
         con.sql("DELETE FROM lake.areas WHERE rel_id IN (SELECT id FROM area_todo)")
         con.sql("INSERT INTO lake.areas SELECT * FROM new_areas ORDER BY id")
+        if _has_cells(con):
+            con.sql(f"DELETE FROM lake.area_cells WHERE area_id IN (SELECT id + {AREA_OFFSET_RELATION} FROM area_todo)")
+            con.sql("INSERT INTO lake.area_cells SELECT * FROM new_cells ORDER BY area_id, cell")
     else:
         con.sql("CREATE OR REPLACE TABLE lake.areas AS SELECT * FROM new_areas ORDER BY id")
+    if not _has_cells(con) or not incremental:
+        # first cover (or full rebuild); an incremental run on a lake from before covers covers all areas
+        if incremental:
+            cellcover.build_cells(con, "SELECT * FROM lake.areas")
+        con.sql("CREATE OR REPLACE TABLE lake.area_cells AS SELECT * FROM new_cells ORDER BY area_id, cell")
     for key, value in (("areas_base", _state(con, "osm_base")), ("areas_batch", batch or "0")):
         con.sql(f"DELETE FROM lake.state WHERE key = '{key}'")
         con.sql(f"INSERT INTO lake.state VALUES ('{key}', '{value}')")
@@ -128,6 +142,7 @@ def build(con, full=False):
     n = con.sql("SELECT count(*) FROM lake.areas").fetchall()[0][0]
     what = f"{n_todo} changed relations" if incremental else \
         f"{con.sql(f'SELECT count(*) FROM lake.relations WHERE {PIVOT}').fetchall()[0][0]} pivot relations (full)"
+    print(f"area cells: {covered} areas covered in this run")
     print(f"areas: {n} total, processed {what} ({time.time() - t:.1f}s)", flush=True)
     return n_todo if incremental else None
 
