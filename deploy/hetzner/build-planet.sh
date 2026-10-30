@@ -9,14 +9,18 @@
 # Then start the updater: systemctl enable --now sunchaser-updater
 # Usage: deploy/hetzner/build-planet.sh   (env from /etc/sunchaser.env; PLANET_URL, THREADS,
 #        BUCKET_BITS, GROUP_ROWS, WRITER_MEM_MB, MEMORY_LIMIT, LANCE=0 to skip Lance, CONSUME=0 to keep the raw buckets, DATA=/data)
+# LAKE set on the command line wins over the env file's, so a planet can be built into a new prefix
+# (LAKE=s3://bucket/planet) while the env file's lake stays live for the updater and API.
 # CONSUME=1 (default) deletes raw buckets as the build uses them, lowering peak disk, but a build
 # that fails part-way then needs the extract again (rm $DATA/state/extract.done). With room to
 # spare, CONSUME=0 makes the build stage re-runnable on its own.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
+lake_arg=${LAKE:-}
 set -a; . /etc/sunchaser.env; set +a
+LAKE=${lake_arg:-${LAKE:-}}
 DATA=${DATA:-/data}
-PLANET_URL=${PLANET_URL:-https://osm-planet-eu-central-1.s3.dualstack.eu-central-1.amazonaws.com/planet-full-history/pbf/2026/history-261019.osm.pbf}
+PLANET_URL=${PLANET_URL:-https://osm-planet-eu-central-1.s3.dualstack.eu-central-1.amazonaws.com/planet-full-history/pbf/2026/history-261026.osm.pbf}
 THREADS=${THREADS:-8}
 BUCKET_BITS=${BUCKET_BITS:-12}
 GROUP_ROWS=${GROUP_ROWS:-100000000}

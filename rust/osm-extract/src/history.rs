@@ -256,6 +256,51 @@ impl<const N: usize> Timeline<N> {
             }
         }
     }
+
+    fn is_disk(&self) -> bool {
+        matches!(self, Timeline::Disk { .. })
+    }
+
+    /// The timelines of `ids` as a small in-RAM timeline. The ids are read in sorted order by many
+    /// threads: a dense index that does not fit in the page cache is otherwise read at random, one
+    /// page fault per lookup, and each page is now touched once per batch instead. Measured on
+    /// Germany in a 30 GB cgroup (index 102 GB): the ways phase went 3x faster, still far below the
+    /// cached rate, so the planet extract is expected to be bound by this.
+    fn gather(&self, mut ids: Vec<i64>) -> Timeline<N> {
+        ids.par_sort_unstable();
+        ids.dedup();
+        let parts: Vec<(Vec<i64>, Vec<u64>, Vec<[u8; N]>)> = io_pool().install(|| {
+            ids.par_chunks(1024)
+                .map(|c| {
+                    let (mut found, mut offs, mut recs) = (Vec::new(), vec![0u64], Vec::new());
+                    for &id in c {
+                        let r = self.get(id);
+                        if !r.is_empty() {
+                            found.push(id);
+                            recs.extend_from_slice(r);
+                            offs.push(recs.len() as u64);
+                        }
+                    }
+                    (found, offs, recs)
+                })
+                .collect()
+        });
+        let (mut all_ids, mut all_offs, mut all_recs) = (Vec::new(), vec![0u64], Vec::new());
+        for (found, offs, recs) in parts {
+            let base = all_recs.len() as u64;
+            all_ids.extend(found);
+            all_offs.extend(offs[1..].iter().map(|o| o + base));
+            all_recs.extend(recs);
+        }
+        Timeline::Ram { ids: all_ids, offs: all_offs, recs: all_recs }
+    }
+}
+
+/// Many more threads than cores for `gather`: they mostly wait on page faults, and a deep queue is
+/// what an NVMe drive needs.
+fn io_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| rayon::ThreadPoolBuilder::new().num_threads(64).build().expect("io thread pool"))
 }
 
 fn rec_time<const N: usize>(r: &[u8; N]) -> i64 {
@@ -836,6 +881,28 @@ impl Pipeline {
                 self.phase = self.phase.next();
             }
             let (nodes, ways) = (&self.nodes, &self.ways);
+            // dense index: copy what this batch looks up into RAM first, in sorted order
+            let (mut want_n, mut want_w) = (Vec::new(), Vec::new());
+            if nodes.is_disk() {
+                for v in gs.iter().flatten() {
+                    match &v.body {
+                        Body::Way(refs) => want_n.extend_from_slice(refs),
+                        Body::Rel(ms) => {
+                            for (mk, r, _) in ms {
+                                match mk {
+                                    Kind::Nodes => want_n.push(*r),
+                                    Kind::Ways => want_w.push(*r),
+                                    Kind::Relations => {}
+                                }
+                            }
+                        }
+                        Body::Node(..) => {}
+                    }
+                }
+            }
+            let local_n = (!want_n.is_empty()).then(|| nodes.gather(want_n));
+            let local_w = (!want_w.is_empty()).then(|| ways.gather(want_w));
+            let (nodes, ways) = (local_n.as_ref().unwrap_or(nodes), local_w.as_ref().unwrap_or(ways));
             let outs: Vec<Out> = match kind {
                 Kind::Nodes => gs.into_par_iter().map(node_group).collect(),
                 Kind::Ways => gs.into_par_iter().map(|g| way_group(g, nodes)).collect(),
