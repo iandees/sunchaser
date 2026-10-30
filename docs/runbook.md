@@ -217,7 +217,7 @@ uv run python src/build_lake.py --raw /data/raw --lake /data/build --catalog /da
 - **Progress:** each table's line ends with the process's peak memory so far, and a table sorted in many groups prints a line at most every 30 s (`lake.X: group 12/40 done`).
 - **`--memory-limit`:** DuckDB's cap (default 80% of RAM; RSS ran about 10% above it). The script sets `MEMORY_LIMIT=70GB`.
 - **`--group-rows`:** how many rows each sort holds. It did not change Germany's peak memory; the limit does.
-- **`--lance`:** optional. It adds 490-550 GB in R2 for queries 1.54× faster in the Berlin spike (local S3 stand-in at 30 ms per request; the R2 figure is being measured). Storage ratios: `docs/architecture.md`, Measurements.
+- **`--lance`:** optional. It adds 490-550 GB in R2 for queries 1.32× faster (geometric mean) on real R2 with Minnesota, 1.54× in the Berlin spike on a local stand-in; the gain is on id-driven queries (recursion, global tags, `around`), and plain bbox scans gain nothing. Storage ratios: `docs/architecture.md`, Measurements.
 
 Then the areas, and the publish:
 

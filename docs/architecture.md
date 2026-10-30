@@ -170,7 +170,7 @@ Lance wins id lookups by 1.4-3.6×, from higher request concurrency and a single
 
 ### Lance in the live path
 
-Berlin, local S3 stand-in at 30 ms per request; the figure on real R2 is being measured. Engine as deployed (Lance for id-driven fetches, including the `out` element fetch; `out meta` still reads DuckLake). Lake updated by scheduled jobs through 24 diffs plus a compaction. The 69 current-data queries of the differential corpus, alternating Lance and no Lance twice, fresh process each, best of 2.
+Berlin, local S3 stand-in at 30 ms per request (the real-R2 figure follows the table). Engine as deployed (Lance for id-driven fetches, including the `out` element fetch; `out meta` still reads DuckLake). Lake updated by scheduled jobs through 24 diffs plus a compaction. The 69 current-data queries of the differential corpus, alternating Lance and no Lance twice, fresh process each, best of 2.
 
 | | No Lance | Lance |
 |---|---|---|
@@ -182,6 +182,17 @@ Berlin, local S3 stand-in at 30 ms per request; the figure on real R2 is being m
 | Bytes read per run | 0.53 GB | 1.24 GB |
 
 Wins reach 3.5× (`regex_value_icase` 0.87 to 0.25 s). On R2 the extra requests cost about $0.03 per thousand queries at $0.36 per million reads. Lance writing took 17 s on top of a 35 s build (+50%).
+
+**On real R2** (Minnesota lake, Hetzner box in Helsinki, 2026-10-30): 22 Minneapolis queries of the same classes, two API processes on the same catalog snapshot (one with `SUNCHASER_LANCE=off`), three rounds alternating which went first, the live updater running throughout. Outputs identical on every query.
+
+| | No Lance | Lance |
+|---|---|---|
+| Sum of 22 queries, warm (best of rounds 2-3) | 191.7 s | 137.7 s |
+| Median query, warm | 5.48 s | 4.37 s |
+| Geometric-mean speedup, warm / cold (round 1) | 1.00× | 1.32× / 1.10× |
+| Faster by more than 1.2× / slower by more than 1.2× | – | 12 / 1 (`cafes_core`: bbox + `out meta`, 0.74×) |
+
+The wins are where the Berlin spike put them: global tag queries 1.7-2.3×, `named_sets` 2.2×, `around` 2.1×, a 184 k-way id fetch 1.9×, Turbo-style queries about 1.45×. Plain bbox scans with `out meta` are even or slower. Query times on R2 are also several times longer than the stand-in's: the stand-in's 30 ms per request understated real latency from this box, so the absolute numbers in the table above do not transfer.
 
 **Lance storage ratio.** The ratio depends on what it is divided by:
 
