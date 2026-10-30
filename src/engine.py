@@ -2,12 +2,9 @@
 
 Every Overpass set is a temp table (type VARCHAR 'n'|'w'|'r', id BIGINT). Statements mirror
 src/overpass_api/statements/*: query (with bbox / tag / id filters), recurse (>, >>, <, <<),
-union, difference. Two backends:
-
-  mode="lake": DuckLake tables built by build_lake.py; plans use the Overpass-style keys
-               (qt / qt_key31 ranges, tag_postings, elem_locator) to prune row groups.
-  mode="raw":  the unkeyed Parquet from extract.py, evaluated by brute-force scans. Used as the
-               reference oracle for the lake plans.
+union, difference. The backend is the DuckLake tables built by build_lake.py; plans use the
+Overpass-style keys (qt / qt_key31 ranges, tag_postings, elem_locator) to prune row groups. The
+oracle for correctness is a reference Overpass (tools/compare_overpass.py), not a second backend.
 """
 import itertools
 import math
@@ -117,7 +114,7 @@ AREA_WAY_OFFSET = 2400000000
 
 @dataclass
 class Plan:
-    """Knobs for the lake backend (ignored in raw mode)."""
+    """Knobs for the lake backend."""
     qt_ranges: bool = True        # add Overpass calc_ranges / calc_parents predicates
     use_postings: bool = True     # use tag_postings for tag-only queries
     locator: bool = True          # route id fetches through elem_locator -> qt ranges
@@ -131,12 +128,14 @@ class Plan:
 class Engine:
     _ids = itertools.count()
 
-    def __init__(self, con, mode="lake", raw_dir="data/raw", plan=None, lance=None, init_macros=True):
+    def __init__(self, con, mode="lake", plan=None, lance=None, init_macros=True):
         """lance: optional callable name -> lance.LanceDataset; routes node/way scans to Lance.
-        init_macros=False when the macros were created once on the shared database (server)."""
+        init_macros=False when the macros were created once on the shared database (server).
+        mode: only "lake" exists; the argument is kept for callers that still pass it."""
+        if mode != "lake":
+            raise ValueError(f"unknown mode {mode!r}")
         self.con = con
         self.lance = lance
-        self.mode = mode
         self.plan = plan or Plan()
         self._locator_memo = {}
         if init_macros:
@@ -145,17 +144,7 @@ class Engine:
             con.sql("LOAD spatial")
         except duckdb.Error:
             pass
-        if mode == "raw":
-            con.sql(f"""
-              CREATE OR REPLACE TEMP VIEW nodes AS SELECT * FROM '{raw_dir}/nodes.parquet';
-              CREATE OR REPLACE TEMP VIEW ways AS
-                SELECT *, list_min(nd_lat) min_lat, list_max(nd_lat) max_lat,
-                          list_min(nd_lon) min_lon, list_max(nd_lon) max_lon
-                FROM '{raw_dir}/ways.parquet';
-              CREATE OR REPLACE TEMP VIEW relations AS SELECT * FROM '{raw_dir}/relations.parquet';""")
-            self.t = {k: v for k, v in TABLE.items()}
-        else:
-            self.t = {k: f"lake.{v}" for k, v in TABLE.items()}
+        self.t = {k: f"lake.{v}" for k, v in TABLE.items()}
 
     # ---- attic ([date:...]) ----------------------------------------------------
 
@@ -164,7 +153,7 @@ class Engine:
     @property
     def indexed(self):
         """Present-only indexes (tag postings, locator, reverse member indexes) are usable."""
-        return self.mode == "lake" and self.date is None
+        return self.date is None
 
     def _date_lit(self):
         return f"TIMESTAMPTZ '{self.date}'"
@@ -172,8 +161,6 @@ class Engine:
     def set_date(self, ts):
         """Answer as of ts: current rows valid then plus history rows covering it (Overpass's attic
         semantics: an element without history exists from its version timestamp on)."""
-        if self.mode != "lake":
-            raise ValueError("[date:] needs a lake")
         self.date = ts
         d = self._date_lit()
         cols = {"n": "qt, id, lat, lon, tags",
@@ -182,8 +169,6 @@ class Engine:
         for t, name in (("n", "nodes"), ("w", "ways"), ("r", "relations")):
             self.t[t] = (f"(SELECT {cols[t]} FROM lake.{name} WHERE valid_from <= {d} UNION ALL "
                          f"SELECT {cols[t]} FROM lake.{name}_history WHERE valid_from <= {d} AND valid_to > {d})")
-        self.plan.use_postings = False
-        self.plan.locator = False
         self.lance = None
 
     def newer_ids(self, t, ts):
@@ -197,11 +182,6 @@ class Engine:
         upper = f" AND ts <= TIMESTAMPTZ '{t2}'" if t2 else ""
         return self._materialize_ids(
             f"SELECT DISTINCT id FROM lake.changes WHERE type = '{t}' AND ts > TIMESTAMPTZ '{t1}'{upper}")
-
-    def history_start(self):
-        """Earliest time attic queries can answer for (the lake's build snapshot)."""
-        rows = self._sql("SELECT min(ts) FROM lake.changes").fetchall()
-        return rows[0][0]
 
     # ---- set plumbing ------------------------------------------------------
 
@@ -268,9 +248,7 @@ class Engine:
             return "false"
         name = self._ids_table(ids)
         pred = f"{col} IN (SELECT id FROM {name})"
-        if self.mode == "lake":
-            pred = f"{self._ranges_sql(col, self._value_ranges(ids))} AND {pred}"
-        return pred
+        return f"{self._ranges_sql(col, self._value_ranges(ids))} AND {pred}"
 
     def id_set(self, t, ids):
         """A set table holding the given ids of type t."""
@@ -334,36 +312,28 @@ class Engine:
         if self._lance_route(t):
             return [f"id IN ({','.join(map(str, ids))})"], []  # Lance BTree lookup
         push, local = [], [self._id_pred("id", ids)]
-        if self.mode == "lake" and self.plan.locator:
+        if self.indexed:
             push.append(self._locator_pred(t, ids))
         return push, local
 
     # ---- query statement -----------------------------------------------------
 
-    def query(self, types, bbox=None, filters=(), ids=None, within=None):
-        """`node|way|rel|nwr [filters] (bbox) (id:...) (.within)` -> set."""
-        parts = [self._query_one(t, bbox, list(filters), ids, within) for t in types]
-        return self._new(" UNION ALL ".join(parts))
-
     # Filters that can only match elements carrying at least one tag.
     NEEDS_TAG = {"=", "exists", "~", "k~v"}
 
-    def _query_one(self, t, bbox, filters, ids, within):
+    def _query_one(self, t, bbox, filters, ids):
         if t == "a":
-            return self._query_areas(bbox, filters, ids, within)
+            return self._query_areas(bbox, filters, ids)
         tbl = self.t[t]
         if t == "n" and self.indexed and any(f.op in self.NEEDS_TAG for f in filters):
             tbl = "lake.nodes_tagged"
         push, local = [], [f.sql() for f in filters]
         cols = ["id", "tags"]
-        for w in ([within] if isinstance(within, str) else (within or [])):
-            local.append(f"id IN (SELECT id FROM {w} WHERE type = '{t}')")
         if ids is not None:
             p, l = self._id_parts(t, sorted(set(ids))) if bbox is None else ([], [self._id_pred("id", sorted(set(ids)))])
             push += p
             local += l
-        lake_postings = self.mode == "lake" and self.plan.use_postings and ids is None and not within
-        drive = next((f for f in filters if f.postings_sql()), None) if lake_postings else None
+        drive = next((f for f in filters if f.postings_sql()), None) if self.indexed and ids is None else None
         if bbox is not None:
             if t == "r":
                 push += self._rel_overlap(bbox)
@@ -391,12 +361,10 @@ class Engine:
 
     # ---- areas (statements/area_query.cc, map_to_area.cc, coord_query.cc, pivot.cc) ----
 
-    def _query_areas(self, bbox, filters, ids, within):
+    def _query_areas(self, bbox, filters, ids):
         if self.date is not None:
             raise ValueError("areas are not available for [date:] queries")
         where = [f.sql() for f in filters]
-        for w in ([within] if isinstance(within, str) else (within or [])):
-            where.append(f"id IN (SELECT id FROM {w} WHERE type = 'a')")
         if ids is not None:
             where.append(f"id IN ({','.join(map(str, ids)) or 'NULL'})")
         # a bbox does not constrain areas: Bbox_Constraint has no area path ("TODO: filter areas"),
@@ -426,7 +394,7 @@ class Engine:
                     continue
             name = f"area{next(self._ids)}"
             self.con.execute(f"CREATE OR REPLACE TEMP TABLE {name} AS SELECT ST_GeomFromWKB(?::BLOB) AS g", [wkb])
-            cand = self._new(self._query_one(t, box, list(filters), None, None))
+            cand = self._new(self._query_one(t, box, list(filters), None))
             found |= self._in_area(t, cand, name)
         return sorted(found)
 
@@ -442,7 +410,7 @@ class Engine:
             box = Bbox(max(box.s, bbox.s), max(box.w, bbox.w), min(box.n, bbox.n), min(box.e, bbox.e))
             if box.s > box.n or box.w > box.e:
                 return []
-        cand = self._new(self._query_one(t, box, list(filters), None, None))
+        cand = self._new(self._query_one(t, box, list(filters), None))
         return sorted(self._in_area(t, cand, name, add_border=True))
 
     def _in_area(self, t, cand, area_tbl, add_border=None):
@@ -527,21 +495,16 @@ class Engine:
         s7, w7, n7, e7 = b.ints()
         if t == "n":
             push = [f"lat BETWEEN {s7} AND {n7} AND lon BETWEEN {w7} AND {e7}"]
-            if self.mode == "lake" and self.plan.qt_ranges:
-                push.append(self._ranges_sql("qt", qt.calc_ranges(b.s, b.n, b.w, b.e)))
+            push.append(self._ranges_sql("qt", qt.calc_ranges(b.s, b.n, b.w, b.e)))
             return push, []
         push = [f"max_lat >= {s7} AND min_lat <= {n7} AND max_lon >= {w7} AND min_lon <= {e7}"]
-        if self.mode == "lake" and self.plan.qt_ranges:
-            push.append(self._ranges_sql("qt_key31", qt.calc_parents(qt.calc_ranges(b.s, b.n, b.w, b.e))))
+        push.append(self._ranges_sql("qt_key31", qt.calc_parents(qt.calc_ranges(b.s, b.n, b.w, b.e))))
         return push, [f"ov_way_in_bbox(nd_lat, nd_lon, {b.s}, {b.n}, {b.w}, {b.e})"]
 
     def _rel_overlap(self, b):
         s7, w7, n7, e7 = b.ints()
-        if self.mode == "raw":
-            return []  # brute force: no precomputed relation bbox in the raw data
         push = [f"max_lat >= {s7} AND min_lat <= {n7} AND max_lon >= {w7} AND min_lon <= {e7}"]
-        if self.plan.qt_ranges:
-            push.append(self._ranges_sql("qt_key31", qt.calc_parents(qt.calc_ranges(b.s, b.n, b.w, b.e))))
+        push.append(self._ranges_sql("qt_key31", qt.calc_parents(qt.calc_ranges(b.s, b.n, b.w, b.e))))
         return push
 
     def _rels_with_member_in(self, cand, b):
@@ -567,8 +530,7 @@ class Engine:
                 "n", push + [f"lat BETWEEN {s7} AND {n7} AND lon BETWEEN {w7} AND {e7}"], local, select="id")))
         if way_ids:
             push, local = self._id_parts("w", way_ids)
-            if self.mode == "lake":
-                push.append(f"max_lat >= {s7} AND min_lat <= {n7} AND max_lon >= {w7} AND min_lon <= {e7}")
+            push.append(f"max_lat >= {s7} AND min_lat <= {n7} AND max_lon >= {w7} AND min_lon <= {e7}")
             hit_w = set(self._materialize_ids(self._scan(
                 "w", push, local + [f"ov_way_in_bbox(nd_lat, nd_lon, {b.s}, {b.n}, {b.w}, {b.e})"],
                 cols=("id", "nd_lat", "nd_lon", "min_lat", "max_lat", "min_lon", "max_lon"), select="id")))
@@ -646,11 +608,8 @@ class Engine:
         ids = sorted(set(ids))
         if self.date is not None:
             return self._meta_attic(t, ids)
-        tbl = self.META_TABLE[t] if self.mode == "lake" else self.t[t]
-        where = self._id_pred("id", ids)
-        if self.mode == "lake":
-            where += " AND " + self._locator_pred(t, ids, col="k")
-            tbl = f"lake.{tbl}"
+        tbl = f"lake.{self.META_TABLE[t]}"
+        where = self._id_pred("id", ids) + " AND " + self._locator_pred(t, ids, col="k")
         rows = self._sql(f'SELECT id, version, ts, changeset, uid, "user" FROM {tbl} WHERE {where}').fetchall()
         return {r[0]: r[1:] for r in rows}
 
@@ -676,7 +635,7 @@ class Engine:
     # ---- recurse statement ---------------------------------------------------
 
     def _fetch_where(self, t, ids):
-        """DuckDB-only id predicate (used for relations and in raw mode)."""
+        """DuckDB-only id predicate (used for relations)."""
         push, local = self._id_parts(t, ids)
         return " AND ".join(push + local)
 
@@ -735,7 +694,7 @@ class Engine:
                 box = Bbox(max(box.s, bbox.s), max(box.w, bbox.w), min(box.n, bbox.n), min(box.e, bbox.e))
                 if box.s > box.n or box.w > box.e:
                     continue
-            cand = self._new(self._query_one(t, box, list(filters), None, None))
+            cand = self._new(self._query_one(t, box, list(filters), None))
             found |= self._within_distance(t, cand, cell_pts, radius)
         return sorted(found)
 

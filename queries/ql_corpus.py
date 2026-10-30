@@ -6,7 +6,7 @@ and statements the engine corpus does not cover.
 """
 from corpus import CORPUS, CITY, KREUZBERG, MITTE, TINY, b
 
-QL = [(f"meta:{name}", f"[out:json];{ql} out meta;") for name, ql, _ in CORPUS]
+QL = [(f"meta:{name}", f"[out:json];{ql} out meta;") for name, ql in CORPUS]
 
 QL += [
     ("turbo_default",

@@ -739,7 +739,7 @@ class Executor:
                 raise QLError(f"line {q.line}: static error: a query needs at least one condition.")
             if bbox is None and ids is None and not q.filters and q.ifs:
                 raise QLError(f"line {q.line}: static error: (if:) needs another condition in the same query.")
-            part = e._query_one(t, bbox, list(q.filters), None if ids is None else sorted(ids), None)
+            part = e._query_one(t, bbox, list(q.filters), None if ids is None else sorted(ids))
             if q.ifs:
                 part = self._apply_ifs(t, e._new(part), q.ifs)
             parts.append(part)
