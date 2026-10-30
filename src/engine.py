@@ -206,6 +206,7 @@ class Engine:
     # ---- set plumbing ------------------------------------------------------
 
     trace = None  # optional callable(label, fn) used by the profiler
+    budget = None  # optional readbudget.ReadBudget: charged for every DuckLake element scan before it runs
 
     def _sql(self, sql):
         if self.trace is None:
@@ -295,7 +296,10 @@ class Engine:
             name = self._lance_fetch(tbl, push, cols)
             return f"SELECT {select} FROM {name}" + (" WHERE " + " AND ".join(local) if local else "")
         preds = list(push) + list(local)
-        return f"SELECT {select} FROM {tbl} WHERE " + (" AND ".join(preds) if preds else "true")
+        sql = f"SELECT {select} FROM {tbl} WHERE " + (" AND ".join(preds) if preds else "true")
+        if self.budget is not None:
+            self.budget.charge(tbl, push, sql)  # raises readbudget.ReadBudgetExceeded before the scan runs
+        return sql
 
     LANCE_ID = "id IN ("  # prefix of the literal id-list predicates produced for Lance
 
