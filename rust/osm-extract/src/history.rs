@@ -14,7 +14,6 @@
 //! Timelines (node positions, way keys/bboxes over time) are kept in RAM or, with --dense-index,
 //! in files indexed by id.
 
-use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -35,6 +34,7 @@ use rayon::prelude::*;
 
 use crate::Args;
 use crate::quadtile;
+use crate::relstate::{Contrib, RelState};
 use crate::tables::{
     Buckets, Kind, Layout, MISSING_BBOX, NO_COORD, extend_bbox, locator_batch, locator_schema, map_names,
     member_struct_fields, parents_schema, props, schema,
@@ -58,12 +58,12 @@ struct Meta {
 enum Body {
     Node(i32, i32),
     Way(Vec<i64>),
-    Rel(Vec<(u8, i64, String)>), // (b'n' | b'w' | b'r', ref, role)
+    Rel(Vec<(Kind, i64, String)>), // (member kind, ref, role)
 }
 
 #[derive(Clone)]
 struct Version {
-    kind: u8, // 0 node, 1 way, 2 relation (PBF order)
+    kind: Kind,
     id: i64,
     meta: Meta,
     tags: Vec<(String, String)>,
@@ -86,12 +86,12 @@ fn dense_version(n: &osmpbf::DenseNode) -> Version {
         },
         None => Meta { version: 0, secs: 0, changeset: 0, uid: 0, user: String::new(), visible: true },
     };
-    Version { kind: 0, id: n.id(), tags: tags_of(n.tags()), body: Body::Node(n.decimicro_lat(), n.decimicro_lon()), meta }
+    Version { kind: Kind::Nodes, id: n.id(), tags: tags_of(n.tags()), body: Body::Node(n.decimicro_lat(), n.decimicro_lon()), meta }
 }
 
 fn node_version(n: &osmpbf::Node) -> Version {
     Version {
-        kind: 0,
+        kind: Kind::Nodes,
         id: n.id(),
         meta: info_meta(&n.info()),
         tags: tags_of(n.tags()),
@@ -100,7 +100,7 @@ fn node_version(n: &osmpbf::Node) -> Version {
 }
 
 fn way_version(w: &osmpbf::Way) -> Version {
-    Version { kind: 1, id: w.id(), meta: info_meta(&w.info()), tags: tags_of(w.tags()), body: Body::Way(w.refs().collect()) }
+    Version { kind: Kind::Ways, id: w.id(), meta: info_meta(&w.info()), tags: tags_of(w.tags()), body: Body::Way(w.refs().collect()) }
 }
 
 fn rel_version(r: &osmpbf::Relation) -> Version {
@@ -108,14 +108,14 @@ fn rel_version(r: &osmpbf::Relation) -> Version {
         .members()
         .map(|m| {
             let t = match m.member_type {
-                RelMemberType::Node => b'n',
-                RelMemberType::Way => b'w',
-                RelMemberType::Relation => b'r',
+                RelMemberType::Node => Kind::Nodes,
+                RelMemberType::Way => Kind::Ways,
+                RelMemberType::Relation => Kind::Relations,
             };
             (t, m.member_id, m.role().unwrap_or("").to_string())
         })
         .collect();
-    Version { kind: 2, id: r.id(), meta: info_meta(&r.info()), tags: tags_of(r.tags()), body: Body::Rel(members) }
+    Version { kind: Kind::Relations, id: r.id(), meta: info_meta(&r.info()), tags: tags_of(r.tags()), body: Body::Rel(members) }
 }
 
 fn decode(block: &PrimitiveBlock) -> Vec<Version> {
@@ -316,20 +316,27 @@ struct Row {
     coords: Vec<(i32, i32)>, // ways
 }
 
+#[derive(Clone)]
 struct Change {
     ts: i64,
-    kind: u8,
+    kind: Kind,
     id: i64,
     old: Option<i32>,
     new: Option<i32>,
     action: &'static str,
 }
 
+/// One element's position/geometry timeline, to be pushed into the matching `Timeline`.
+enum Track {
+    Node(Vec<[u8; 16]>),
+    Way(Vec<[u8; 32]>),
+}
+
 #[derive(Default)]
 struct Out {
     rows: Vec<Row>,
     changes: Vec<Change>,
-    timeline: Vec<(i64, Vec<[u8; 32]>)>, // node records are 16 bytes: stored in the first half
+    timeline: Option<(i64, Track)>,
     parents: Vec<(i64, i64)>,
 }
 
@@ -355,22 +362,18 @@ fn node_group(vs: Vec<Version>) -> Out {
             Some((la, lo))
         } else {
             if prev.is_some() {
-                out.changes.push(Change { ts: t, kind: 0, id: v.id, old: prev, new: None, action: "delete" });
+                out.changes.push(Change { ts: t, kind: Kind::Nodes, id: v.id, old: prev, new: None, action: "delete" });
             }
             prev = None;
             None
         };
         if pos != prev_pos {
             let (la, lo) = pos.unwrap_or((NO_COORD, NO_COORD));
-            let mut r = [0u8; 32];
-            r[..16].copy_from_slice(&npos(t, la, lo));
-            tl.push(r);
+            tl.push(npos(t, la, lo));
         }
         prev_pos = pos;
     }
-    if let Some(v) = vs.first() {
-        out.timeline.push((v.id, tl));
-    }
+    out.timeline = vs.first().map(|v| (v.id, Track::Node(tl)));
     out
 }
 
@@ -401,7 +404,7 @@ fn way_group(vs: Vec<Version>, nodes: &Timeline<16>) -> Out {
         let end = vs.get(k + 1).map(|n| n.meta.secs);
         if !v.meta.visible {
             if prev.is_some() {
-                out.changes.push(Change { ts: t, kind: 1, id: v.id, old: prev, new: None, action: "delete" });
+                out.changes.push(Change { ts: t, kind: Kind::Ways, id: v.id, old: prev, new: None, action: "delete" });
                 tl.push(wrec(t, false, 0, MISSING_BBOX));
             }
             prev = None;
@@ -433,7 +436,7 @@ fn way_group(vs: Vec<Version>, nodes: &Timeline<16>) -> Out {
             if i == 0 {
                 version_change(&mut out, v, prev);
             } else {
-                out.changes.push(Change { ts: *s, kind: 1, id: v.id, old: Some(v.meta.version), new: Some(v.meta.version), action: "geometry" });
+                out.changes.push(Change { ts: *s, kind: Kind::Ways, id: v.id, old: Some(v.meta.version), new: Some(v.meta.version), action: "geometry" });
             }
             let (qt, b) = way_key(c);
             if prev_coords.as_ref() != Some(c) {
@@ -451,96 +454,18 @@ fn way_group(vs: Vec<Version>, nodes: &Timeline<16>) -> Out {
             out.parents.extend(rs.into_iter().map(|n| (n, v.id)));
         }
     }
-    if let Some(v) = vs.first() {
-        out.timeline.push((v.id, tl));
-    }
+    out.timeline = vs.first().map(|v| (v.id, Track::Way(tl)));
     out
 }
 
-/// A relation's key and bbox under member changes, in O(log n) per change instead of recomputing
-/// over all members (big boundaries have thousands of members and thousands of member moves).
-#[derive(Default)]
-struct RelState {
-    idx: BTreeMap<u32, u32>,     // distinct member indexes (with multiplicity)
-    comp: [BTreeMap<u32, u32>; 4], // their calc_index components: lat_min, lon_min, lat_max, lon_max
-    global: u32,                 // members with the planet-wide index 0x80000080
-    bb: [BTreeMap<i32, u32>; 4], // member bboxes: min_lat, max_lat, min_lon, max_lon
-}
-
-type Contrib = (Option<u32>, Option<[i32; 4]>);
-
-fn bump<K: Ord + Copy>(m: &mut BTreeMap<K, u32>, k: K, add: bool) {
-    if add {
-        *m.entry(k).or_insert(0) += 1;
-    } else if let Some(c) = m.get_mut(&k) {
-        *c -= 1;
-        if *c == 0 {
-            m.remove(&k);
-        }
-    }
-}
-
-impl RelState {
-    fn apply(&mut self, c: &Contrib, add: bool) {
-        if let Some(i) = c.0 {
-            let before = self.idx.get(&i).copied().unwrap_or(0);
-            bump(&mut self.idx, i, add);
-            let after = self.idx.get(&i).copied().unwrap_or(0);
-            if (before == 0) != (after == 0) {
-                // the distinct set changed: add or remove this index's components
-                match quadtile::components(i) {
-                    Some((a, b, c2, d)) => {
-                        for (m, k) in self.comp.iter_mut().zip([a, b, c2, d]) {
-                            bump(m, k, after > 0);
-                        }
-                    }
-                    None => {
-                        if after > 0 { self.global += 1 } else { self.global -= 1 }
-                    }
-                }
-            }
-        }
-        if let Some(b) = c.1 {
-            for (m, k) in self.bb.iter_mut().zip(b) {
-                bump(m, k, add);
-            }
-        }
-    }
-
-    fn key(&self) -> (u32, [i32; 4]) {
-        let qt = match self.idx.keys().next() {
-            None => 0xFE,
-            Some(_) if self.global > 0 => 0x8000_0080,
-            Some(&first) => quadtile::calc_index_from(
-                first,
-                *self.comp[0].keys().next().unwrap(),
-                *self.comp[1].keys().next().unwrap(),
-                *self.comp[2].keys().next_back().unwrap(),
-                *self.comp[3].keys().next_back().unwrap(),
-            ),
-        };
-        let bbox = if self.bb[0].is_empty() {
-            MISSING_BBOX
-        } else {
-            [
-                *self.bb[0].keys().next().unwrap(),
-                *self.bb[1].keys().next_back().unwrap(),
-                *self.bb[2].keys().next().unwrap(),
-                *self.bb[3].keys().next_back().unwrap(),
-            ]
-        };
-        (qt, bbox)
-    }
-}
-
 /// What a member contributes at time t: its index and bbox (None while it doesn't exist).
-fn contrib(mt: u8, r: i64, nodes: &Timeline<16>, ways: &Timeline<32>, t: i64) -> Contrib {
+fn contrib(mt: Kind, r: i64, nodes: &Timeline<16>, ways: &Timeline<32>, t: i64) -> Contrib {
     match mt {
-        b'n' => match at(nodes.get(r), t).and_then(npos_dec) {
+        Kind::Nodes => match at(nodes.get(r), t).and_then(npos_dec) {
             Some((la, lo)) => (Some(quadtile::node_index(la, lo)), Some([la, la, lo, lo])),
             None => (None, None),
         },
-        b'w' => match at(ways.get(r), t).and_then(wrec_dec) {
+        Kind::Ways => match at(ways.get(r), t).and_then(wrec_dec) {
             Some((q, wb)) => (Some(q), if wb[0] != i32::MAX { Some(wb) } else { None }),
             None => (None, None),
         },
@@ -557,7 +482,7 @@ fn rel_group(vs: Vec<Version>, nodes: &Timeline<16>, ways: &Timeline<32>) -> Out
         let end = vs.get(k + 1).map(|n| n.meta.secs);
         if !v.meta.visible {
             if prev.is_some() {
-                out.changes.push(Change { ts: t, kind: 2, id: v.id, old: prev, new: None, action: "delete" });
+                out.changes.push(Change { ts: t, kind: Kind::Relations, id: v.id, old: prev, new: None, action: "delete" });
             }
             prev = None;
             continue;
@@ -572,8 +497,8 @@ fn rel_group(vs: Vec<Version>, nodes: &Timeline<16>, ways: &Timeline<32>) -> Out
             state.apply(&c, true);
             cur.push(c);
             let times: Box<dyn Iterator<Item = i64>> = match mt {
-                b'n' => Box::new(nodes.get(*r).iter().map(rec_time)),
-                b'w' => Box::new(ways.get(*r).iter().map(rec_time)),
+                Kind::Nodes => Box::new(nodes.get(*r).iter().map(rec_time)),
+                Kind::Ways => Box::new(ways.get(*r).iter().map(rec_time)),
                 _ => Box::new(std::iter::empty()),
             };
             events.extend(times.filter(|&x| x > t && end.is_none_or(|e| x < e)).map(|x| (x, i)));
@@ -595,7 +520,7 @@ fn rel_group(vs: Vec<Version>, nodes: &Timeline<16>, ways: &Timeline<32>) -> Out
                 e += 1;
             }
             // every member move is a change of the relation (updater cascade / Overpass)...
-            out.changes.push(Change { ts: s, kind: 2, id: v.id, old: Some(v.meta.version), new: Some(v.meta.version), action: "geometry" });
+            out.changes.push(Change { ts: s, kind: Kind::Relations, id: v.id, old: Some(v.meta.version), new: Some(v.meta.version), action: "geometry" });
             // ...but a new row only when what the row stores changes
             let (qt, b) = state.key();
             if starts.last().is_some_and(|l| (l.1, l.2) != (qt, b)) {
@@ -672,11 +597,7 @@ fn batch(kind: Kind, rows: &[&Row], history: bool) -> Result<RecordBatch> {
             Body::Rel(ms) => {
                 let mb = members.values();
                 for (t, rf, role) in ms {
-                    mb.field_builder::<StringBuilder>(0).unwrap().append_value(match t {
-                        b'n' => "n",
-                        b'w' => "w",
-                        _ => "r",
-                    });
+                    mb.field_builder::<StringBuilder>(0).unwrap().append_value(t.letter());
                     mb.field_builder::<Int64Builder>(1).unwrap().append_value(*rf);
                     mb.field_builder::<StringBuilder>(2).unwrap().append_value(role);
                     mb.append(true);
@@ -741,7 +662,7 @@ fn changes_batch(cs: &[Change]) -> Result<RecordBatch> {
     );
     for c in cs {
         ts.append_value(c.ts * 1000);
-        t.append_value(["n", "w", "r"][c.kind as usize]);
+        t.append_value(c.kind.letter());
         id.append_value(c.id);
         old.append_option(c.old);
         new.append_option(c.new);
@@ -770,36 +691,28 @@ struct Writers {
     locator: Vec<ArrowWriter<File>>,
 }
 
-fn kind_of(k: u8) -> Kind {
-    [Kind::Nodes, Kind::Ways, Kind::Relations][k as usize]
-}
-
 impl Writers {
-    fn write(&mut self, k: u8, outs: Vec<Out>, layout: Layout) -> Result<()> {
-        let kind = kind_of(k);
+    fn write(&mut self, kind: Kind, outs: Vec<Out>, layout: Layout) -> Result<()> {
+        let k = kind.index();
         let rows: Vec<&Row> = outs.iter().flat_map(|o| o.rows.iter()).collect();
         let cur: Vec<&Row> = rows.iter().copied().filter(|r| r.to.is_none()).collect();
         let hist: Vec<&Row> = rows.iter().copied().filter(|r| r.to.is_some_and(|t| t > r.from)).collect();
         let bucket = |q: u32| layout.bucket(kind, q);
         if !cur.is_empty() {
             let b = batch(kind, &cur, false)?;
-            self.locator[k as usize].write(&locator_batch(&b)?)?;
+            self.locator[k].write(&locator_batch(&b)?)?;
             let keys: Vec<usize> = cur.iter().map(|r| bucket(r.qt)).collect();
-            self.cur[k as usize].write_split(&[b], |_| keys.clone())?;
+            self.cur[k].write_split(&[b], |_| keys.clone())?;
         }
         if let Some((hw, _)) = self.hist.as_ref().filter(|_| !hist.is_empty()) {
             let keys: Vec<usize> = hist.iter().map(|r| bucket(r.qt)).collect();
-            hw[k as usize].write_split(&[batch(kind, &hist, true)?], |_| keys.clone())?;
+            hw[k].write_split(&[batch(kind, &hist, true)?], |_| keys.clone())?;
         }
-        let cs: Vec<&Change> = outs.iter().flat_map(|o| o.changes.iter()).collect();
+        let cs: Vec<Change> = outs.iter().flat_map(|o| o.changes.iter().cloned()).collect();
         if let Some((_, changes)) = self.hist.as_ref().filter(|_| !cs.is_empty()) {
-            let owned: Vec<Change> = cs
-                .iter()
-                .map(|c| Change { ts: c.ts, kind: c.kind, id: c.id, old: c.old, new: c.new, action: c.action })
-                .collect();
             // ~48-day buckets of change time, so the build sorts the log one period at a time
-            let keys: Vec<usize> = owned.iter().map(|c| ((c.ts.max(0) as u64 >> 22) as usize).min(1023)).collect();
-            changes.write_split(&[changes_batch(&owned)?], |_| keys.clone())?;
+            let keys: Vec<usize> = cs.iter().map(|c| ((c.ts.max(0) as u64 >> 22) as usize).min(1023)).collect();
+            changes.write_split(&[changes_batch(&cs)?], |_| keys.clone())?;
         }
         let parents: Vec<(i64, i64)> = outs.iter().flat_map(|o| o.parents.iter().copied()).collect();
         if !parents.is_empty() {
@@ -841,7 +754,7 @@ struct Pipeline {
     ways: Timeline<32>,
     counts: [u64; 3],
     versions: u64,
-    phase: u8,
+    phase: Kind, // the kind being processed; timelines of earlier kinds are complete
     pending: Vec<Version>,
     layout: Layout,
 }
@@ -893,7 +806,7 @@ impl Pipeline {
             ways,
             counts: [0; 3],
             versions: 0,
-            phase: 0,
+            phase: Kind::Nodes,
             pending: Vec::new(),
             layout,
         })
@@ -905,43 +818,38 @@ impl Pipeline {
         self.pending.extend(vs);
         let mut by_kind: [Vec<Vec<Version>>; 3] = [Vec::new(), Vec::new(), Vec::new()];
         for g in take_groups(&mut self.pending, last) {
-            by_kind[g[0].kind as usize].push(g);
+            by_kind[g[0].kind.index()].push(g);
         }
         // process by type in PBF order; a type's timeline is complete once the next type starts
-        for (k, gs) in by_kind.into_iter().enumerate() {
-            let k = k as u8;
+        for (kind, gs) in Kind::ALL.into_iter().zip(by_kind) {
             if gs.is_empty() {
                 continue;
             }
-            if k < self.phase {
+            if kind < self.phase {
                 bail!("PBF not sorted by type");
             }
-            while self.phase < k {
-                if self.phase == 0 {
-                    self.nodes.finish()?;
-                } else {
-                    self.ways.finish()?;
+            while self.phase < kind {
+                match self.phase {
+                    Kind::Nodes => self.nodes.finish()?,
+                    _ => self.ways.finish()?,
                 }
-                self.phase += 1;
+                self.phase = self.phase.next();
             }
             let (nodes, ways) = (&self.nodes, &self.ways);
-            let outs: Vec<Out> = match k {
-                0 => gs.into_par_iter().map(node_group).collect(),
-                1 => gs.into_par_iter().map(|g| way_group(g, nodes)).collect(),
-                _ => gs.into_par_iter().map(|g| rel_group(g, nodes, ways)).collect(),
+            let outs: Vec<Out> = match kind {
+                Kind::Nodes => gs.into_par_iter().map(node_group).collect(),
+                Kind::Ways => gs.into_par_iter().map(|g| way_group(g, nodes)).collect(),
+                Kind::Relations => gs.into_par_iter().map(|g| rel_group(g, nodes, ways)).collect(),
             };
             for o in &outs {
-                self.counts[k as usize] += o.rows.iter().filter(|r| r.to.is_none()).count() as u64;
-                for (id, recs) in &o.timeline {
-                    if k == 0 {
-                        let r16: Vec<[u8; 16]> = recs.iter().map(|r| r[..16].try_into().unwrap()).collect();
-                        self.nodes.push(*id, &r16)?;
-                    } else if k == 1 {
-                        self.ways.push(*id, recs)?;
-                    }
+                self.counts[kind.index()] += o.rows.iter().filter(|r| r.to.is_none()).count() as u64;
+                match &o.timeline {
+                    Some((id, Track::Node(recs))) => self.nodes.push(*id, recs)?,
+                    Some((id, Track::Way(recs))) => self.ways.push(*id, recs)?,
+                    None => {}
                 }
             }
-            self.w.write(k, outs, self.layout)?;
+            self.w.write(kind, outs, self.layout)?;
         }
         Ok(())
     }

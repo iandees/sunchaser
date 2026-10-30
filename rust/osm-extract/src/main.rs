@@ -31,6 +31,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod history;
 mod quadtile;
+mod relstate;
 mod tables;
 
 use std::fs::File;

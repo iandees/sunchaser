@@ -92,11 +92,30 @@ pub(crate) fn schema(kind: Kind, history: bool) -> Arc<Schema> {
     Arc::new(Schema::new(f))
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+/// Element kind, in PBF order (nodes, then ways, then relations).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub(crate) enum Kind {
     Nodes,
     Ways,
     Relations,
+}
+
+impl Kind {
+    pub(crate) const ALL: [Kind; 3] = [Kind::Nodes, Kind::Ways, Kind::Relations];
+
+    pub(crate) fn index(self) -> usize {
+        self as usize
+    }
+
+    /// The single letter used in the `type` columns ("n", "w", "r").
+    pub(crate) fn letter(self) -> &'static str {
+        ["n", "w", "r"][self as usize]
+    }
+
+    /// The following kind (Relations stays).
+    pub(crate) fn next(self) -> Kind {
+        Kind::ALL[(self.index() + 1).min(2)]
+    }
 }
 
 pub(crate) fn extend_bbox(b: &mut [i32; 4], la_min: i32, la_max: i32, lo_min: i32, lo_max: i32) {
