@@ -654,14 +654,18 @@ impl<R: Read> Read for Counting<R> {
     }
 }
 
-/// Resident and peak memory of this process, as " | rss 12.3 GB (peak 14.0)" (Linux only).
+/// Resident and peak memory of this process, as " | rss 12.3 GB (peak 14.0, anon 9.1)" (Linux only);
+/// anon is the part that is not file-backed, so the memory-mapped dense index is not in it.
 fn memory_note() -> String {
     let Ok(status) = std::fs::read_to_string("/proc/self/status") else { return String::new() };
     let kb = |key: &str| {
         status.lines().find(|l| l.starts_with(key)).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<f64>().ok())
     };
     match (kb("VmRSS:"), kb("VmHWM:")) {
-        (Some(r), Some(h)) => format!(" | rss {:.1} GB (peak {:.1})", r / 1e6, h / 1e6),
+        (Some(r), Some(h)) => {
+            let anon = kb("RssAnon:").map_or(String::new(), |a| format!(", anon {:.1}", a / 1e6));
+            format!(" | rss {:.1} GB (peak {:.1}{anon})", r / 1e6, h / 1e6)
+        }
         _ => String::new(),
     }
 }
