@@ -1,8 +1,11 @@
 """Minutely updater: applies OSM replication diffs (osmChange) to the lake.
 
-  python src/updater.py run [--region s,w,n,e] [--once]    follow replication (day -> hour -> minute catch-up)
+  python src/updater.py job --loop --catalog-url s3://bucket/lake/catalog.ducklake [--region s,w,n,e]
+                                  follow replication (hour -> minute catch-up), always on
+  python src/updater.py job --catalog-url ...                one scheduled run: catch up, upload, exit
+  python src/updater.py run [--region s,w,n,e]              job --loop on $SUNCHASER_CATALOG (a local .ducklake)
   python src/updater.py apply FILE.osc.gz ...               apply local diffs
-  python src/updater.py compact                             flush inlined data, merge files, expire snapshots
+(the catalog is an s3:// URL or a local .ducklake file; maintenance -- areas, compaction -- runs inside job)
 
 The updater is the lake's single writer (like Overpass's update_database). Each batch commits as one
 DuckLake transaction, so API readers see either the whole diff or none of it. Per batch:
@@ -42,6 +45,9 @@ MEMBER_T = pa.struct([("type", pa.string()), ("ref", pa.int64()), ("role", pa.st
 
 
 STOP = threading.Event()  # set by SIGTERM: finish the diff in hand, upload, release the lease, exit
+POLL = 30  # seconds to wait when job --loop finds nothing new
+LEASE_SLACK = 600  # the writer lease lasts --max-seconds + this
+FILE_GRACE = 3600  # seconds before unreferenced files and old snapshots are deleted
 
 
 # ---- replication feed ----------------------------------------------------------------
@@ -532,7 +538,7 @@ class Updater:
                      WHERE id IN ({changed_rels})) m""")
 
 
-def compaction_steps(grace=3600):
+def compaction_steps(grace=FILE_GRACE):
     """The compaction as (label, run(con)) steps: inlined rows -> sorted Parquet, small files merged,
     old snapshots dropped, Lance fragments merged. Files are deleted only `grace` seconds after they
     stop being referenced, so readers still on an older catalog (or a frozen copy) keep working;
@@ -558,12 +564,6 @@ def run_step(con, label, run):
         print(f"{label:<90} skipped: {str(e).splitlines()[0][:80]}", flush=True)
 
 
-def compact(con, grace=3600):
-    """All the compaction steps in a row (the CLI and the `run` mode)."""
-    for label, run in compaction_steps(grace):
-        run_step(con, label, run)
-
-
 COMPACTION = None  # job --loop: the steps still to run, one per cycle, so diffs flow between them
 
 
@@ -576,7 +576,7 @@ def compact_due(con, args, state):
     if COMPACTION is None:
         if not args.compact_every or time.time() - float(state.get("compacted_at", "0")) < args.compact_every:
             return False
-        COMPACTION = compaction_steps(args.file_grace)
+        COMPACTION = compaction_steps()
     for _ in range(1 if args.loop else len(COMPACTION)):
         label, run = COMPACTION.pop(0)
         run_step(con, label, run)
@@ -587,35 +587,10 @@ def compact_due(con, args, state):
     return True
 
 
-class Maintenance:
-    """Periodic jobs between batches: areas (like Overpass's rules loop) and compaction."""
-
-    def __init__(self, con, areas_every=3600, compact_every=3600):
-        self.con, self.jobs = con, []
-        if areas_every:
-            self.jobs.append(["areas", areas_every, time.time()])
-        if compact_every:
-            self.jobs.append(["compact", compact_every, time.time()])
-
-    def tick(self):
-        for job in self.jobs:
-            name, every, last = job
-            if time.time() - last < every:
-                continue
-            t = time.time()
-            if name == "areas":
-                import build_areas
-                build_areas.build(self.con)
-            else:
-                compact(self.con)
-            job[2] = time.time()
-            print(f"maintenance {name} {time.time() - t:.1f}s", flush=True)
-
-
-def follow(up, once=False, poll=30, kinds=("hour", "minute"), maintenance=None, until=None, deadline=None):
+def follow(up, kinds=("hour", "minute"), until=None, deadline=None):
     """Catch up with coarse diffs (hourly by default: a planet day diff is ~100 MB, too much to hold
-    in one batch), then minute diffs; then poll the minutely feed. Returns the number of diffs applied.
-    `deadline` (epoch seconds) ends a scheduled job's run between diffs."""
+    in one batch), then minute diffs, and return the number of diffs applied. `deadline` (epoch
+    seconds) ends a scheduled job's run between diffs."""
     applied = 0
     base = up.sql("SELECT value FROM lake.state WHERE key = 'osm_base'").fetchall()[0][0]
     for kind in kinds:
@@ -635,23 +610,14 @@ def follow(up, once=False, poll=30, kinds=("hour", "minute"), maintenance=None, 
             stats = up.apply([osc(kind, seq)], osm_base=ts, sequence=f"{kind}/{seq}")
             applied += 1
             print(f"{kind}/{seq} -> {ts} {stats}", flush=True)
-            if maintenance is not None:
-                maintenance.tick()
             base = ts
             seq += 1
-            if kind == "minute" and seq > cur and not once:
-                while True:
-                    cur, _ = state_of("minute")
-                    if cur >= seq or STOP.is_set():
-                        break
-                    time.sleep(poll)
-        if once and kind == "minute":
-            return applied
     return applied
 
 
 def job(args):
-    """Updater runs against a catalog on object storage (src/objcatalog.py), holding the writer lease.
+    """Updater runs against a catalog on object storage (src/objcatalog.py; a local file works too, without
+    a lease), holding the writer lease.
     One run (default): download the catalog, apply pending diffs until caught up or out of time,
     update areas, compact when due, upload it conditionally, exit; scheduled, nothing runs between
     runs. --loop: keep running and keep the catalog on local disk, uploading after each batch of
@@ -659,7 +625,7 @@ def job(args):
     import objcatalog
     import signal
     t0 = time.time()
-    ttl = args.lease_seconds or args.max_seconds + 600
+    ttl = args.max_seconds + LEASE_SLACK
     # systemd stops a service with SIGTERM: finish the diff in hand, upload, and release the lease
     # (the `finally`), so the restarted job doesn't wait out the old one's TTL
     signal.signal(signal.SIGTERM, lambda *_: STOP.set())
@@ -682,8 +648,8 @@ def _cycle(local, args, deadline):
     try:
         region = tuple(map(float, args.region.split(","))) if args.region else None
         up = Updater(con, region)
-        n = follow(up, once=True, until=args.until, deadline=deadline)
-        if n and args.areas_every:
+        n = follow(up, until=args.until, deadline=deadline)
+        if n:
             build_areas.build(con)
         state = dict(con.sql("SELECT key, value FROM lake.state").fetchall())
         compacted = compact_due(con, args, state)
@@ -693,7 +659,7 @@ def _cycle(local, args, deadline):
         con.close()
 
 
-def _commit(args, local, etag, state):
+def _commit(args, local, etag):
     """Conditional upload; returns the new ETag, or None if another writer committed first."""
     import objcatalog
     try:
@@ -701,10 +667,6 @@ def _commit(args, local, etag, state):
     except objcatalog.Conflict as e:
         print(f"job: {e}; discarding this run", flush=True)
         return None
-    if args.keep_versions:
-        prefix = args.catalog_url.rsplit("/", 1)[0] + "/catalogs"
-        objcatalog.copy(args.catalog_url, prefix + f"/{state.get('osm_base', 'unknown').replace(':', '')}.ducklake")
-        objcatalog.prune(prefix, args.keep_versions)
     return new
 
 
@@ -718,7 +680,7 @@ def _job(args, t0):
         if not changed:
             print(f"job: nothing new at {state.get('osm_base')}", flush=True)
             return 0
-        if _commit(args, local, etag, state) is None:
+        if _commit(args, local, etag) is None:
             return 2
     print(f"job: {n} diffs to {state.get('osm_base')}, committed in {time.time() - t0:.0f}s", flush=True)
     return 0
@@ -727,12 +689,11 @@ def _job(args, t0):
 def _loop(args, lease, ttl):
     """Always-on updater: the catalog stays on local disk between batches; each upload is conditional
     on the previous upload's ETag, and the lease is renewed every cycle. Uploads happen at most every
-    --upload-every seconds (at the next cycle after that, so within --poll more), and at once when
+    --upload-every seconds (at the next cycle after that, so within POLL more), and at once when
     stopping or at --until: a crash loses only the batches since the last upload, which the next start
     applies again."""
     import objcatalog
-    workdir = args.workdir or "."
-    local = os.path.join(workdir, "catalog.ducklake")
+    local = objcatalog.workfile(args.catalog_url, args.workdir or ".")
     etag = objcatalog.fetch(args.catalog_url, local)
     print(f"job --loop: catalog {args.catalog_url} -> {local}", flush=True)
     dirty, unsent, last_upload = False, 0, 0.0
@@ -743,7 +704,7 @@ def _loop(args, lease, ttl):
         reached = args.until and state.get("osm_base", "") >= args.until
         if dirty and (not args.upload_every or STOP.is_set() or reached
                       or time.time() - last_upload >= args.upload_every):
-            etag = _commit(args, local, etag, state)
+            etag = _commit(args, local, etag)
             if etag is None:
                 return 2  # someone else wrote the catalog: stop rather than fork it
             print(f"job --loop: {unsent} diffs to {state.get('osm_base')}, committed in {time.time() - t:.0f}s", flush=True)
@@ -755,44 +716,36 @@ def _loop(args, lease, ttl):
         if STOP.is_set() or reached:
             return 0
         if not n and COMPACTION is None:
-            STOP.wait(args.poll)
+            STOP.wait(POLL)
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["run", "job", "apply", "compact"])
+    ap.add_argument("cmd", choices=["run", "job", "apply"])
     ap.add_argument("files", nargs="*")
+    ap.add_argument("--catalog-url", help="job: the catalog, an s3:// URL or a local .ducklake file")
+    ap.add_argument("--workdir", help="job: local scratch for the catalog (default: system temp; with --loop, .)")
     ap.add_argument("--region", help="s,w,n,e: keep a regional extract consistent (omit for a planet lake)")
-    ap.add_argument("--once", action="store_true", help="catch up and exit instead of following")
     ap.add_argument("--until", help="stop before the first diff ending after this timestamp (fixed test windows)")
-    ap.add_argument("--areas-every", type=int, default=300, help="seconds between incremental area updates (0: never)")
-    ap.add_argument("--compact-every", type=int, default=3600, help="seconds between compactions (0: never)")
-    ap.add_argument("--catalog-url", help="job: the catalog on object storage (s3://bucket/lake/catalog.ducklake)")
     ap.add_argument("--max-seconds", type=float, default=240, help="job: stop applying diffs after this long")
-    ap.add_argument("--keep-versions", nargs="?", type=int, const=24, default=0, metavar="N",
-                    help="job: also copy each committed catalog to catalogs/, keeping the newest N (default 24)")
-    ap.add_argument("--upload-every", type=float, default=0, metavar="SECONDS",
-                    help="job --loop: upload the catalog at most this often (default 0: after every batch)")
-    ap.add_argument("--file-grace", type=int, default=3600, help="seconds before unreferenced files are deleted")
-    ap.add_argument("--workdir", help="job: local scratch for the catalog (default: system temp)")
     ap.add_argument("--loop", action="store_true",
                     help="job: keep running with the catalog on local disk (always-on host; --workdir keeps it)")
-    ap.add_argument("--poll", type=float, default=30, help="job --loop: seconds to wait when nothing is new")
-    ap.add_argument("--lease-seconds", type=float, help="job: writer lease length (default: --max-seconds + 600); "
-                                                        "set it above the longest run, e.g. a compaction")
+    ap.add_argument("--upload-every", type=float, default=120, metavar="SECONDS",
+                    help="job --loop: upload the catalog at most this often (0: after every batch)")
+    ap.add_argument("--compact-every", type=int, default=3600, help="job: seconds between compactions (0: never)")
     args = ap.parse_args()
+    if args.cmd == "run":  # the local-catalog form of job --loop
+        args.cmd, args.loop = "job", True
+        args.catalog_url = args.catalog_url or lakeconn.env("CATALOG", "data/lake/osm.ducklake")
     if args.cmd == "job":
+        if not args.catalog_url:
+            ap.error("job needs --catalog-url")
         sys.exit(job(args))
     con = duckdb.connect()
     lakeconn.attach(con)
-    if args.cmd == "compact":
-        return compact(con)
     region = tuple(map(float, args.region.split(","))) if args.region else None
     up = Updater(con, region)
-    if args.cmd == "apply":
-        print(up.apply([pathlib.Path(f).read_bytes() for f in args.files]))
-    else:
-        follow(up, once=args.once, maintenance=Maintenance(con, args.areas_every, args.compact_every), until=args.until)
+    print(up.apply([pathlib.Path(f).read_bytes() for f in args.files]))
 
 
 if __name__ == "__main__":

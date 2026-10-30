@@ -10,11 +10,16 @@ wrote are unreferenced orphans that compaction removes. Between jobs nothing run
 
 AWS S3 and Cloudflare R2 both support conditional PUTs. Credentials: lakeconn's SUNCHASER_S3_*.
 
+A URL that is not s3:// is a local file: the same calls work on it (fetch copies, push replaces the
+file atomically after checking its mtime+size token, the lease is a no-op), so the updater runs
+against a local catalog with `job --catalog-url /path/catalog.ducklake`.
+
   python src/objcatalog.py put local.ducklake s3://bucket/lake/catalog.ducklake   # first upload
   python src/objcatalog.py get s3://bucket/lake/catalog.ducklake local.ducklake
 """
 import os
 import pathlib
+import shutil
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
@@ -38,6 +43,28 @@ def _client():
                         region_name=env("S3_REGION") or None, config=Config(s3={"addressing_style": style}))
 
 
+def is_local(url):
+    return not url.startswith("s3://")
+
+
+def workfile(url, workdir):
+    """The catalog file the updater works on: a local catalog in place, an s3 one downloaded to workdir."""
+    return url if is_local(url) else os.path.join(workdir, "catalog.ducklake")
+
+
+def _local_token(path):
+    """The local counterpart of an ETag: changes whenever the file is replaced or rewritten."""
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        return None
+    return f"{st.st_mtime_ns}-{st.st_size}"
+
+
+def _same_file(a, b):
+    return os.path.exists(a) and os.path.exists(b) and os.path.samefile(a, b)
+
+
 def _split(url):
     if not url.startswith("s3://"):
         raise ValueError(f"not an s3:// URL: {url}")
@@ -48,6 +75,8 @@ def _split(url):
 def head(url):
     """ETag of the catalog, or None if it doesn't exist."""
     from botocore.exceptions import ClientError
+    if is_local(url):
+        return _local_token(url)
     bucket, key = _split(url)
     try:
         return _client().head_object(Bucket=bucket, Key=key)["ETag"]
@@ -59,6 +88,11 @@ def head(url):
 
 def fetch(url, local):
     """Download the catalog; returns its ETag (the token for the conditional upload)."""
+    if is_local(url):
+        if not _same_file(url, local):
+            shutil.copyfile(url, f"{local}.part")
+            os.replace(f"{local}.part", local)
+        return _local_token(url)
     bucket, key = _split(url)
     r = _client().get_object(Bucket=bucket, Key=key)
     tmp = f"{local}.part"
@@ -90,6 +124,14 @@ def push(local, url, etag):
     exist yet). Returns the new ETag; raises Conflict if another writer committed in between."""
     import tempfile
     from botocore.exceptions import ClientError
+    if is_local(url):
+        if not _same_file(local, url) and _local_token(url) != etag:
+            raise Conflict(f"{url} changed since it was read (another writer committed)")
+        with tempfile.TemporaryDirectory(dir=os.path.dirname(os.path.abspath(url))) as tmp:
+            small = os.path.join(tmp, "catalog.ducklake")
+            compact(local, small)
+            os.replace(small, url)
+        return _local_token(url)
     bucket, key = _split(url)
     cond = {"IfMatch": etag} if etag else {"IfNoneMatch": "*"}
     with tempfile.TemporaryDirectory(dir=os.path.dirname(os.path.abspath(local))) as tmp:
@@ -112,6 +154,8 @@ def acquire_lease(url, ttl):
     import json
     import time
     from botocore.exceptions import ClientError
+    if is_local(url):
+        return "local"
     bucket, key = _split(url + ".lease")
     s3 = _client()
     body = json.dumps({"expires": time.time() + ttl}).encode()
@@ -138,6 +182,8 @@ def renew_lease(url, etag, ttl):
     import json
     import time
     from botocore.exceptions import ClientError
+    if is_local(url):
+        return etag
     bucket, key = _split(url + ".lease")
     body = json.dumps({"expires": time.time() + ttl}).encode()
     try:
@@ -147,28 +193,10 @@ def renew_lease(url, etag, ttl):
 
 
 def release_lease(url):
+    if is_local(url):
+        return
     bucket, key = _split(url + ".lease")
     _client().delete_object(Bucket=bucket, Key=key)
-
-
-def copy(url, dest_url):
-    """Server-side copy, e.g. to keep a versioned history of catalogs for rollback."""
-    bucket, key = _split(url)
-    dbucket, dkey = _split(dest_url)
-    _client().copy_object(Bucket=dbucket, Key=dkey, CopySource={"Bucket": bucket, "Key": key})
-
-
-def prune(prefix_url, keep):
-    """Delete all but the newest `keep` objects under a prefix (catalog copies are named by
-    timestamp, so name order is time order). Returns the number deleted."""
-    bucket, prefix = _split(prefix_url.rstrip("/") + "/")
-    s3 = _client()
-    keys = sorted(o["Key"] for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix)
-                  for o in page.get("Contents", []))
-    old = keys[:max(len(keys) - keep, 0)]
-    for i in range(0, len(old), 1000):
-        s3.delete_objects(Bucket=bucket, Delete={"Objects": [{"Key": k} for k in old[i:i + 1000]], "Quiet": True})
-    return len(old)
 
 
 def main():
