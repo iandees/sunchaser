@@ -175,8 +175,14 @@ impl<const N: usize> Timeline<N> {
         let f = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(dir.join(format!("{name}.idx")))?;
         f.set_len((max_id + 1) * 8)?;
         let path = dir.join(format!("{name}.recs"));
+        let idx = unsafe { MmapMut::map_mut(&f)? };
+        // The index is read at random (a sorted batch still touches pages far apart on a planet), so
+        // the kernel must not read ahead around each page fault: with the md RAID0 default of 2 MB it
+        // read 1.1 GB/s from the NVMe array to serve lookups that needed 4 KB each, and the planet's
+        // ways phase ran at about 2,500 ways/s. MADV_RANDOM turns readahead off for these mappings.
+        idx.advise(memmap2::Advice::Random)?;
         Ok(Timeline::Disk {
-            idx: unsafe { MmapMut::map_mut(&f)? },
+            idx,
             cap: max_id + 1,
             last: -1,
             n: 0,
@@ -226,7 +232,9 @@ impl<const N: usize> Timeline<N> {
             if let Some(mut wr) = w.take() {
                 wr.flush()?;
                 if *n > 0 {
-                    *recs = Some(unsafe { Mmap::map(&File::open(&*path)?)? });
+                    let m = unsafe { Mmap::map(&File::open(&*path)?)? };
+                    m.advise(memmap2::Advice::Random)?; // see `disk`
+                    *recs = Some(m);
                 }
             }
         }
