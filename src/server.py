@@ -13,6 +13,8 @@ Configuration (environment):
                        S3 / R2 credentials for DuckDB's httpfs
   SUNCHASER_MAX_TIMEOUT  cap for [timeout:N] in seconds (default 180)
   SUNCHASER_MAX_OUTPUT   cap for a response in bytes (default 2 GiB); [maxsize:N] can lower it
+  SUNCHASER_MAX_READ_MB  refuse a query before it runs when the catalog's file statistics say its scans would read
+                         more than this many MB from storage (default 0: off); see src/readbudget.py
   SUNCHASER_MAX_QUERIES  queries executed concurrently (default 16); more wait in line
   SUNCHASER_LANCE        "off" to ignore a lake's Lance id store (default: use it when the lake has one)
   SUNCHASER_LOG_QUERIES  1: one line per query (time, bytes, outcome, query text); 2: also each SQL statement
@@ -44,6 +46,7 @@ from starlette.routing import Route
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import lakeconn  # noqa: E402
 import ql  # noqa: E402
+import readbudget  # noqa: E402
 import lancestore  # noqa: E402
 from engine import SQL_MACROS, Engine, Plan  # noqa: E402
 
@@ -246,6 +249,7 @@ def _execute(script, callback, sink):
         st = script.settings
         timeout = min(int(st.get("timeout", 180)), int(env("MAX_TIMEOUT", "180")))
         maxsize = min(int(st.get("maxsize", MAX_OUTPUT)), MAX_OUTPUT)
+        max_read = int(float(env("MAX_READ_MB", "0")) * (1 << 20))
         doc = ql.Document(fmt=st.get("out", "xml"), csv=st.get("csv"), timestamp=osm_base(cur),
                           json_callback=callback, sink=sink, maxsize=maxsize)
         timer = threading.Timer(timeout, cur.interrupt)
@@ -261,6 +265,8 @@ def _execute(script, callback, sink):
                     steps.append((time.time() - t, sql))
                     return rel
                 engine.trace = timed
+            if max_read:
+                engine.budget = readbudget.ReadBudget(cur, max_read)
             ran = time.time()
             ql.Executor(engine, doc.timestamp).run(script, doc=doc)
         except duckdb.InterruptException:
@@ -272,6 +278,10 @@ def _execute(script, callback, sink):
         except ql.OutputTooLarge:
             outcome = "too-large"
             doc.remarks.append(f"runtime error: Query run out of memory using about {-(-maxsize >> 20)} MB of RAM.")
+        except readbudget.ReadBudgetExceeded as e:
+            outcome = "too-big"
+            doc.remarks.append(f"runtime error: Query would read about {-(-e.estimated >> 20)} MB of data, over the "
+                               f"limit of {e.limit / (1 << 20):g} MB. Narrow the bounding box or add more filters.")
         except (ClientGone, ql.QLError):
             outcome = "error"
             raise
