@@ -28,9 +28,12 @@ remark; a client that disconnects cancels its query.
 import asyncio
 import concurrent.futures
 import datetime as dt
+import glob
 import html
+import os
 import pathlib
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -45,6 +48,7 @@ from starlette.routing import Route
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import lakeconn  # noqa: E402
+import objcatalog  # noqa: E402
 import ql  # noqa: E402
 import readbudget  # noqa: E402
 import lancestore  # noqa: E402
@@ -60,42 +64,31 @@ STREAM_AHEAD = 16                                          # unsent 64 KB chunks
 WORKERS = concurrent.futures.ThreadPoolExecutor(int(env("MAX_QUERIES", "16")))  # concurrent queries
 
 
+CATALOGS = tempfile.mkdtemp(prefix="sunchaser-catalog-")  # local copies of an s3:// catalog, newest last
+CATALOG_ETAG = None  # ETag of the copy the current connection was opened on
+
+
 def open_lake():
-    for attempt in range(5):
-        con = duckdb.connect()
-        con.sql("SET parquet_metadata_cache = true")
-        try:
-            lakeconn.attach(con, read_only=True, override_data_path=bool(env("DATA_PATH")))
-        except duckdb.HTTPException as e:
-            # the updater replaced the catalog while we were reading it (its ETag changed): read it again
-            if "ETag" not in str(e) or attempt == 4:
-                raise
-            time.sleep(1)
-            continue
-        con.sql(SQL_MACROS)
-        return con
+    """A connection on the lake. An s3:// catalog is downloaded and attached as a local file: DuckDB reads a
+    catalog lazily, and a block read after the updater has replaced the object fails on its ETag in the
+    middle of a query. The data files it points at are immutable, so they are read from R2 as before."""
+    global CATALOG_ETAG
+    con = duckdb.connect()
+    con.sql("SET parquet_metadata_cache = true")
+    catalog, url = None, remote_catalog()
+    if url:
+        catalog = os.path.join(CATALOGS, f"catalog-{time.time_ns()}.ducklake")
+        CATALOG_ETAG = objcatalog.fetch(url, catalog)
+        for old in sorted(glob.glob(os.path.join(CATALOGS, "catalog-*.ducklake")))[:-2]:
+            os.remove(old)  # requests in flight may still read the previous copy; older ones are finished
+    lakeconn.attach(con, catalog=catalog, read_only=True, override_data_path=bool(env("DATA_PATH")))
+    con.sql(SQL_MACROS)
+    return con
 
 
 def remote_catalog():
     cat = env("CATALOG", "")
-    return cat if cat.startswith(("s3://", "http://", "https://")) else None
-
-
-def catalog_version(url):
-    """ETag (or Last-Modified) of the object-storage catalog the lake is attached through."""
-    if url.startswith("s3://"):
-        import boto3
-        bucket, _, key = url[5:].partition("/")
-        endpoint = env("S3_ENDPOINT")
-        if endpoint and not endpoint.startswith("http"):
-            endpoint = ("https://" if env("S3_USE_SSL", "true") == "true" else "http://") + endpoint
-        s3 = boto3.client("s3", endpoint_url=endpoint, aws_access_key_id=env("S3_KEY_ID"),
-                          aws_secret_access_key=env("S3_SECRET"), region_name=env("S3_REGION", "auto"))
-        h = s3.head_object(Bucket=bucket, Key=key)
-        return h.get("ETag") or str(h.get("LastModified"))
-    import urllib.request
-    with urllib.request.urlopen(urllib.request.Request(url, method="HEAD"), timeout=30) as r:
-        return r.headers.get("ETag") or r.headers.get("Last-Modified")
+    return cat if cat.startswith("s3://") else None
 
 
 def refresher():
@@ -103,19 +96,16 @@ def refresher():
     Requests in flight keep their cursor on the previous connection."""
     global DB
     url, every = remote_catalog(), float(env("CATALOG_REFRESH", "30"))
-    seen = None
     while True:
+        time.sleep(every)
         try:
-            v = catalog_version(url)
-            if seen is not None and v != seen:
+            if objcatalog.head(url) != CATALOG_ETAG:
                 fresh = open_lake()
                 with DB_LOCK:
                     DB = fresh
-                print(f"reloaded catalog {url} ({v})", flush=True)
-            seen = v
+                print(f"reloaded catalog {url} ({CATALOG_ETAG})", flush=True)
         except Exception as e:  # keep serving the last good catalog
             print(f"catalog refresh failed: {e}", flush=True)
-        time.sleep(every)
 
 
 DB = None
