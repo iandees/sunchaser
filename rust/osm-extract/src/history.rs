@@ -887,7 +887,7 @@ impl Pipeline {
             m,
             "{{\"format\": 2, \"history\": {history}, \"bucket_bits\": {}, \"node_id_shift\": {}, \
              \"versions\": {versions}, \"nodes\": {}, \"ways\": {}, \"relations\": {}{history_fields}, \
-             \"node_parent_ways\": {n_parents}, {}}}",
+             \"node_parent_ways\": {n_parents}{}}}",
             layout.bits, layout.id_shift, counts[0], counts[1], counts[2], crate::header_fields()
         )?;
         Ok(format!(
