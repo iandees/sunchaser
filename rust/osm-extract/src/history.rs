@@ -43,7 +43,7 @@ const CHUNK_BLOBS: usize = 64;
 // ---- decoded versions -------------------------------------------------------------
 
 #[derive(Clone)]
-pub(crate) struct Meta {
+struct Meta {
     version: i32,
     secs: i64,
     changeset: i64,
@@ -53,14 +53,14 @@ pub(crate) struct Meta {
 }
 
 #[derive(Clone)]
-pub(crate) enum Body {
+enum Body {
     Node(i32, i32),
     Way(Vec<i64>),
     Rel(Vec<(u8, i64, String)>), // (b'n' | b'w' | b'r', ref, role)
 }
 
 #[derive(Clone)]
-pub(crate) struct Version {
+struct Version {
     kind: u8, // 0 node, 1 way, 2 relation (PBF order)
     id: i64,
     meta: Meta,
@@ -72,7 +72,7 @@ fn tags_of<'a>(it: impl Iterator<Item = (&'a str, &'a str)>) -> Vec<(String, Str
     it.map(|(k, v)| (k.to_string(), v.to_string())).collect()
 }
 
-pub(crate) fn dense_version(n: &osmpbf::DenseNode) -> Version {
+fn dense_version(n: &osmpbf::DenseNode) -> Version {
     let meta = match n.info() {
         Some(i) => Meta {
             version: i.version(),
@@ -87,7 +87,7 @@ pub(crate) fn dense_version(n: &osmpbf::DenseNode) -> Version {
     Version { kind: 0, id: n.id(), tags: tags_of(n.tags()), body: Body::Node(n.decimicro_lat(), n.decimicro_lon()), meta }
 }
 
-pub(crate) fn node_version(n: &osmpbf::Node) -> Version {
+fn node_version(n: &osmpbf::Node) -> Version {
     Version {
         kind: 0,
         id: n.id(),
@@ -97,11 +97,11 @@ pub(crate) fn node_version(n: &osmpbf::Node) -> Version {
     }
 }
 
-pub(crate) fn way_version(w: &osmpbf::Way) -> Version {
+fn way_version(w: &osmpbf::Way) -> Version {
     Version { kind: 1, id: w.id(), meta: info_meta(&w.info()), tags: tags_of(w.tags()), body: Body::Way(w.refs().collect()) }
 }
 
-pub(crate) fn rel_version(r: &osmpbf::Relation) -> Version {
+fn rel_version(r: &osmpbf::Relation) -> Version {
     let members = r
         .members()
         .map(|m| {
@@ -849,23 +849,22 @@ fn take_groups(pending: &mut Vec<Version>, last_chunk: bool) -> Vec<Vec<Version>
 
 /// One history extraction: version groups in, bucketed raw tables out. Fed in PBF order; a group
 /// may continue in the next feed (versions of one element spanning blocks).
-pub(crate) struct Pipeline {
+struct Pipeline {
     out: PathBuf,
     w: Writers,
     nodes: Timeline<16>,
     ways: Timeline<32>,
     counts: [u64; 3],
-    pub(crate) versions: u64,
+    versions: u64,
     phase: u8,
     pending: Vec<Version>,
     bits: u32,
     nb: usize,
     id_shift: u32,
-    pub(crate) busy: f64, // seconds spent processing (for resource measurements)
 }
 
 impl Pipeline {
-    pub(crate) fn new(out: &Path, bits: u32, history: bool, dense: Option<(&Path, u64, u64)>) -> Result<Self> {
+    fn new(out: &Path, bits: u32, history: bool, dense: Option<(&Path, u64, u64)>) -> Result<Self> {
         std::fs::create_dir_all(out)?;
         let nb = 1usize << bits;
         let mk = |sub: &str, s: Arc<Schema>, n: usize| Buckets::new(out.join(sub), s, n);
@@ -915,13 +914,11 @@ impl Pipeline {
             bits,
             nb,
             id_shift: 34 - bits,
-            busy: 0.0,
         })
     }
 
     /// Versions in PBF order; `last` flushes the final group.
-    pub(crate) fn feed(&mut self, vs: Vec<Version>, last: bool) -> Result<()> {
-        let t = Instant::now();
+    fn feed(&mut self, vs: Vec<Version>, last: bool) -> Result<()> {
         self.versions += vs.len() as u64;
         self.pending.extend(vs);
         let mut by_kind: [Vec<Vec<Version>>; 3] = [Vec::new(), Vec::new(), Vec::new()];
@@ -964,13 +961,12 @@ impl Pipeline {
             }
             self.w.write(k, outs, self.bits, self.id_shift, self.nb)?;
         }
-        self.busy += t.elapsed().as_secs_f64();
         Ok(())
     }
 
     /// Close the files and write manifest.json; returns a summary line.
-    pub(crate) fn finish(self, extra: &str) -> Result<String> {
-        let Pipeline { out, w, counts, versions, bits, id_shift, busy, .. } = self;
+    fn finish(self) -> Result<String> {
+        let Pipeline { out, w, counts, versions, bits, id_shift, .. } = self;
         let Writers { cur, hist, parents, locator } = w;
         for l in locator {
             l.close()?;
@@ -1001,7 +997,7 @@ impl Pipeline {
             m,
             "{{\"format\": 2, \"history\": {history}, \"bucket_bits\": {bits}, \"node_id_shift\": {id_shift}, \
              \"versions\": {versions}, \"nodes\": {}, \"ways\": {}, \"relations\": {}{history_fields}, \
-             \"node_parent_ways\": {n_parents}, \"process_seconds\": {busy:.1}{}{extra}}}",
+             \"node_parent_ways\": {n_parents}, {}}}",
             counts[0], counts[1], counts[2], crate::header_fields()
         )?;
         Ok(format!(
@@ -1038,7 +1034,7 @@ pub fn run(args: &Args) -> Result<()> {
             break;
         }
     }
-    let summary = p.finish("")?;
+    let summary = p.finish()?;
     println!("history: {summary} {:.1}s", t0.elapsed().as_secs_f64());
     Ok(())
 }
