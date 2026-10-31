@@ -11,6 +11,7 @@ The SQL macros below are shared with the updater, which computes keys for change
 import argparse
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 import pathlib
 import shutil
 import sys
@@ -71,6 +72,22 @@ CREATE OR REPLACE MACRO ov_level(idx) AS CASE
     WHEN idx & 4 <> 0 THEN 3 WHEN idx & 8 <> 0 THEN 4 WHEN idx & 16 <> 0 THEN 5
     WHEN idx & 32 <> 0 THEN 6 WHEN idx & 64 <> 0 THEN 7 ELSE 8 END::UTINYINT;
 """
+
+MIN_SPLIT_ROWS = 2_000_000  # smallest key sub-range worth its own concurrent sorted insert
+
+
+def key31_push(lo, hi):
+    """Rows whose ov_key31(qt) lies in [lo, hi) as ranges of qt itself (Parquet files prune on qt):
+    key31 moves qt's top bit to the bottom, so a key31 range is one range of the low 31 bits in
+    each half of the qt space."""
+    a = f"qt >= {lo >> 1}" if lo is not None else None
+    b = f"qt < {(hi >> 1) + 1}" if hi is not None else None
+    a2 = f"qt >= {(1 << 31) + (lo >> 1)}" if lo is not None else "qt >= 2147483648"
+    b2 = f"qt < {min((1 << 31) + (hi >> 1) + 1, 1 << 32)}" if hi is not None else None
+    low = " AND ".join(c for c in (a, b) if c) or "qt < 2147483648"
+    high = " AND ".join(c for c in (a2, b2) if c)
+    return f"(({low}) OR ({high}))"
+
 
 def union(sources):
     return sources[0] if len(sources) == 1 else "(" + " UNION ALL ".join(f"SELECT * FROM {x}" for x in sources) + ")"
@@ -133,6 +150,8 @@ def main():
     ap.add_argument("--lance", metavar="BASE", help="also build the Lance id store here (e.g. s3://bucket/lake/lance)")
     ap.add_argument("--group-rows", type=int, default=50_000_000,
                     help="bucketed input: rows sorted per insert (bounds memory and temp disk)")
+    ap.add_argument("--parallel", type=int, default=os.cpu_count() or 1,
+                    help="key sub-ranges of a group inserted concurrently (a sorted insert writes on one thread)")
     args = ap.parse_args()
     raw, lake = pathlib.Path(args.raw), pathlib.Path(args.lake)
     if lake.exists():
@@ -171,20 +190,72 @@ def main():
     # geometry change), or with --no-history the version timestamp, as Overpass assumes without attic data
     vf = "valid_from"
 
-    def fill(table, sort, select, sources, where="", append=False, threads=0):
-        """Create lake.<table> from the first source and append the rest, each sorted by `sort`.
-        Sources are disjoint, increasing key ranges, so the table ends up globally sorted.
+    def lit(v):
+        """A DuckDB literal for a sampled cut point (string, integer or timestamp)."""
+        if isinstance(v, str):
+            return "'" + v.replace("'", "''") + "'"
+        if hasattr(v, "isoformat"):  # the literal's type must match the column's for file pruning
+            return f"'{v.isoformat()}'::{'TIMESTAMPTZ' if v.tzinfo else 'TIMESTAMP'}"
+        return str(v)
+
+    def run_all(stmts):
+        """Run the statements concurrently, each on its own connection (DuckLake appends to one
+        table commit side by side)."""
+        if len(stmts) == 1:
+            return con.sql(stmts[0])
+
+        def run(stmt):
+            cur = con.cursor()
+            try:
+                cur.sql(stmt)
+            finally:
+                cur.close()
+        with ThreadPoolExecutor(len(stmts)) as pool:
+            list(pool.map(run, stmts))  # list() re-raises the first failure
+
+    def cut_points(x, source, where, parallel):
+        """Cut `source` into up to `parallel` ranges of the expression x with about the same number
+        of rows (from a 0.1% sample), none smaller than MIN_SPLIT_ROWS: the fixed cost of a range
+        (a scan, a sort, a transaction) outweighs the parallelism below that."""
+        con.sql(f"CREATE OR REPLACE TEMP TABLE split_sample AS SELECT x FROM (SELECT {x} AS x FROM {source} {where}) "
+                "USING SAMPLE 0.1% (bernoulli)")
+        n = con.sql("SELECT count(*) FROM split_sample").fetchall()[0][0] * 1000
+        parts = max(1, min(parallel, n // MIN_SPLIT_ROWS))
+        if parts < 2:
+            return []
+        cuts = con.sql(f"SELECT quantile_disc(x, {[j / parts for j in range(1, parts)]}) FROM split_sample").fetchall()[0][0]
+        return sorted(set(c for c in cuts if c is not None))  # a value with more than a range's share repeats
+
+    def fill(table, sort, select, sources, where="", append=False, threads=0, split=None, push=None):
+        """Create lake.<table> and append each source sorted by `sort`. Sources are disjoint,
+        increasing key ranges, so the table ends up globally sorted.
+        A sorted insert writes its files on one thread (zstd, checksums and all), which left 11 of
+        12 cores idle for most of each planet group. So a source is cut into up to --parallel
+        sub-ranges of `split` (the leading sort key as an expression over the source's columns) that
+        are inserted concurrently. They are disjoint in key order, so every file still covers a
+        narrow key range, which is all the readers' zone-map pruning depends on. Each sub-range
+        scans the source; `push`(lo, hi) gives a superset of its rows as a predicate on plain
+        columns, so the Parquet reader skips the files outside it (a bucket is a key range).
         threads=1 for rows with long member lists: a parallel sorted insert into DuckLake runs out of
         memory on them (Berlin's relation history: 303 M members in 490 k rows, 4 threads, 10 GB),
-        while one thread spills and finishes."""
+        while one thread spills and finishes; such a source is inserted whole."""
         t = time.time()
         if threads:
             con.sql(f"SET threads = {threads}")
+        if not append:
+            con.sql(f"CREATE TABLE lake.{table} SORTED BY ({sort}) AS SELECT {select} FROM {sources[0]} {where} LIMIT 0")
         last_report = t
         for i, source in enumerate(sources):
-            sql = f"SELECT {select} FROM {source} {where} ORDER BY {sort}"
-            con.sql(f"CREATE TABLE lake.{table} SORTED BY ({sort}) AS {sql}" if i == 0 and not append
-                    else f"INSERT INTO lake.{table} BY NAME {sql}")
+            cuts = cut_points(split, source, where, args.parallel) if split and not threads else []
+            bounds = [None] + cuts + [None]
+            stmts = []
+            for lo, hi in zip(bounds, bounds[1:]):
+                conds = [f"{split} >= {lit(lo)}"] * (lo is not None) + [f"{split} < {lit(hi)}"] * (hi is not None)
+                if push and conds:
+                    conds.insert(0, push(lo, hi))
+                w = where + (" AND " if where else " WHERE ") + " AND ".join(conds) if conds else where
+                stmts.append(f"INSERT INTO lake.{table} BY NAME SELECT {select} FROM {source} {w} ORDER BY {sort}")
+            run_all(stmts)
             if len(sources) > 1 and i + 1 < len(sources) and time.time() - last_report >= 30:
                 last_report = time.time()  # a table of many groups takes hours at planet scale
                 print(f"  lake.{table}: group {i + 1}/{len(sources)} done, {last_report - t:.0f}s, "
@@ -226,42 +297,48 @@ def main():
         p = posting.format(t=t, s=union(src[t]))
         con.sql(f"CREATE OR REPLACE TEMP TABLE kv_sample AS SELECT kv FROM ({p}) USING SAMPLE 0.1% (bernoulli)")
         n = con.sql("SELECT count(*) FROM kv_sample").fetchall()[0][0] * 1000
-        parts = max(1, -(-n // args.group_rows))
+        at_once = max(1, min(args.parallel, args.group_rows // MIN_SPLIT_ROWS))  # ranges sorted concurrently
+        parts = max(1, -(-n // args.group_rows)) * at_once
         cuts = con.sql(f"SELECT quantile_disc(kv, {[i / parts for i in range(1, parts)]}) "
                        "FROM kv_sample").fetchall()[0][0] if parts > 1 else []
         cuts = sorted(set(cuts))  # a kv with more than a range's share of rows repeats as a cut
-        lit = lambda s: "'" + s.replace("'", "''") + "'"
         part = ("CASE " + " ".join(f"WHEN kv < {lit(c)} THEN {i}" for i, c in enumerate(cuts)) +
                 f" ELSE {len(cuts)} END") if cuts else "0"
         staged = lake / f"postings_{t}"
         con.sql(f"COPY (SELECT *, {part} AS part FROM ({p})) TO '{staged}' (FORMAT parquet, PARTITION_BY (part))")
         print(f"  tag_postings {t}: ~{n / 1e6:.0f} M rows staged in {len(cuts) + 1} kv ranges, "
               f"{time.time() - t0:.0f}s, peak rss {peak_rss_gb():.1f} GB", flush=True)
+        t1 = time.time()
         ranges = [f"read_parquet('{staged}/part={i}/*.parquet')" for i in range(len(cuts) + 1)
                   if (staged / f"part={i}").exists()]
-        fill("tag_postings", psort, "type, kv, k, v, qt_key31, id", ranges, append=True)
+        for j in range(0, len(ranges), at_once):
+            run_all([f"INSERT INTO lake.tag_postings BY NAME SELECT type, kv, k, v, qt_key31, id FROM {r} ORDER BY {psort}"
+                     for r in ranges[j:j + at_once]])
+        print(f"{'lake.tag_postings':<22} {time.time() - t1:6.1f}s  ({len(ranges)} ranges, {at_once} at once)  "
+              f"peak rss {peak_rss_gb():.1f} GB", flush=True)
         shutil.rmtree(staged)
 
-    fill("nodes_tagged", "qt, id", f"qt, id, lat, lon, tags, {vf}", src["n"], "WHERE cardinality(tags) > 0")
-    fill("nodes_untagged", "qt, id", f"qt, id, lat, lon, tags, {vf}", src["n"], "WHERE cardinality(tags) = 0")
+    fill("nodes_tagged", "qt, id", f"qt, id, lat, lon, tags, {vf}", src["n"], "WHERE cardinality(tags) > 0", split="qt")
+    fill("nodes_untagged", "qt, id", f"qt, id, lat, lon, tags, {vf}", src["n"], "WHERE cardinality(tags) = 0", split="qt")
     step("lake.nodes (view)", """
         CREATE VIEW lake.nodes AS
         SELECT * FROM lake.nodes_tagged UNION ALL SELECT * FROM lake.nodes_untagged""")
-    fill("nodes_meta", "k, id", f"qt AS k, id, {meta}", src["n"])
+    fill("nodes_meta", "k, id", f"qt AS k, id, {meta}", src["n"], split="qt")
     step("lake.tag_postings", f"CREATE TABLE lake.tag_postings SORTED BY ({psort}) AS "
          f"{posting.format(t='n', s=src['n'][0])} WHERE false")
     fill_postings("n")
     consume("nodes")
 
     fill("ways", "qt_key31, id", f"""ov_key31(qt) AS qt_key31, ov_level(qt) AS qt_level, qt, id,
-         min_lat, max_lat, min_lon, max_lon, tags, nds, nd_lat, nd_lon, {vf}""", src["w"])
-    fill("ways_meta", "k, id", f"ov_key31(qt) AS k, id, {meta}", src["w"])
+         min_lat, max_lat, min_lon, max_lon, tags, nds, nd_lat, nd_lon, {vf}""", src["w"], split="ov_key31(qt)",
+         push=key31_push)
+    fill("ways_meta", "k, id", f"ov_key31(qt) AS k, id, {meta}", src["w"], split="ov_key31(qt)", push=key31_push)
     fill_postings("w")
     consume("ways")
 
     fill("relations", "qt_key31, id", f"""ov_key31(qt) AS qt_key31, ov_level(qt) AS qt_level, qt, id,
          min_lat, max_lat, min_lon, max_lon, tags, members, {vf}""", src["r"], threads=1)
-    fill("relations_meta", "k, id", f"ov_key31(qt) AS k, id, {meta}", src["r"])
+    fill("relations_meta", "k, id", f"ov_key31(qt) AS k, id, {meta}", src["r"], split="ov_key31(qt)", push=key31_push)
     fill_postings("r")
     fill("member_parent_rels", "mtype, mid", "DISTINCT m.type AS mtype, m.ref AS mid, m.id AS rel_id",
          [f"(SELECT id, unnest(members, recursive := true) FROM {union(src['r'])}) m"])
@@ -284,17 +361,18 @@ def main():
                                    action VARCHAR, batch BIGINT);""")
     if src["history"]:
         hist = f"valid_from, valid_to, {meta}"
-        fill("nodes_history", "qt, valid_from", f"qt, id, lat, lon, tags, {hist}", src["nh"], append=True)
+        fill("nodes_history", "qt, valid_from", f"qt, id, lat, lon, tags, {hist}", src["nh"], append=True, split="qt")
         consume("nodes_history")
         fill("ways_history", "qt_key31, valid_from", f"""ov_key31(qt) AS qt_key31, ov_level(qt) AS qt_level, qt, id,
-             min_lat, max_lat, min_lon, max_lon, tags, nds, nd_lat, nd_lon, {hist}""", src["wh"], append=True)
+             min_lat, max_lat, min_lon, max_lon, tags, nds, nd_lat, nd_lon, {hist}""", src["wh"], append=True,
+             split="ov_key31(qt)", push=key31_push)
         consume("ways_history")
         fill("relations_history", "qt_key31, valid_from", f"""ov_key31(qt) AS qt_key31, ov_level(qt) AS qt_level, qt,
              id, min_lat, max_lat, min_lon, max_lon, tags, members, {hist}""", src["rh"], append=True, threads=1)
         consume("relations_history")
         # buckets are consecutive periods of change time: sorted one at a time, the log is in time order
         fill("changes", "ts, type, id", "ts, type, id, old_version, new_version, action, batch", src["changes"],
-             append=True)
+             append=True, split="ts")
         consume("changes")
 
     t = time.time()  # already in id order: no sort
@@ -302,7 +380,7 @@ def main():
         f"SELECT * FROM (SELECT '{k}' AS type, id, qt FROM '{src['locator']}/{k}.parquet')" for k in "nwr"))
     print(f"{'lake.elem_locator':<22} {time.time() - t:6.1f}s", flush=True)
     consume("locator")
-    fill("node_parent_ways", "node_id", "node_id, way_id", src["parents"])  # distinct per way, bucketed by node id
+    fill("node_parent_ways", "node_id", "node_id, way_id", src["parents"], split="node_id")  # distinct per way, bucketed by node id
     consume("node_parent_ways")
 
     step("lake.state", f"""
