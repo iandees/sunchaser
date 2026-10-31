@@ -1008,27 +1008,57 @@ pub fn run(args: &Args) -> Result<()> {
     let mut p = Pipeline::new(&args.out, args.bucket_bits, !args.no_history, dense)?;
     let mut blobs = crate::open_input(&args.input)?.peekable();
     let mut progress = crate::Progress::new();
-    loop {
-        let chunk: Vec<_> = blobs.by_ref().take(CHUNK_BLOBS).collect::<std::result::Result<_, _>>()?;
-        let last = chunk.is_empty() || blobs.peek().is_none();
-        let decoded: Vec<Vec<Version>> = chunk
-            .par_iter()
-            .filter_map(|b| match b.decode() {
-                Ok(BlobDecode::OsmData(block)) => Some(Ok(decode(&block))),
-                Ok(BlobDecode::OsmHeader(hd)) => {
-                    crate::note_header(&hd);
-                    None
+    // A producer thread reads and decodes the next chunk while the main thread processes the
+    // current one. The channel holds one chunk, so at most three chunks are alive at once (being
+    // decoded, queued, being fed).
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Result<(Vec<Version>, bool)>>(1);
+    std::thread::scope(|scope| -> Result<()> {
+        scope.spawn(move || {
+            let mut produce = || -> Result<Option<(Vec<Version>, bool)>> {
+                let chunk: Vec<_> = blobs.by_ref().take(CHUNK_BLOBS).collect::<std::result::Result<_, _>>()?;
+                let last = chunk.is_empty() || blobs.peek().is_none();
+                let decoded: Vec<Vec<Version>> = chunk
+                    .par_iter()
+                    .filter_map(|b| match b.decode() {
+                        Ok(BlobDecode::OsmData(block)) => Some(Ok(decode(&block))),
+                        Ok(BlobDecode::OsmHeader(hd)) => {
+                            crate::note_header(&hd);
+                            None
+                        }
+                        Ok(_) => None,
+                        Err(e) => Some(Err(e)),
+                    })
+                    .collect::<std::result::Result<_, _>>()?;
+                Ok(Some((decoded.into_iter().flatten().collect(), last)))
+            };
+            loop {
+                match produce() {
+                    Ok(Some((vs, last))) => {
+                        // a send error: the consumer stopped (it failed), so stop too
+                        if tx.send(Ok((vs, last))).is_err() || last {
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                        break;
+                    }
                 }
-                Ok(_) => None,
-                Err(e) => Some(Err(e)),
-            })
-            .collect::<std::result::Result<_, _>>()?;
-        p.feed(decoded.into_iter().flatten().collect(), last)?;
-        progress.tick(|| format!("versions={} (current n={} w={} r={})", p.versions, p.counts[0], p.counts[1], p.counts[2]));
-        if last {
-            break;
+            }
+        });
+        loop {
+            let (vs, last) = match rx.recv() {
+                Ok(m) => m?,
+                Err(_) => bail!("input reader stopped without a last chunk"),
+            };
+            p.feed(vs, last)?;
+            progress.tick(|| format!("versions={} (current n={} w={} r={})", p.versions, p.counts[0], p.counts[1], p.counts[2]));
+            if last {
+                return Ok(());
+            }
         }
-    }
+    })?;
     let summary = p.finish()?;
     println!("history: {summary} {:.1}s", t0.elapsed().as_secs_f64());
     Ok(())

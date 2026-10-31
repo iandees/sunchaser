@@ -40,6 +40,7 @@ stage() { [ -f "$DATA/state/$1.done" ] && { echo "== $1: done already"; return 1
 done_() { touch "$DATA/state/$1.done"; }
 
 if stage extract; then
+  export MIMALLOC_PURGE_DELAY=-1  # keep freed memory: returning it to the OS and re-faulting zeroed pages was 7% of the main thread
   rm -rf "$DATA/raw" "$DATA/idx"
   size=$(curl -sSfI "$PLANET_URL" | awk 'tolower($1) == "content-length:" {print $2 + 0}')  # for % and ETA in the progress lines
   $M --label extract --watch "$DATA/raw" --watch "$DATA/idx" -- bash -c \
