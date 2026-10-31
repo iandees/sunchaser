@@ -29,7 +29,6 @@ use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use memmap2::{Mmap, MmapMut};
 use osmpbf::{BlobDecode, PrimitiveBlock, RelMemberType};
-use parquet::arrow::ArrowWriter;
 use rayon::prelude::*;
 
 use crate::Args;
@@ -37,7 +36,7 @@ use crate::quadtile;
 use crate::relstate::{Contrib, RelState};
 use crate::tables::{
     Buckets, Kind, Layout, MISSING_BBOX, NO_COORD, extend_bbox, locator_schema, map_names,
-    member_struct_fields, parents_schema, props, schema,
+    member_struct_fields, parents_schema, schema,
 };
 
 const CHUNK_BLOBS: usize = 64;
@@ -766,14 +765,13 @@ fn changes_batch(cs: &[&Change]) -> Result<RecordBatch> {
 
 // ---- driver -------------------------------------------------------------------------
 
-/// The output tables. They are written on their own thread (see `Pipeline`), a chunk at a time, in
-/// chunk order (the locator files must stay in id order: the build relies on it).
+/// The output tables. They are written on their own thread (see `Pipeline`), a chunk at a time.
 struct Writers {
     cur: [Buckets; 3],
     /// None with --no-history: no *_history tables and no changes log
     hist: Option<([Buckets; 3], Buckets)>,
     parents: Buckets,
-    locator: Vec<ArrowWriter<File>>,
+    locator: [Buckets; 3],
 }
 
 impl Writers {
@@ -786,7 +784,7 @@ impl Writers {
         let parents: Vec<&(i64, i64)> = outs.iter().flat_map(|o| o.parents.iter()).collect();
         let bucket = |q: u32| layout.bucket(kind, q);
         let Writers { cur: cw, hist: hw, parents: pw, locator } = self;
-        let (cw, loc) = (&cw[k], &mut locator[k]);
+        let (cw, loc) = (&cw[k], &locator[k]);
         let ((r1, r2), (r3, r4)) = rayon::join(
             || {
                 rayon::join(
@@ -794,9 +792,12 @@ impl Writers {
                         if cur.is_empty() {
                             return Ok(());
                         }
-                        let ids = Int64Array::from_iter_values(cur.iter().map(|r| r.v.id));
-                        let qts = UInt32Array::from_iter_values(cur.iter().map(|r| r.qt));
-                        loc.write(&RecordBatch::try_new(locator_schema(), vec![Arc::new(ids), Arc::new(qts)])?)?;
+                        let keys: Vec<usize> = cur.iter().map(|r| layout.parent_bucket(r.v.id)).collect();
+                        loc.write_rows(&keys, &cur, |rs| {
+                            let ids = Int64Array::from_iter_values(rs.iter().map(|r| r.v.id));
+                            let qts = UInt32Array::from_iter_values(rs.iter().map(|r| r.qt));
+                            Ok(RecordBatch::try_new(locator_schema(), vec![Arc::new(ids), Arc::new(qts)])?)
+                        })?;
                         let keys: Vec<usize> = cur.iter().map(|r| bucket(r.qt)).collect();
                         cw.write_rows(&keys, &cur, |rs| batch(kind, rs, false))
                     },
@@ -888,12 +889,6 @@ impl Pipeline {
         let layout = Layout::new(bits);
         let nb = layout.count;
         let mk = |sub: &str, s: Arc<Schema>, n: usize| Buckets::new(out.join(sub), s, n);
-        std::fs::create_dir_all(out.join("locator"))?;
-        let mut locator = Vec::new();
-        for t in ["n", "w", "r"] {
-            let f = File::create(out.join("locator").join(format!("{t}.parquet")))?;
-            locator.push(ArrowWriter::try_new(f, locator_schema(), Some(props()?))?);
-        }
         let w = Writers {
             cur: [
                 mk("nodes", schema(Kind::Nodes, false), nb)?,
@@ -913,7 +908,7 @@ impl Pipeline {
                 None
             },
             parents: mk("node_parent_ways", parents_schema(), nb)?,
-            locator,
+            locator: [mk("locator/n", locator_schema(), nb)?, mk("locator/w", locator_schema(), nb)?, mk("locator/r", locator_schema(), nb)?],
         };
         let (nodes, ways) = match dense {
             Some((dir, max_node, max_way)) => {
@@ -1042,6 +1037,7 @@ impl Pipeline {
         for l in locator {
             l.close()?;
         }
+        // (each Buckets::close returns its row count; the locator's equals the current counts)
         let mut hist_rows = [0u64; 3];
         for b in cur {
             b.close()?;

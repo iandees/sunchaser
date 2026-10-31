@@ -6,7 +6,7 @@
 //!   nodes/NNNN.parquet             id, lat, lon, tags, <meta>, qt
 //!   ways/NNNN.parquet              id, nds, nd_lat, nd_lon, tags, <meta>, qt, min/max lat/lon
 //!   relations/NNNN.parquet         id, members, tags, <meta>, qt, min/max lat/lon (node and way members)
-//!   locator/{n,w,r}.parquet        id, qt in id order (the PBF's order: no sort needed)
+//!   locator/{n,w,r}/NNNN.parquet   id, qt, bucketed by id like node_parent_ways
 //!   node_parent_ways/NNNN.parquet  node_id, way_id (distinct per way)
 //!   manifest.json
 //! The output also has nodes_history/, ways_history/, relations_history/ and changes/ (see

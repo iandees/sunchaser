@@ -120,11 +120,16 @@ def bucketed_sources(con, raw, manifest, group_rows, run_rows):
         return chunks(runs, group_rows, lambda r: sum(rows.get(f, 0) for f in r))
 
     src = {"n": groups("nodes"), "w": groups("ways"), "r": groups("relations"),
-           "parents": groups("node_parent_ways"), "locator": str(raw / "locator"), "history": False}
+           "parents": groups("node_parent_ways"), "history": False}
     if manifest.get("history"):  # osm-extract --history: every version since the first
         src.update(history=True, nh=groups("nodes_history"), wh=groups("ways_history"),
                    rh=groups("relations_history"), changes=groups("changes"))
-    files["locator"] = [str(f) for f in sorted((raw / "locator").glob("*.parquet"))]
+    if (raw / "locator" / "n.parquet").exists():  # extracts before 2026-11: one file per type, in id order
+        src["locator"] = str(raw / "locator")
+        files["locator"] = [str(f) for f in sorted((raw / "locator").glob("*.parquet"))]
+    else:
+        src["loc"] = {k: groups(f"locator/{k}") for k in "nwr"}
+        files["locator"] = [f for k in "nwr" for f in files[f"locator/{k}"]]
     src["files"], src["glob"], src["rows"] = files, glob, rows
     return src
 
@@ -360,10 +365,14 @@ def main():
              append=True, key="ts")
         consume("changes")
 
-    t = time.time()  # already in id order: no sort
-    con.sql("CREATE TABLE lake.elem_locator SORTED BY (type, id) AS " + " UNION ALL ".join(
-        f"SELECT * FROM (SELECT '{k}' AS type, id, qt FROM '{src['locator']}/{k}.parquet')" for k in "nwr"))
-    print(f"{'lake.elem_locator':<22} {time.time() - t:6.1f}s", flush=True)
+    if "loc" in src:
+        for k in "nwr":
+            fill("elem_locator", "type, id", f"'{k}' AS type, id, qt", src["loc"][k], append=k != "n", key="id")
+    else:
+        t = time.time()  # already in id order: no sort
+        con.sql("CREATE TABLE lake.elem_locator SORTED BY (type, id) AS " + " UNION ALL ".join(
+            f"SELECT * FROM (SELECT '{k}' AS type, id, qt FROM '{src['locator']}/{k}.parquet')" for k in "nwr"))
+        print(f"{'lake.elem_locator':<22} {time.time() - t:6.1f}s", flush=True)
     consume("locator")
     fill("node_parent_ways", "node_id", "node_id, way_id", src["parents"], key="node_id")  # distinct per way, bucketed by node id
     consume("node_parent_ways")
