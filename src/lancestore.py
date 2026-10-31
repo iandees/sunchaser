@@ -15,13 +15,23 @@ converges regardless.
   python src/lancestore.py build s3://bucket/lake/lance     # add Lance to an existing lake
 """
 import datetime as dt
+import os
 import pathlib
 import sys
 import threading
 import time
 
-import lance
-import pyarrow as pa
+# Lance's query/index memory pool is 1.8 GB unless LANCE_MEM_POOL_SIZE says otherwise: training the
+# BTREE id index on the planet's 300 M tagged nodes died in its sort merge there (the sort spills to
+# $TMPDIR, the merge cannot). Read at import, so it is set here: a quarter of RAM, 2 GB at least.
+try:
+    _ram = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+except (ValueError, OSError, AttributeError):
+    _ram = 0
+os.environ.setdefault("LANCE_MEM_POOL_SIZE", str(max(2 << 30, _ram // 4)))
+
+import lance  # noqa: E402
+import pyarrow as pa  # noqa: E402
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import lakeconn  # noqa: E402

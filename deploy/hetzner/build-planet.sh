@@ -34,7 +34,11 @@ M="uv run python -I tools/measure.py"
 ulimit -n 65536 2>/dev/null || ulimit -n "$(ulimit -Hn)"
 need=$(( (7 << BUCKET_BITS) + 1024 + 256 ))  # history mode: 7 bucketed tables + 1024 change-log buckets
 [ "$(ulimit -n)" -ge "$need" ] || { echo "open-files limit $(ulimit -n) < $need: raise it or lower BUCKET_BITS"; exit 1; }
-mkdir -p "$DATA/state" "$DATA/logs"
+mkdir -p "$DATA/state" "$DATA/logs" "$DATA/tmp"
+export TMPDIR="$DATA/tmp"  # Lance's index sorts spill here (the root disk is small); DuckDB spills under --lake
+# Lance's memory pool while the build trains the id indexes (DuckDB is idle then): the planet's 300 M
+# tagged nodes needed 1.8 GB for the sort merge alone, which cannot spill; untagged nodes are 35x that
+export LANCE_MEM_POOL_SIZE=${LANCE_MEM_POOL_SIZE:-$((60 << 30))}
 case "$LAKE" in s3://*) ;; *) echo "LAKE must be s3://... (see /etc/sunchaser.env)"; exit 1;; esac
 
 stage() { [ -f "$DATA/state/$1.done" ] && { echo "== $1: done already"; return 1; }; echo "== $1: $(date -u +%FT%TZ)"; }
