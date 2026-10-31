@@ -437,10 +437,6 @@ fn node_group(vs: Vec<Version>) -> Out {
     out
 }
 
-fn way_coords(refs: &[i64], nodes: &Timeline<16>, t: i64) -> Vec<(i32, i32)> {
-    refs.iter().map(|&r| at(nodes.get(r), t).and_then(npos_dec).unwrap_or((NO_COORD, NO_COORD))).collect()
-}
-
 fn way_key(coords: &[(i32, i32)]) -> (u32, [i32; 4]) {
     let mut b = MISSING_BBOX;
     let mut idxs = Vec::with_capacity(coords.len());
@@ -473,9 +469,12 @@ fn way_group(vs: Vec<Version>, nodes: &Timeline<16>) -> Out {
             continue;
         }
         let Body::Way(refs) = &v.body else { unreachable!() };
+        // each node's timeline looked up once: a long way whose nodes moved often (a coastline, a
+        // boundary) is otherwise refs x slices lookups, a tail every chunk waited for
+        let recs: Vec<&[[u8; 16]]> = refs.iter().map(|&r| nodes.get(r)).collect();
         let mut bps = vec![t];
-        for &r in refs {
-            for rec in nodes.get(r) {
+        for rs in &recs {
+            for rec in *rs {
                 let rt = rec_time(rec);
                 if rt > t && end.is_none_or(|e| rt < e) {
                     bps.push(rt);
@@ -487,7 +486,8 @@ fn way_group(vs: Vec<Version>, nodes: &Timeline<16>) -> Out {
         // slices: the version start, then every time a member's position actually changes
         let mut slices: Vec<(i64, Vec<(i32, i32)>)> = Vec::new();
         for (i, &s) in bps.iter().enumerate() {
-            let c = way_coords(refs, nodes, s);
+            let c: Vec<(i32, i32)> =
+                recs.iter().map(|rs| at(rs, s).and_then(npos_dec).unwrap_or((NO_COORD, NO_COORD))).collect();
             if i > 0 && slices.last().is_some_and(|l| l.1 == c) {
                 continue;
             }
@@ -522,18 +522,35 @@ fn way_group(vs: Vec<Version>, nodes: &Timeline<16>) -> Out {
     out
 }
 
-/// What a member contributes at time t: its index and bbox (None while it doesn't exist).
-fn contrib(mt: Kind, r: i64, nodes: &Timeline<16>, ways: &Timeline<32>, t: i64) -> Contrib {
-    match mt {
-        Kind::Nodes => match at(nodes.get(r), t).and_then(npos_dec) {
-            Some((la, lo)) => (Some(quadtile::node_index(la, lo)), Some([la, la, lo, lo])),
-            None => (None, None),
-        },
-        Kind::Ways => match at(ways.get(r), t).and_then(wrec_dec) {
-            Some((q, wb)) => (Some(q), if wb[0] != i32::MAX { Some(wb) } else { None }),
-            None => (None, None),
-        },
-        _ => (None, None),
+/// A relation member's timeline (looked up once per version, see way_group).
+enum MemberRecs<'a> {
+    Node(&'a [[u8; 16]]),
+    Way(&'a [[u8; 32]]),
+    Rel,
+}
+
+impl MemberRecs<'_> {
+    fn times(&self) -> Box<dyn Iterator<Item = i64> + '_> {
+        match self {
+            MemberRecs::Node(rs) => Box::new(rs.iter().map(rec_time)),
+            MemberRecs::Way(rs) => Box::new(rs.iter().map(rec_time)),
+            MemberRecs::Rel => Box::new(std::iter::empty()),
+        }
+    }
+
+    /// What the member contributes at time t: its index and bbox (None while it doesn't exist).
+    fn contrib(&self, t: i64) -> Contrib {
+        match self {
+            MemberRecs::Node(rs) => match at(rs, t).and_then(npos_dec) {
+                Some((la, lo)) => (Some(quadtile::node_index(la, lo)), Some([la, la, lo, lo])),
+                None => (None, None),
+            },
+            MemberRecs::Way(rs) => match at(rs, t).and_then(wrec_dec) {
+                Some((q, wb)) => (Some(q), if wb[0] != i32::MAX { Some(wb) } else { None }),
+                None => (None, None),
+            },
+            MemberRecs::Rel => (None, None),
+        }
     }
 }
 
@@ -554,18 +571,21 @@ fn rel_group(vs: Vec<Version>, nodes: &Timeline<16>, ways: &Timeline<32>) -> Out
         let Body::Rel(members) = &v.body else { unreachable!() };
         // state at the version's start, then member changes in time order
         let mut state = RelState::default();
+        let recs: Vec<MemberRecs> = members
+            .iter()
+            .map(|(mt, r, _)| match mt {
+                Kind::Nodes => MemberRecs::Node(nodes.get(*r)),
+                Kind::Ways => MemberRecs::Way(ways.get(*r)),
+                Kind::Relations => MemberRecs::Rel,
+            })
+            .collect();
         let mut cur: Vec<Contrib> = Vec::with_capacity(members.len());
         let mut events: Vec<(i64, usize)> = Vec::new();
-        for (i, (mt, r, _)) in members.iter().enumerate() {
-            let c = contrib(*mt, *r, nodes, ways, t);
+        for (i, m) in recs.iter().enumerate() {
+            let c = m.contrib(t);
             state.apply(&c, true);
             cur.push(c);
-            let times: Box<dyn Iterator<Item = i64>> = match mt {
-                Kind::Nodes => Box::new(nodes.get(*r).iter().map(rec_time)),
-                Kind::Ways => Box::new(ways.get(*r).iter().map(rec_time)),
-                _ => Box::new(std::iter::empty()),
-            };
-            events.extend(times.filter(|&x| x > t && end.is_none_or(|e| x < e)).map(|x| (x, i)));
+            events.extend(m.times().filter(|&x| x > t && end.is_none_or(|e| x < e)).map(|x| (x, i)));
         }
         events.sort_unstable();
         version_change(&mut out, &v, prev);
@@ -576,8 +596,7 @@ fn rel_group(vs: Vec<Version>, nodes: &Timeline<16>, ways: &Timeline<32>) -> Out
             let s = events[e].0;
             while e < events.len() && events[e].0 == s {
                 let i = events[e].1;
-                let (mt, r, _) = &members[i];
-                let c = contrib(*mt, *r, nodes, ways, s);
+                let c = recs[i].contrib(s);
                 state.apply(&cur[i], false);
                 state.apply(&c, true);
                 cur[i] = c;
@@ -749,12 +768,14 @@ fn changes_batch(cs: &[&Change]) -> Result<RecordBatch> {
 
 // ---- driver -------------------------------------------------------------------------
 
-/// The bucketed tables. They are written on their own thread (see `Pipeline`), a chunk at a time.
+/// The output tables. They are written on their own thread (see `Pipeline`), a chunk at a time, in
+/// chunk order (the locator files must stay in id order: the build relies on it).
 struct Writers {
     cur: [Buckets; 3],
     /// None with --no-history: no *_history tables and no changes log
     hist: Option<([Buckets; 3], Buckets)>,
     parents: Buckets,
+    locator: Vec<ArrowWriter<File>>,
 }
 
 impl Writers {
@@ -766,8 +787,8 @@ impl Writers {
         let cs: Vec<&Change> = outs.iter().flat_map(|o| o.changes.iter()).collect();
         let parents: Vec<&(i64, i64)> = outs.iter().flat_map(|o| o.parents.iter()).collect();
         let bucket = |q: u32| layout.bucket(kind, q);
-        let Writers { cur: cw, hist: hw, parents: pw } = self;
-        let cw = &cw[k];
+        let Writers { cur: cw, hist: hw, parents: pw, locator } = self;
+        let (cw, loc) = (&cw[k], &mut locator[k]);
         let ((r1, r2), (r3, r4)) = rayon::join(
             || {
                 rayon::join(
@@ -775,6 +796,9 @@ impl Writers {
                         if cur.is_empty() {
                             return Ok(());
                         }
+                        let ids = Int64Array::from_iter_values(cur.iter().map(|r| r.v.id));
+                        let qts = UInt32Array::from_iter_values(cur.iter().map(|r| r.qt));
+                        loc.write(&RecordBatch::try_new(locator_schema(), vec![Arc::new(ids), Arc::new(qts)])?)?;
                         let keys: Vec<usize> = cur.iter().map(|r| bucket(r.qt)).collect();
                         cw.write_rows(&keys, &cur, |rs| batch(kind, rs, false))
                     },
@@ -843,18 +867,17 @@ fn take_groups(pending: &mut Vec<Version>, last_chunk: bool) -> Vec<Vec<Version>
 
 /// One history extraction: version groups in, bucketed raw tables out. Fed in PBF order; a group
 /// may continue in the next feed (versions of one element spanning blocks).
-/// The bucketed tables are written on a writer thread, one chunk behind: writing parallelises
-/// over the buckets a chunk touches, few for the consecutive ids of a chunk, and waiting for it
-/// was 40% of the main thread. The locator (in id order, which the build relies on) is written
-/// here, and the timelines are appended here, both in chunk order.
+/// The tables are written on a writer thread, one chunk behind: writing parallelises over the
+/// buckets a chunk touches, few for the consecutive ids of a chunk, and waiting for it was 40%
+/// of the main thread. The timelines are appended here, in chunk order.
 struct Pipeline {
     out: PathBuf,
     writer: Option<std::thread::JoinHandle<Result<Writers>>>,
     tx: Option<std::sync::mpsc::SyncSender<(Kind, Vec<Out>)>>,
-    locator: Vec<ArrowWriter<File>>,
     nodes: Timeline<16>,
     ways: Timeline<32>,
     counts: [u64; 3],
+    t0: Instant,
     versions: u64,
     phase: Kind, // the kind being processed; timelines of earlier kinds are complete
     pending: Vec<Version>,
@@ -892,6 +915,7 @@ impl Pipeline {
                 None
             },
             parents: mk("node_parent_ways", parents_schema(), nb)?,
+            locator,
         };
         let (nodes, ways) = match dense {
             Some((dir, max_node, max_way)) => {
@@ -913,10 +937,10 @@ impl Pipeline {
             out: out.to_path_buf(),
             writer: Some(writer),
             tx: Some(tx),
-            locator,
             nodes,
             ways,
             counts: [0; 3],
+            t0: Instant::now(),
             versions: 0,
             phase: Kind::Nodes,
             pending: Vec::new(),
@@ -945,6 +969,7 @@ impl Pipeline {
                     Kind::Nodes => self.nodes.finish()?,
                     _ => self.ways.finish()?,
                 }
+                eprintln!("[{:>6.0}s] {:?} done: {} current", self.t0.elapsed().as_secs_f64(), self.phase, self.counts[self.phase.index()]);
                 self.phase = self.phase.next();
             }
             let (nodes, ways) = (&self.nodes, &self.ways);
@@ -975,22 +1000,13 @@ impl Pipeline {
                 Kind::Ways => gs.into_par_iter().map(|g| way_group(g, nodes)).collect(),
                 Kind::Relations => gs.into_par_iter().map(|g| rel_group(g, nodes, ways)).collect(),
             };
-            let (mut ids, mut qts) = (Vec::new(), Vec::new());
             for o in &outs {
-                for r in o.rows.iter().filter(|r| r.to.is_none()) {
-                    ids.push(r.v.id);
-                    qts.push(r.qt);
-                }
+                self.counts[kind.index()] += o.rows.iter().filter(|r| r.to.is_none()).count() as u64;
                 match &o.timeline {
                     Some((id, Track::Node(recs))) => self.nodes.push(*id, recs)?,
                     Some((id, Track::Way(recs))) => self.ways.push(*id, recs)?,
                     None => {}
                 }
-            }
-            self.counts[kind.index()] += ids.len() as u64;
-            if !ids.is_empty() {
-                let cols = vec![Arc::new(Int64Array::from(ids)) as ArrayRef, Arc::new(UInt32Array::from(qts))];
-                self.locator[kind.index()].write(&RecordBatch::try_new(locator_schema(), cols)?)?;
             }
             if self.tx.as_ref().unwrap().send((kind, outs)).is_err() {
                 self.join_writer()?; // it stopped on an error: that is the one to report
@@ -1007,8 +1023,8 @@ impl Pipeline {
 
     /// Close the files and write manifest.json; returns a summary line.
     fn finish(mut self) -> Result<String> {
-        let Writers { cur, hist, parents } = self.join_writer()?;
-        let Pipeline { out, locator, counts, versions, layout, .. } = self;
+        let Writers { cur, hist, parents, locator } = self.join_writer()?;
+        let Pipeline { out, counts, versions, layout, .. } = self;
         for l in locator {
             l.close()?;
         }
@@ -1105,6 +1121,7 @@ pub fn run(args: &Args) -> Result<()> {
             }
         }
     })?;
+    eprintln!("[{:>6.0}s] Relations done: {} current", t0.elapsed().as_secs_f64(), p.counts[2]);
     let summary = p.finish()?;
     println!("history: {summary} {:.1}s", t0.elapsed().as_secs_f64());
     Ok(())

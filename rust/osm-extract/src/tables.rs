@@ -9,9 +9,11 @@ use anyhow::Result;
 use arrow::array::MapFieldNames;
 use arrow::datatypes::{DataType, Field, Fields, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
-use parquet::arrow::ArrowWriter;
+use parquet::arrow::arrow_writer::{ArrowColumnChunk, ArrowLeafColumn, ArrowRowGroupWriterFactory, compute_leaves};
+use parquet::arrow::{ArrowSchemaConverter, add_encoded_arrow_schema_to_metadata};
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
+use parquet::file::writer::SerializedFileWriter;
 use rayon::prelude::*;
 
 pub(crate) const NO_COORD: i32 = i32::MIN;
@@ -139,14 +141,80 @@ pub(crate) fn props() -> Result<WriterProperties> {
         .build())
 }
 
+const ROW_GROUP_ROWS: usize = 1 << 17;
+
+/// One Parquet file of a bucket: the rows of its next row group wait in `pending` until there are
+/// ROW_GROUP_ROWS of them (or the memory budget says now), then the row group's columns are
+/// encoded in parallel and appended. A chunk's rows fall into few buckets (consecutive ids are
+/// neighbours), so parallelism across buckets alone left one thread encoding the busiest bucket
+/// while the others waited for it.
+struct BucketFile {
+    w: SerializedFileWriter<File>,
+    pending: Vec<RecordBatch>,
+    rows: usize,
+    bytes: usize,
+}
+
+impl BucketFile {
+    /// Encode the first `n` pending rows (all of them past the end) as one row group.
+    fn flush(&mut self, schema: &Arc<Schema>, n: usize) -> Result<()> {
+        let (mut take, mut got) = (Vec::new(), 0);
+        while got < n && !self.pending.is_empty() {
+            let b = self.pending.remove(0);
+            if got + b.num_rows() > n {
+                take.push(b.slice(0, n - got));
+                self.pending.insert(0, b.slice(n - got, b.num_rows() - (n - got)));
+                got = n;
+            } else {
+                got += b.num_rows();
+                take.push(b);
+            }
+        }
+        if got == 0 {
+            return Ok(());
+        }
+        self.rows -= got;
+        self.bytes = self.pending.iter().map(|b| b.get_array_memory_size()).sum();
+        let factory = ArrowRowGroupWriterFactory::new(&self.w, schema.clone());
+        let writers = factory.create_column_writers(self.w.flushed_row_groups().len())?;
+        let mut leaves: Vec<Vec<ArrowLeafColumn>> = (0..writers.len()).map(|_| Vec::new()).collect();
+        for b in &take {
+            let mut j = 0;
+            for (field, col) in schema.fields().iter().zip(b.columns()) {
+                for leaf in compute_leaves(field, col)? {
+                    leaves[j].push(leaf);
+                    j += 1;
+                }
+            }
+        }
+        let chunks: Vec<ArrowColumnChunk> = writers
+            .into_par_iter()
+            .zip(leaves)
+            .map(|(mut w, ls)| -> Result<ArrowColumnChunk> {
+                for l in &ls {
+                    w.write(l)?;
+                }
+                Ok(w.close()?)
+            })
+            .collect::<Result<_>>()?;
+        let mut rg = self.w.next_row_group()?;
+        for c in chunks {
+            c.append_to_row_group(&mut rg)?;
+        }
+        rg.close()?;
+        Ok(())
+    }
+}
+
 /// One lazily created Parquet file per bucket; buckets are written in parallel. Each open file
-/// buffers its current row group in memory, so with thousands of buckets the buffers, not the data,
+/// buffers its next row group in memory, so with thousands of buckets the buffers, not the data,
 /// decide the memory use: past WRITER_BUDGET bytes per table the largest buffers are flushed early
 /// (smaller row groups in the raw files, bounded memory at any scale).
 pub(crate) struct Buckets {
     dir: PathBuf,
     schema: Arc<Schema>,
-    writers: Vec<Mutex<Option<ArrowWriter<File>>>>,
+    props: Arc<WriterProperties>,
+    files: Vec<Mutex<Option<BucketFile>>>,
     rows: Vec<Mutex<u64>>,
 }
 
@@ -159,22 +227,36 @@ pub(crate) fn set_writer_budget_mb(mb: usize) {
 impl Buckets {
     pub(crate) fn new(dir: PathBuf, schema: Arc<Schema>, n: usize) -> Result<Self> {
         std::fs::create_dir_all(&dir)?;
+        let mut props = props()?;
+        add_encoded_arrow_schema_to_metadata(&schema, &mut props); // as ArrowWriter would
         Ok(Buckets {
             dir,
             schema,
-            writers: (0..n).map(|_| Mutex::new(None)).collect(),
+            props: Arc::new(props),
+            files: (0..n).map(|_| Mutex::new(None)).collect(),
             rows: (0..n).map(|_| Mutex::new(0)).collect(),
         })
     }
 
-    fn write(&self, bucket: usize, batch: &RecordBatch) -> Result<()> {
-        let mut w = self.writers[bucket].lock().unwrap();
-        if w.is_none() {
-            let f = File::create(self.dir.join(format!("{bucket:04}.parquet")))?;
-            *w = Some(ArrowWriter::try_new(f, self.schema.clone(), Some(props()?))?);
+    fn open(&self, name: &str) -> Result<SerializedFileWriter<File>> {
+        let f = File::create(self.dir.join(name))?;
+        let desc = ArrowSchemaConverter::new().with_coerce_types(self.props.coerce_types()).convert(&self.schema)?;
+        Ok(SerializedFileWriter::new(f, desc.root_schema_ptr(), self.props.clone())?)
+    }
+
+    fn write(&self, bucket: usize, batch: RecordBatch) -> Result<()> {
+        let mut f = self.files[bucket].lock().unwrap();
+        if f.is_none() {
+            *f = Some(BucketFile { w: self.open(&format!("{bucket:04}.parquet"))?, pending: Vec::new(), rows: 0, bytes: 0 });
         }
-        w.as_mut().unwrap().write(batch)?;
+        let f = f.as_mut().unwrap();
         *self.rows[bucket].lock().unwrap() += batch.num_rows() as u64;
+        f.rows += batch.num_rows();
+        f.bytes += batch.get_array_memory_size();
+        f.pending.push(batch);
+        while f.rows >= ROW_GROUP_ROWS {
+            f.flush(&self.schema, ROW_GROUP_ROWS)?;
+        }
         Ok(())
     }
 
@@ -192,7 +274,7 @@ impl Buckets {
             by.entry(k).or_default().push(r);
         }
         let groups: Vec<(usize, Vec<&T>)> = by.into_iter().collect();
-        groups.into_par_iter().try_for_each(|(b, rs)| self.write(b, &build(&rs)?))?;
+        groups.into_par_iter().try_for_each(|(b, rs)| self.write(b, build(&rs)?))?;
         self.limit_memory()
     }
 
@@ -200,12 +282,11 @@ impl Buckets {
         let budget = WRITER_BUDGET.load(std::sync::atomic::Ordering::Relaxed);
         let mut sizes: Vec<(usize, usize)> = Vec::new();
         let mut total = 0;
-        for (i, w) in self.writers.iter().enumerate() {
-            if let Some(w) = w.lock().unwrap().as_ref() {
-                let m = w.memory_size();
-                total += m;
-                if m > 0 {
-                    sizes.push((m, i));
+        for (i, f) in self.files.iter().enumerate() {
+            if let Some(f) = f.lock().unwrap().as_ref() {
+                total += f.bytes;
+                if f.bytes > 0 {
+                    sizes.push((f.bytes, i));
                 }
             }
         }
@@ -217,7 +298,7 @@ impl Buckets {
             if total <= budget / 2 {
                 break;
             }
-            self.writers[i].lock().unwrap().as_mut().unwrap().flush()?;
+            self.files[i].lock().unwrap().as_mut().unwrap().flush(&self.schema, usize::MAX)?;
             total -= m;
         }
         Ok(())
@@ -225,17 +306,19 @@ impl Buckets {
 
     /// Close all files; a table with no rows still gets one empty file so its schema is known.
     pub(crate) fn close(self) -> Result<u64> {
-        let mut total = 0;
-        for (w, r) in self.writers.into_iter().zip(self.rows) {
-            if let Some(w) = w.into_inner().unwrap() {
-                w.close()?;
-            }
-            total += r.into_inner().unwrap();
-        }
+        let total: u64 = self.rows.iter().map(|r| *r.lock().unwrap()).sum();
         if total == 0 {
-            let f = File::create(self.dir.join("0000.parquet"))?;
-            ArrowWriter::try_new(f, self.schema.clone(), Some(props()?))?.close()?;
+            self.open("0000.parquet")?.close()?;
         }
+        // every open bucket writes its last row group here: all at once
+        let schema = self.schema.clone();
+        self.files.into_par_iter().try_for_each(|f| -> Result<()> {
+            if let Some(mut f) = f.into_inner().unwrap() {
+                f.flush(&schema, usize::MAX)?;
+                f.w.close()?;
+            }
+            Ok(())
+        })?;
         Ok(total)
     }
 }
