@@ -274,7 +274,14 @@ impl Buckets {
             by.entry(k).or_default().push(r);
         }
         let groups: Vec<(usize, Vec<&T>)> = by.into_iter().collect();
-        groups.into_par_iter().try_for_each(|(b, rs)| self.write(b, build(&rs)?))?;
+        groups.into_par_iter().try_for_each(|(b, rs)| -> Result<()> {
+            // a busy bucket's batch is built in slices, in parallel too
+            let batches: Vec<RecordBatch> = rs.par_chunks(1 << 15).map(|c| build(c)).collect::<Result<_>>()?;
+            for batch in batches {
+                self.write(b, batch)?;
+            }
+            Ok(())
+        })?;
         self.limit_memory()
     }
 

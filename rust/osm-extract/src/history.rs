@@ -119,7 +119,7 @@ fn rel_version(r: &osmpbf::Relation) -> Version {
 }
 
 fn decode(block: &PrimitiveBlock) -> Vec<Version> {
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(8192); // a block holds up to 8,000 elements
     for g in block.groups() {
         out.extend(g.dense_nodes().map(|n| dense_version(&n)));
         out.extend(g.nodes().map(|n| node_version(&n)));
@@ -949,7 +949,9 @@ impl Pipeline {
     /// Versions in PBF order; `last` flushes the final group.
     fn feed(&mut self, vs: Vec<Version>, last: bool) -> Result<()> {
         self.versions += vs.len() as u64;
-        self.pending.extend(vs);
+        // the chunk becomes the pending vector; the leftover group (a few versions) goes in front
+        let leftover = std::mem::replace(&mut self.pending, vs);
+        self.pending.splice(0..0, leftover);
         let mut by_kind: [Vec<Vec<Version>>; 3] = [Vec::new(), Vec::new(), Vec::new()];
         for g in take_groups(&mut self.pending, last) {
             by_kind[g[0].kind.index()].push(g);
