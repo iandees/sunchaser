@@ -127,10 +127,15 @@ pub(crate) fn extend_bbox(b: &mut [i32; 4], la_min: i32, la_max: i32, lo_min: i3
 
 // ---- output ---------------------------------------------------------------------
 
+/// No dictionary encoding: on ids, coordinates and times it hashed every value into a dictionary
+/// as large as the column and then fell back to plain, on the one thread that writes each bucket
+/// (about 10% of the planet extract's CPU), and zstd compresses plain pages better anyway
+/// (Minnesota: 2.6 GB -> 1.7 GB, the strings included).
 pub(crate) fn props() -> Result<WriterProperties> {
     Ok(WriterProperties::builder()
         .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
         .set_max_row_group_row_count(Some(1 << 17))
+        .set_dictionary_enabled(false)
         .build())
 }
 

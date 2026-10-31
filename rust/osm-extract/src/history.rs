@@ -398,20 +398,26 @@ fn version_change(out: &mut Out, v: &Version, prev: Option<i32>) {
     out.changes.push(Change { ts: v.meta.secs, kind: v.kind, id: v.id, old: prev, new: Some(v.meta.version), action });
 }
 
+/// When each version ends: the next one's time (None for the last).
+fn ends(vs: &[Version]) -> Vec<Option<i64>> {
+    (0..vs.len()).map(|k| vs.get(k + 1).map(|n| n.meta.secs)).collect()
+}
+
 fn node_group(vs: Vec<Version>) -> Out {
     let vs = collapse(vs);
     let mut out = Out::default();
     let mut prev: Option<i32> = None;
     let mut prev_pos: Option<(i32, i32)> = None;
     let mut tl = Vec::new();
-    for (k, v) in vs.iter().enumerate() {
+    let id = vs.first().map(|v| v.id);
+    let ends = ends(&vs);
+    for (v, next) in vs.into_iter().zip(ends) {
         let t = v.meta.secs;
-        let next = vs.get(k + 1).map(|n| n.meta.secs);
         let pos = if v.meta.visible {
             let Body::Node(la, lo) = v.body else { unreachable!() };
-            version_change(&mut out, v, prev);
-            out.rows.push(Row { v: v.clone(), from: t, to: next, qt: quadtile::node_index(la, lo), bbox: [la, la, lo, lo], coords: vec![] });
+            version_change(&mut out, &v, prev);
             prev = Some(v.meta.version);
+            out.rows.push(Row { v, from: t, to: next, qt: quadtile::node_index(la, lo), bbox: [la, la, lo, lo], coords: vec![] });
             Some((la, lo))
         } else {
             if prev.is_some() {
@@ -426,7 +432,7 @@ fn node_group(vs: Vec<Version>) -> Out {
         }
         prev_pos = pos;
     }
-    out.timeline = vs.first().map(|v| (v.id, Track::Node(tl)));
+    out.timeline = id.map(|id| (id, Track::Node(tl)));
     out
 }
 
@@ -450,18 +456,19 @@ fn way_group(vs: Vec<Version>, nodes: &Timeline<16>) -> Out {
     let vs = collapse(vs);
     let mut out = Out::default();
     let mut prev: Option<i32> = None;
-    let mut prev_coords: Option<Vec<(i32, i32)>> = None;
+    let mut prev_row: Option<usize> = None; // the last row since the way last came into existence
     let mut tl = Vec::new();
-    for (k, v) in vs.iter().enumerate() {
+    let id = vs.first().map(|v| v.id);
+    let ends = ends(&vs);
+    for (v, end) in vs.into_iter().zip(ends) {
         let t = v.meta.secs;
-        let end = vs.get(k + 1).map(|n| n.meta.secs);
         if !v.meta.visible {
             if prev.is_some() {
                 out.changes.push(Change { ts: t, kind: Kind::Ways, id: v.id, old: prev, new: None, action: "delete" });
                 tl.push(wrec(t, false, 0, MISSING_BBOX));
             }
             prev = None;
-            prev_coords = None;
+            prev_row = None;
             continue;
         }
         let Body::Way(refs) = &v.body else { unreachable!() };
@@ -485,29 +492,32 @@ fn way_group(vs: Vec<Version>, nodes: &Timeline<16>) -> Out {
             }
             slices.push((s, c));
         }
-        for (i, (s, c)) in slices.iter().enumerate() {
-            if i == 0 {
-                version_change(&mut out, v, prev);
-            } else {
-                out.changes.push(Change { ts: *s, kind: Kind::Ways, id: v.id, old: Some(v.meta.version), new: Some(v.meta.version), action: "geometry" });
-            }
-            let (qt, b) = way_key(c);
-            if prev_coords.as_ref() != Some(c) {
-                tl.push(wrec(*s, true, qt, b));
-            }
-            prev_coords = Some(c.clone());
-            let to = slices.get(i + 1).map(|n| n.0).or(end);
-            out.rows.push(Row { v: v.clone(), from: *s, to, qt, bbox: b, coords: c.clone() });
-        }
-        prev = Some(v.meta.version);
         if end.is_none() {
             let mut rs: Vec<i64> = refs.clone();
             rs.sort_unstable();
             rs.dedup();
             out.parents.extend(rs.into_iter().map(|n| (n, v.id)));
         }
+        version_change(&mut out, &v, prev);
+        prev = Some(v.meta.version);
+        let (id, version) = (v.id, v.meta.version);
+        let starts: Vec<i64> = slices.iter().map(|s| s.0).collect();
+        let mut v = Some(v); // the last row takes the version itself, earlier rows (rare) a clone
+        for (i, (s, c)) in slices.into_iter().enumerate() {
+            if i > 0 {
+                out.changes.push(Change { ts: s, kind: Kind::Ways, id, old: Some(version), new: Some(version), action: "geometry" });
+            }
+            let (qt, b) = way_key(&c);
+            if prev_row.is_none_or(|r| out.rows[r].coords != c) {
+                tl.push(wrec(s, true, qt, b));
+            }
+            let to = starts.get(i + 1).copied().or(end);
+            let rv = if i + 1 == starts.len() { v.take().unwrap() } else { v.as_ref().unwrap().clone() };
+            out.rows.push(Row { v: rv, from: s, to, qt, bbox: b, coords: c });
+            prev_row = Some(out.rows.len() - 1);
+        }
     }
-    out.timeline = vs.first().map(|v| (v.id, Track::Way(tl)));
+    out.timeline = id.map(|id| (id, Track::Way(tl)));
     out
 }
 
@@ -530,9 +540,9 @@ fn rel_group(vs: Vec<Version>, nodes: &Timeline<16>, ways: &Timeline<32>) -> Out
     let vs = collapse(vs);
     let mut out = Out::default();
     let mut prev: Option<i32> = None;
-    for (k, v) in vs.iter().enumerate() {
+    let ends = ends(&vs);
+    for (v, end) in vs.into_iter().zip(ends) {
         let t = v.meta.secs;
-        let end = vs.get(k + 1).map(|n| n.meta.secs);
         if !v.meta.visible {
             if prev.is_some() {
                 out.changes.push(Change { ts: t, kind: Kind::Relations, id: v.id, old: prev, new: None, action: "delete" });
@@ -557,7 +567,7 @@ fn rel_group(vs: Vec<Version>, nodes: &Timeline<16>, ways: &Timeline<32>) -> Out
             events.extend(times.filter(|&x| x > t && end.is_none_or(|e| x < e)).map(|x| (x, i)));
         }
         events.sort_unstable();
-        version_change(&mut out, v, prev);
+        version_change(&mut out, &v, prev);
         let (qt, b) = state.key();
         let mut starts: Vec<(i64, u32, [i32; 4])> = vec![(t, qt, b)];
         let mut e = 0;
@@ -580,11 +590,13 @@ fn rel_group(vs: Vec<Version>, nodes: &Timeline<16>, ways: &Timeline<32>) -> Out
                 starts.push((s, qt, b));
             }
         }
+        prev = Some(v.meta.version);
+        let mut v = Some(v); // the last row takes the version itself, earlier rows (rare) a clone
         for (i, &(s, qt, b)) in starts.iter().enumerate() {
             let to = starts.get(i + 1).map(|n| n.0).or(end);
-            out.rows.push(Row { v: v.clone(), from: s, to, qt, bbox: b, coords: vec![] });
+            let rv = if i + 1 == starts.len() { v.take().unwrap() } else { v.as_ref().unwrap().clone() };
+            out.rows.push(Row { v: rv, from: s, to, qt, bbox: b, coords: vec![] });
         }
-        prev = Some(v.meta.version);
     }
     out
 }
@@ -806,7 +818,10 @@ impl Writers {
                 )
             },
         );
-        r1.and(r2).and(r3).and(r4)
+        let r = r1.and(r2).and(r3).and(r4);
+        drop((rows, cur, hist, cs, parents));
+        outs.into_par_iter().for_each(drop); // several frees per row: on the main thread it was 12% of it
+        r
     }
 }
 
