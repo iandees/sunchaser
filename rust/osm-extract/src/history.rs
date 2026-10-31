@@ -143,16 +143,17 @@ fn info_meta(i: &osmpbf::Info) -> Meta {
 /// Versions sorted by version; those sharing a timestamp collapse to the last one.
 fn collapse(mut vs: Vec<Version>) -> Vec<Version> {
     vs.sort_by_key(|v| v.meta.version);
-    let mut out: Vec<Version> = Vec::with_capacity(vs.len());
-    for v in vs {
-        if let Some(last) = out.last() {
-            if last.meta.secs >= v.meta.secs {
-                out.pop(); // same second (or a clock going backwards): the later version wins
-            }
+    // same second (or a clock going backwards): the later version wins. dedup_by drops the later
+    // element when the closure says so, hence the swap to keep it (in place: no second vector).
+    vs.dedup_by(|later, earlier| {
+        if earlier.meta.secs >= later.meta.secs {
+            std::mem::swap(later, earlier);
+            true
+        } else {
+            false
         }
-        out.push(v);
-    }
-    out
+    });
+    vs
 }
 
 // ---- timelines: id -> time-ordered fixed-size records ------------------------------
@@ -748,12 +749,12 @@ fn changes_batch(cs: &[&Change]) -> Result<RecordBatch> {
 
 // ---- driver -------------------------------------------------------------------------
 
+/// The bucketed tables. They are written on their own thread (see `Pipeline`), a chunk at a time.
 struct Writers {
     cur: [Buckets; 3],
     /// None with --no-history: no *_history tables and no changes log
     hist: Option<([Buckets; 3], Buckets)>,
     parents: Buckets,
-    locator: Vec<ArrowWriter<File>>,
 }
 
 impl Writers {
@@ -765,8 +766,8 @@ impl Writers {
         let cs: Vec<&Change> = outs.iter().flat_map(|o| o.changes.iter()).collect();
         let parents: Vec<&(i64, i64)> = outs.iter().flat_map(|o| o.parents.iter()).collect();
         let bucket = |q: u32| layout.bucket(kind, q);
-        let Writers { cur: cw, hist: hw, parents: pw, locator } = self;
-        let (cw, loc) = (&cw[k], &mut locator[k]);
+        let Writers { cur: cw, hist: hw, parents: pw } = self;
+        let cw = &cw[k];
         let ((r1, r2), (r3, r4)) = rayon::join(
             || {
                 rayon::join(
@@ -774,9 +775,6 @@ impl Writers {
                         if cur.is_empty() {
                             return Ok(());
                         }
-                        let ids = Int64Array::from_iter_values(cur.iter().map(|r| r.v.id));
-                        let qts = UInt32Array::from_iter_values(cur.iter().map(|r| r.qt));
-                        loc.write(&RecordBatch::try_new(locator_schema(), vec![Arc::new(ids), Arc::new(qts)])?)?;
                         let keys: Vec<usize> = cur.iter().map(|r| bucket(r.qt)).collect();
                         cw.write_rows(&keys, &cur, |rs| batch(kind, rs, false))
                     },
@@ -845,9 +843,15 @@ fn take_groups(pending: &mut Vec<Version>, last_chunk: bool) -> Vec<Vec<Version>
 
 /// One history extraction: version groups in, bucketed raw tables out. Fed in PBF order; a group
 /// may continue in the next feed (versions of one element spanning blocks).
+/// The bucketed tables are written on a writer thread, one chunk behind: writing parallelises
+/// over the buckets a chunk touches, few for the consecutive ids of a chunk, and waiting for it
+/// was 40% of the main thread. The locator (in id order, which the build relies on) is written
+/// here, and the timelines are appended here, both in chunk order.
 struct Pipeline {
     out: PathBuf,
-    w: Writers,
+    writer: Option<std::thread::JoinHandle<Result<Writers>>>,
+    tx: Option<std::sync::mpsc::SyncSender<(Kind, Vec<Out>)>>,
+    locator: Vec<ArrowWriter<File>>,
     nodes: Timeline<16>,
     ways: Timeline<32>,
     counts: [u64; 3],
@@ -888,7 +892,6 @@ impl Pipeline {
                 None
             },
             parents: mk("node_parent_ways", parents_schema(), nb)?,
-            locator,
         };
         let (nodes, ways) = match dense {
             Some((dir, max_node, max_way)) => {
@@ -897,9 +900,20 @@ impl Pipeline {
             }
             None => (Timeline::ram(), Timeline::ram()),
         };
+        // one chunk queued at most: three chunks of output alive at once (queued, written, produced)
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(Kind, Vec<Out>)>(1);
+        let writer = std::thread::spawn(move || -> Result<Writers> {
+            let mut w = w;
+            for (kind, outs) in rx {
+                w.write(kind, outs, layout)?;
+            }
+            Ok(w)
+        });
         Ok(Pipeline {
             out: out.to_path_buf(),
-            w,
+            writer: Some(writer),
+            tx: Some(tx),
+            locator,
             nodes,
             ways,
             counts: [0; 3],
@@ -961,23 +975,40 @@ impl Pipeline {
                 Kind::Ways => gs.into_par_iter().map(|g| way_group(g, nodes)).collect(),
                 Kind::Relations => gs.into_par_iter().map(|g| rel_group(g, nodes, ways)).collect(),
             };
+            let (mut ids, mut qts) = (Vec::new(), Vec::new());
             for o in &outs {
-                self.counts[kind.index()] += o.rows.iter().filter(|r| r.to.is_none()).count() as u64;
+                for r in o.rows.iter().filter(|r| r.to.is_none()) {
+                    ids.push(r.v.id);
+                    qts.push(r.qt);
+                }
                 match &o.timeline {
                     Some((id, Track::Node(recs))) => self.nodes.push(*id, recs)?,
                     Some((id, Track::Way(recs))) => self.ways.push(*id, recs)?,
                     None => {}
                 }
             }
-            self.w.write(kind, outs, self.layout)?;
+            self.counts[kind.index()] += ids.len() as u64;
+            if !ids.is_empty() {
+                let cols = vec![Arc::new(Int64Array::from(ids)) as ArrayRef, Arc::new(UInt32Array::from(qts))];
+                self.locator[kind.index()].write(&RecordBatch::try_new(locator_schema(), cols)?)?;
+            }
+            if self.tx.as_ref().unwrap().send((kind, outs)).is_err() {
+                self.join_writer()?; // it stopped on an error: that is the one to report
+                bail!("writer thread stopped");
+            }
         }
         Ok(())
     }
 
+    fn join_writer(&mut self) -> Result<Writers> {
+        drop(self.tx.take());
+        self.writer.take().expect("writer joined once").join().map_err(|_| anyhow::anyhow!("writer thread panicked"))?
+    }
+
     /// Close the files and write manifest.json; returns a summary line.
-    fn finish(self) -> Result<String> {
-        let Pipeline { out, w, counts, versions, layout, .. } = self;
-        let Writers { cur, hist, parents, locator } = w;
+    fn finish(mut self) -> Result<String> {
+        let Writers { cur, hist, parents } = self.join_writer()?;
+        let Pipeline { out, locator, counts, versions, layout, .. } = self;
         for l in locator {
             l.close()?;
         }
