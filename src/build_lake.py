@@ -3,8 +3,9 @@
 Input: the bucketed output of rust/osm-extract (manifest.json format 2): keys, bboxes, the id
 locator and the node -> way index are precomputed, and rows are split into key-range buckets. Each
 table is filled bucket group by bucket group (sort a group, append it), so the build sorts at most
---group-rows rows at a time and its memory and temp disk stay bounded at planet scale. Only
-tag_postings needs a global sort (by key=value), which DuckDB does out of core.
+--group-rows rows at a time and its memory and temp disk stay bounded at planet scale. tag_postings
+is sorted by key=value, which the buckets are not, so its rows are first staged on local disk in
+key=value ranges of that size and then sorted range by range.
 The SQL macros below are shared with the updater, which computes keys for changed rows.
 """
 import argparse
@@ -211,10 +212,35 @@ def main():
     meta = "version, ts, changeset, uid, \"user\""
     # kv = 'key=value' as one sort/filter column: a single zone-map range per lookup, where separate
     # k/v predicates made DuckDB probe v in every row group (266 vs 15 requests, results/NOTES.md).
-    # The one global sort of the build: per type, out of core; types are appended in order.
-    posting = "SELECT '{t}' AS type, unnest(map_keys(tags)) AS k, unnest(map_values(tags)) AS v, ov_key31(qt) AS qt_key31, id FROM {s}"
-    postings = lambda t: [f"({posting.format(t=t, s=union(src[t]))})"]
-    pcols = "type, k || '=' || v AS kv, k, v, qt_key31, id"
+    posting = ("SELECT type, k || '=' || v AS kv, k, v, qt_key31, id FROM (SELECT '{t}' AS type, "
+               "unnest(map_keys(tags)) AS k, unnest(map_values(tags)) AS v, ov_key31(qt) AS qt_key31, id FROM {s})")
+    psort = "type, kv, qt_key31, id"
+
+    def fill_postings(t):
+        """Append one type's postings, sorted by kv across the whole type like every other table is
+        sorted across its key: the buckets are not in kv order, so the rows are staged on local disk
+        in kv ranges of about --group-rows rows (cut points from a 0.1% sample), and each range is
+        sorted and appended in turn. One ORDER BY over the planet's node postings (a few billion
+        rows) ran out of memory at 70 GB; a range sorts like a bucket group does."""
+        t0 = time.time()
+        p = posting.format(t=t, s=union(src[t]))
+        con.sql(f"CREATE OR REPLACE TEMP TABLE kv_sample AS SELECT kv FROM ({p}) USING SAMPLE 0.1% (bernoulli)")
+        n = con.sql("SELECT count(*) FROM kv_sample").fetchall()[0][0] * 1000
+        parts = max(1, -(-n // args.group_rows))
+        cuts = con.sql(f"SELECT quantile_disc(kv, {[i / parts for i in range(1, parts)]}) "
+                       "FROM kv_sample").fetchall()[0][0] if parts > 1 else []
+        cuts = sorted(set(cuts))  # a kv with more than a range's share of rows repeats as a cut
+        lit = lambda s: "'" + s.replace("'", "''") + "'"
+        part = ("CASE " + " ".join(f"WHEN kv < {lit(c)} THEN {i}" for i, c in enumerate(cuts)) +
+                f" ELSE {len(cuts)} END") if cuts else "0"
+        staged = lake / f"postings_{t}"
+        con.sql(f"COPY (SELECT *, {part} AS part FROM ({p})) TO '{staged}' (FORMAT parquet, PARTITION_BY (part))")
+        print(f"  tag_postings {t}: ~{n / 1e6:.0f} M rows staged in {len(cuts) + 1} kv ranges, "
+              f"{time.time() - t0:.0f}s, peak rss {peak_rss_gb():.1f} GB", flush=True)
+        ranges = [f"read_parquet('{staged}/part={i}/*.parquet')" for i in range(len(cuts) + 1)
+                  if (staged / f"part={i}").exists()]
+        fill("tag_postings", psort, "type, kv, k, v, qt_key31, id", ranges, append=True)
+        shutil.rmtree(staged)
 
     fill("nodes_tagged", "qt, id", f"qt, id, lat, lon, tags, {vf}", src["n"], "WHERE cardinality(tags) > 0")
     fill("nodes_untagged", "qt, id", f"qt, id, lat, lon, tags, {vf}", src["n"], "WHERE cardinality(tags) = 0")
@@ -222,19 +248,21 @@ def main():
         CREATE VIEW lake.nodes AS
         SELECT * FROM lake.nodes_tagged UNION ALL SELECT * FROM lake.nodes_untagged""")
     fill("nodes_meta", "k, id", f"qt AS k, id, {meta}", src["n"])
-    fill("tag_postings", "type, kv, qt_key31, id", pcols, postings("n"))
+    step("lake.tag_postings", f"CREATE TABLE lake.tag_postings SORTED BY ({psort}) AS "
+         f"{posting.format(t='n', s=src['n'][0])} WHERE false")
+    fill_postings("n")
     consume("nodes")
 
     fill("ways", "qt_key31, id", f"""ov_key31(qt) AS qt_key31, ov_level(qt) AS qt_level, qt, id,
          min_lat, max_lat, min_lon, max_lon, tags, nds, nd_lat, nd_lon, {vf}""", src["w"])
     fill("ways_meta", "k, id", f"ov_key31(qt) AS k, id, {meta}", src["w"])
-    fill("tag_postings", "type, kv, qt_key31, id", pcols, postings("w"), append=True)
+    fill_postings("w")
     consume("ways")
 
     fill("relations", "qt_key31, id", f"""ov_key31(qt) AS qt_key31, ov_level(qt) AS qt_level, qt, id,
          min_lat, max_lat, min_lon, max_lon, tags, members, {vf}""", src["r"], threads=1)
     fill("relations_meta", "k, id", f"ov_key31(qt) AS k, id, {meta}", src["r"])
-    fill("tag_postings", "type, kv, qt_key31, id", pcols, postings("r"), append=True)
+    fill_postings("r")
     fill("member_parent_rels", "mtype, mid", "DISTINCT m.type AS mtype, m.ref AS mid, m.id AS rel_id",
          [f"(SELECT id, unnest(members, recursive := true) FROM {union(src['r'])}) m"])
     consume("relations")
