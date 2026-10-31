@@ -390,7 +390,7 @@ enum Track {
 struct Out {
     rows: Vec<Row>,
     changes: Vec<Change>,
-    timeline: Option<(i64, Track)>,
+    timelines: Vec<(i64, Track)>,
     parents: Vec<(i64, i64)>,
 }
 
@@ -404,9 +404,8 @@ fn ends(vs: &[Version]) -> Vec<Option<i64>> {
     (0..vs.len()).map(|k| vs.get(k + 1).map(|n| n.meta.secs)).collect()
 }
 
-fn node_group(vs: Vec<Version>) -> Out {
+fn node_group(vs: Vec<Version>, out: &mut Out) {
     let vs = collapse(vs);
-    let mut out = Out::default();
     let mut prev: Option<i32> = None;
     let mut prev_pos: Option<(i32, i32)> = None;
     let mut tl = Vec::new();
@@ -416,7 +415,7 @@ fn node_group(vs: Vec<Version>) -> Out {
         let t = v.meta.secs;
         let pos = if v.meta.visible {
             let Body::Node(la, lo) = v.body else { unreachable!() };
-            version_change(&mut out, &v, prev);
+            version_change(out, &v, prev);
             prev = Some(v.meta.version);
             out.rows.push(Row { v, from: t, to: next, qt: quadtile::node_index(la, lo), bbox: [la, la, lo, lo], coords: vec![] });
             Some((la, lo))
@@ -433,8 +432,9 @@ fn node_group(vs: Vec<Version>) -> Out {
         }
         prev_pos = pos;
     }
-    out.timeline = id.map(|id| (id, Track::Node(tl)));
-    out
+    if let Some(id) = id {
+        out.timelines.push((id, Track::Node(tl)));
+    }
 }
 
 fn way_key(coords: &[(i32, i32)]) -> (u32, [i32; 4]) {
@@ -449,9 +449,8 @@ fn way_key(coords: &[(i32, i32)]) -> (u32, [i32; 4]) {
     (quadtile::calc_index(&idxs), b)
 }
 
-fn way_group(vs: Vec<Version>, nodes: &Timeline<16>) -> Out {
+fn way_group(vs: Vec<Version>, nodes: &Timeline<16>, out: &mut Out) {
     let vs = collapse(vs);
-    let mut out = Out::default();
     let mut prev: Option<i32> = None;
     let mut prev_row: Option<usize> = None; // the last row since the way last came into existence
     let mut tl = Vec::new();
@@ -499,7 +498,7 @@ fn way_group(vs: Vec<Version>, nodes: &Timeline<16>) -> Out {
             rs.dedup();
             out.parents.extend(rs.into_iter().map(|n| (n, v.id)));
         }
-        version_change(&mut out, &v, prev);
+        version_change(out, &v, prev);
         prev = Some(v.meta.version);
         let (id, version) = (v.id, v.meta.version);
         let starts: Vec<i64> = slices.iter().map(|s| s.0).collect();
@@ -518,8 +517,9 @@ fn way_group(vs: Vec<Version>, nodes: &Timeline<16>) -> Out {
             prev_row = Some(out.rows.len() - 1);
         }
     }
-    out.timeline = id.map(|id| (id, Track::Way(tl)));
-    out
+    if let Some(id) = id {
+        out.timelines.push((id, Track::Way(tl)));
+    }
 }
 
 /// A relation member's timeline (looked up once per version, see way_group).
@@ -554,9 +554,8 @@ impl MemberRecs<'_> {
     }
 }
 
-fn rel_group(vs: Vec<Version>, nodes: &Timeline<16>, ways: &Timeline<32>) -> Out {
+fn rel_group(vs: Vec<Version>, nodes: &Timeline<16>, ways: &Timeline<32>, out: &mut Out) {
     let vs = collapse(vs);
-    let mut out = Out::default();
     let mut prev: Option<i32> = None;
     let ends = ends(&vs);
     for (v, end) in vs.into_iter().zip(ends) {
@@ -588,7 +587,7 @@ fn rel_group(vs: Vec<Version>, nodes: &Timeline<16>, ways: &Timeline<32>) -> Out
             events.extend(m.times().filter(|&x| x > t && end.is_none_or(|e| x < e)).map(|x| (x, i)));
         }
         events.sort_unstable();
-        version_change(&mut out, &v, prev);
+        version_change(out, &v, prev);
         let (qt, b) = state.key();
         let mut starts: Vec<(i64, u32, [i32; 4])> = vec![(t, qt, b)];
         let mut e = 0;
@@ -618,7 +617,6 @@ fn rel_group(vs: Vec<Version>, nodes: &Timeline<16>, ways: &Timeline<32>) -> Out
             out.rows.push(Row { v: rv, from: s, to, qt, bbox: b, coords: vec![] });
         }
     }
-    out
 }
 
 // ---- record batches -----------------------------------------------------------------
@@ -995,17 +993,31 @@ impl Pipeline {
             let local_n = (!want_n.is_empty()).then(|| nodes.gather(want_n));
             let local_w = (!want_w.is_empty()).then(|| ways.gather(want_w));
             let (nodes, ways) = (local_n.as_ref().unwrap_or(nodes), local_w.as_ref().unwrap_or(ways));
-            let outs: Vec<Out> = match kind {
-                Kind::Nodes => gs.into_par_iter().map(node_group).collect(),
-                Kind::Ways => gs.into_par_iter().map(|g| way_group(g, nodes)).collect(),
-                Kind::Relations => gs.into_par_iter().map(|g| rel_group(g, nodes, ways)).collect(),
-            };
+            // one Out per job of many groups, not per group: a group's own vectors were most of
+            // the allocations (and their cross-thread frees most of the allocator's time)
+            let mut gs = gs;
+            let per = if kind == Kind::Relations { 8 } else { 256 }; // a few big relations per job
+            let outs: Vec<Out> = gs
+                .par_chunks_mut(per)
+                .map(|jobs| {
+                    let mut out = Out::default();
+                    for g in jobs {
+                        match kind {
+                            Kind::Nodes => node_group(std::mem::take(g), &mut out),
+                            Kind::Ways => way_group(std::mem::take(g), nodes, &mut out),
+                            Kind::Relations => rel_group(std::mem::take(g), nodes, ways, &mut out),
+                        }
+                    }
+                    out
+                })
+                .collect();
             for o in &outs {
                 self.counts[kind.index()] += o.rows.iter().filter(|r| r.to.is_none()).count() as u64;
-                match &o.timeline {
-                    Some((id, Track::Node(recs))) => self.nodes.push(*id, recs)?,
-                    Some((id, Track::Way(recs))) => self.ways.push(*id, recs)?,
-                    None => {}
+                for (id, track) in &o.timelines {
+                    match track {
+                        Track::Node(recs) => self.nodes.push(*id, recs)?,
+                        Track::Way(recs) => self.ways.push(*id, recs)?,
+                    }
                 }
             }
             if self.tx.as_ref().unwrap().send((kind, outs)).is_err() {
