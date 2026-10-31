@@ -22,7 +22,7 @@ use std::time::Instant;
 
 use anyhow::{Result, bail};
 use arrow::array::{
-    ArrayRef, Int32Builder, Int64Array, Int64Builder, ListBuilder, MapBuilder, StringBuilder, StructBuilder,
+    ArrayRef, Int32Builder, Int64Array, UInt32Array, Int64Builder, ListBuilder, MapBuilder, StringBuilder, StructBuilder,
     TimestampMillisecondBuilder, UInt32Builder,
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
@@ -36,7 +36,7 @@ use crate::Args;
 use crate::quadtile;
 use crate::relstate::{Contrib, RelState};
 use crate::tables::{
-    Buckets, Kind, Layout, MISSING_BBOX, NO_COORD, extend_bbox, locator_batch, locator_schema, map_names,
+    Buckets, Kind, Layout, MISSING_BBOX, NO_COORD, extend_bbox, locator_schema, map_names,
     member_struct_fields, parents_schema, props, schema,
 };
 
@@ -703,7 +703,7 @@ fn changes_schema() -> Arc<Schema> {
     ]))
 }
 
-fn changes_batch(cs: &[Change]) -> Result<RecordBatch> {
+fn changes_batch(cs: &[&Change]) -> Result<RecordBatch> {
     let mut ts = TimestampMillisecondBuilder::new().with_timezone("UTC");
     let (mut t, mut id, mut old, mut new, mut action, mut batch) = (
         StringBuilder::new(),
@@ -750,33 +750,63 @@ impl Writers {
         let rows: Vec<&Row> = outs.iter().flat_map(|o| o.rows.iter()).collect();
         let cur: Vec<&Row> = rows.iter().copied().filter(|r| r.to.is_none()).collect();
         let hist: Vec<&Row> = rows.iter().copied().filter(|r| r.to.is_some_and(|t| t > r.from)).collect();
+        let cs: Vec<&Change> = outs.iter().flat_map(|o| o.changes.iter()).collect();
+        let parents: Vec<&(i64, i64)> = outs.iter().flat_map(|o| o.parents.iter()).collect();
         let bucket = |q: u32| layout.bucket(kind, q);
-        if !cur.is_empty() {
-            let b = batch(kind, &cur, false)?;
-            self.locator[k].write(&locator_batch(&b)?)?;
-            let keys: Vec<usize> = cur.iter().map(|r| bucket(r.qt)).collect();
-            self.cur[k].write_split(&[b], |_| keys.clone())?;
-        }
-        if let Some((hw, _)) = self.hist.as_ref().filter(|_| !hist.is_empty()) {
-            let keys: Vec<usize> = hist.iter().map(|r| bucket(r.qt)).collect();
-            hw[k].write_split(&[batch(kind, &hist, true)?], |_| keys.clone())?;
-        }
-        let cs: Vec<Change> = outs.iter().flat_map(|o| o.changes.iter().cloned()).collect();
-        if let Some((_, changes)) = self.hist.as_ref().filter(|_| !cs.is_empty()) {
-            // ~48-day buckets of change time, so the build sorts the log one period at a time
-            let keys: Vec<usize> = cs.iter().map(|c| ((c.ts.max(0) as u64 >> 22) as usize).min(1023)).collect();
-            changes.write_split(&[changes_batch(&cs)?], |_| keys.clone())?;
-        }
-        let parents: Vec<(i64, i64)> = outs.iter().flat_map(|o| o.parents.iter().copied()).collect();
-        if !parents.is_empty() {
-            let (n, w): (Vec<i64>, Vec<i64>) = parents.into_iter().unzip();
-            let pb = RecordBatch::try_new(parents_schema(), vec![Arc::new(Int64Array::from(n)), Arc::new(Int64Array::from(w))])?;
-            self.parents.write_split(&[pb], |b| {
-                let ids = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-                ids.values().iter().map(|&i| layout.parent_bucket(i)).collect()
-            })?;
-        }
-        Ok(())
+        let Writers { cur: cw, hist: hw, parents: pw, locator } = self;
+        let (cw, loc) = (&cw[k], &mut locator[k]);
+        let ((r1, r2), (r3, r4)) = rayon::join(
+            || {
+                rayon::join(
+                    || -> Result<()> {
+                        if cur.is_empty() {
+                            return Ok(());
+                        }
+                        let ids = Int64Array::from_iter_values(cur.iter().map(|r| r.v.id));
+                        let qts = UInt32Array::from_iter_values(cur.iter().map(|r| r.qt));
+                        loc.write(&RecordBatch::try_new(locator_schema(), vec![Arc::new(ids), Arc::new(qts)])?)?;
+                        let keys: Vec<usize> = cur.iter().map(|r| bucket(r.qt)).collect();
+                        cw.write_rows(&keys, &cur, |rs| batch(kind, rs, false))
+                    },
+                    || -> Result<()> {
+                        match hw.as_ref().filter(|_| !hist.is_empty()) {
+                            Some((hw, _)) => {
+                                let keys: Vec<usize> = hist.iter().map(|r| bucket(r.qt)).collect();
+                                hw[k].write_rows(&keys, &hist, |rs| batch(kind, rs, true))
+                            }
+                            None => Ok(()),
+                        }
+                    },
+                )
+            },
+            || {
+                rayon::join(
+                    || -> Result<()> {
+                        match hw.as_ref().filter(|_| !cs.is_empty()) {
+                            Some((_, changes)) => {
+                                // ~48-day buckets of change time, so the build sorts the log one period at a time
+                                let keys: Vec<usize> =
+                                    cs.iter().map(|c| ((c.ts.max(0) as u64 >> 22) as usize).min(1023)).collect();
+                                changes.write_rows(&keys, &cs, changes_batch)
+                            }
+                            None => Ok(()),
+                        }
+                    },
+                    || -> Result<()> {
+                        if parents.is_empty() {
+                            return Ok(());
+                        }
+                        let keys: Vec<usize> = parents.iter().map(|p| layout.parent_bucket(p.0)).collect();
+                        pw.write_rows(&keys, &parents, |rs| {
+                            let n = Int64Array::from_iter_values(rs.iter().map(|p| p.0));
+                            let w = Int64Array::from_iter_values(rs.iter().map(|p| p.1));
+                            Ok(RecordBatch::try_new(parents_schema(), vec![Arc::new(n), Arc::new(w)])?)
+                        })
+                    },
+                )
+            },
+        );
+        r1.and(r2).and(r3).and(r4)
     }
 }
 

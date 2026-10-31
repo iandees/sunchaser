@@ -6,8 +6,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use arrow::array::{MapFieldNames, UInt32Array};
-use arrow::compute::take_record_batch;
+use arrow::array::MapFieldNames;
 use arrow::datatypes::{DataType, Field, Fields, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
@@ -174,24 +173,21 @@ impl Buckets {
         Ok(())
     }
 
-    /// Split `batches` by bucket (rows keep their order) and write the pieces in parallel.
-    pub(crate) fn write_split(&self, batches: &[RecordBatch], bucket_of: impl Fn(&RecordBatch) -> Vec<usize> + Sync) -> Result<()> {
-        let mut pieces: BTreeMap<usize, Vec<RecordBatch>> = BTreeMap::new();
-        for batch in batches {
-            let mut by: BTreeMap<usize, Vec<u32>> = BTreeMap::new();
-            for (row, b) in bucket_of(batch).into_iter().enumerate() {
-                by.entry(b).or_default().push(row as u32);
-            }
-            for (b, rows) in by {
-                let piece = if rows.len() == batch.num_rows() {
-                    batch.clone()
-                } else {
-                    take_record_batch(batch, &UInt32Array::from(rows))?
-                };
-                pieces.entry(b).or_default().push(piece);
-            }
+    /// Group `rows` by `keys[i]` (each group keeps the rows' order), then build every bucket's
+    /// batch with `build` and write it, in parallel across buckets. A bucket is touched by one
+    /// thread only; the memory budget is enforced afterwards.
+    pub(crate) fn write_rows<T: Sync>(
+        &self,
+        keys: &[usize],
+        rows: &[&T],
+        build: impl Fn(&[&T]) -> Result<RecordBatch> + Sync,
+    ) -> Result<()> {
+        let mut by: BTreeMap<usize, Vec<&T>> = BTreeMap::new();
+        for (&k, &r) in keys.iter().zip(rows) {
+            by.entry(k).or_default().push(r);
         }
-        pieces.into_par_iter().try_for_each(|(b, ps)| ps.iter().try_for_each(|p| self.write(b, p)))?;
+        let groups: Vec<(usize, Vec<&T>)> = by.into_iter().collect();
+        groups.into_par_iter().try_for_each(|(b, rs)| self.write(b, &build(&rs)?))?;
         self.limit_memory()
     }
 
@@ -246,10 +242,6 @@ fn key31(v: u32) -> u64 {
 
 pub(crate) fn locator_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false), Field::new("qt", DataType::UInt32, false)]))
-}
-
-pub(crate) fn locator_batch(batch: &RecordBatch) -> Result<RecordBatch> {
-    Ok(RecordBatch::try_new(locator_schema(), vec![batch.column(0).clone(), batch.column_by_name("qt").unwrap().clone()])?)
 }
 
 pub(crate) fn parents_schema() -> Arc<Schema> {
