@@ -125,8 +125,9 @@ def bucketed_sources(con, raw, manifest, group_rows, run_rows):
         src.update(history=True, nh=groups("nodes_history"), wh=groups("ways_history"),
                    rh=groups("relations_history"), changes=groups("changes"))
     if (raw / "locator" / "n.parquet").exists():  # extracts before 2026-11: one file per type, in id order
-        src["locator"] = str(raw / "locator")
         files["locator"] = [str(f) for f in sorted((raw / "locator").glob("*.parquet"))]
+        rows.update(con.sql(f"SELECT file_name, sum(num_rows) FROM parquet_file_metadata({files['locator']}) GROUP BY 1").fetchall())
+        src["loc"] = {k: [[[str(raw / "locator" / f"{k}.parquet")]]] for k in "nwr"}  # one run each: `fill` stages the big ones
     else:
         src["loc"] = {k: groups(f"locator/{k}") for k in "nwr"}
         files["locator"] = [f for k in "nwr" for f in files[f"locator/{k}"]]
@@ -161,11 +162,25 @@ def main():
                     help="bucketed input: rows sorted per insert (bounds memory and temp disk)")
     ap.add_argument("--parallel", type=int, default=os.cpu_count() or 1,
                     help="key sub-ranges of a group inserted concurrently (a sorted insert writes on one thread)")
+    ap.add_argument("--resume", action="store_true",
+                    help="go on from a failed build: keep the catalog and skip the tables <lake>/done.txt lists; "
+                         "the table that was being filled when the build died must be dropped first (or its "
+                         "appended rows deleted), since its finished inserts stayed committed")
     args = ap.parse_args()
     raw, lake = pathlib.Path(args.raw), pathlib.Path(args.lake)
-    if lake.exists():
+    if lake.exists() and not args.resume:
         shutil.rmtree(lake)
-    lake.mkdir(parents=True)
+    lake.mkdir(parents=True, exist_ok=True)
+    for d in lake.glob("staged_*"):
+        shutil.rmtree(d)
+    done_file = lake / "done.txt"  # one line per finished table (or appended part), for --resume
+    done = set(done_file.read_text().split("\n")) if args.resume and done_file.exists() else set()
+    appends = {}
+
+    def finished(key):
+        done.add(key)
+        with done_file.open("a") as f:
+            f.write(key + "\n")
     catalog = args.catalog or lakeconn.env("CATALOG") or f"{lake}/osm.ducklake"
     data_path = args.data_path or lakeconn.env("DATA_PATH") or f"{lake}/data"
 
@@ -180,9 +195,13 @@ def main():
         con.sql(f"CALL lake.set_option('{opt}', {val})")
 
     def step(name, sql):
+        if name in done:
+            print(f"{name:<22} done already")
+            return
         t = time.time()
         con.sql(sql)
         print(f"{name:<22} {time.time() - t:6.1f}s  peak rss {peak_rss_gb():.1f} GB")
+        finished(name)
 
     manifest = raw / "manifest.json"
     if not manifest.exists():
@@ -244,6 +263,12 @@ def main():
         threads=1 for rows with long member lists: a parallel sorted insert into DuckLake runs out of
         memory on them (Berlin's relation history: 303 M members in 490 k rows, 4 threads, 10 GB),
         while one thread spills and finishes; such a group is inserted whole."""
+        if append:  # the n-th append to a table is its own line in done.txt
+            appends[table] = appends.get(table, 0) + 1
+        key_done = f"lake.{table}" + (f"#{appends[table]}" if append else "")
+        if key_done in done:
+            print(f"{key_done:<22} done already", flush=True)
+            return
         t = time.time()
         if threads:
             con.sql(f"SET threads = {threads}")
@@ -273,6 +298,7 @@ def main():
             con.sql("RESET threads")
         print(f"{'lake.' + table:<22} {time.time() - t:6.1f}s  ({len(groups)} groups of up to {max(map(len, groups))})  "
               f"peak rss {peak_rss_gb():.1f} GB", flush=True)
+        finished(key_done)
 
     def consume(*subs):
         """--consume: raw buckets no later step reads are deleted, so the build's peak disk use
@@ -300,6 +326,8 @@ def main():
         """Append one type's postings, sorted by kv across the whole type like every other table is
         sorted across its key: the buckets are not in kv order, so the rows are staged in kv ranges
         first, then sorted and appended --parallel ranges at a time."""
+        if f"lake.tag_postings#{appends.get('tag_postings', 0) + 1}" in done:
+            return fill("tag_postings", psort, "", [], append=True)  # skipped: no staging either
         t0 = time.time()
         staged = lake / f"staged_postings_{t}"
         ranges = stage(posting.format(t=t, s=src["glob"][full[t]]), "kv", staged)
@@ -365,15 +393,9 @@ def main():
              append=True, key="ts")
         consume("changes")
 
-    if "loc" in src:
-        for k in "nwr":
-            fill("elem_locator", "type, id", f"'{k}' AS type, id, qt", src["loc"][k], append=k != "n", key="id")
-    else:
-        t = time.time()  # already in id order: no sort
-        con.sql("CREATE TABLE lake.elem_locator SORTED BY (type, id) AS " + " UNION ALL ".join(
-            f"SELECT * FROM (SELECT '{k}' AS type, id, qt FROM '{src['locator']}/{k}.parquet')" for k in "nwr"))
-        print(f"{'lake.elem_locator':<22} {time.time() - t:6.1f}s", flush=True)
-    consume("locator")
+    for k in "nwr":  # one file per type in the old layout: a sorted table sorts on insert, and one insert
+        fill("elem_locator", "type, id", f"'{k}' AS type, id, qt", src["loc"][k], append=k != "n", key="id")
+    consume("locator")  # of the planet's 11 B node rows ran out of memory at 70 GB, so it is staged like a big bucket
     fill("node_parent_ways", "node_id", "node_id, way_id", src["parents"], key="node_id")  # distinct per way, bucketed by node id
     consume("node_parent_ways")
 

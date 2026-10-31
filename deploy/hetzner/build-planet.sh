@@ -13,7 +13,8 @@
 # (LAKE=s3://bucket/planet) while the env file's lake stays live for the updater and API.
 # CONSUME=1 (default) deletes raw buckets as the build uses them, lowering peak disk, but a build
 # that fails part-way then needs the extract again (rm $DATA/state/extract.done). With room to
-# spare, CONSUME=0 makes the build stage re-runnable on its own.
+# spare, CONSUME=0 makes the build stage re-runnable on its own, and RESUME=1 re-runs it from where it
+# failed (build_lake.py --resume: drop the table it was filling first, its finished inserts are committed).
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 lake_arg=${LAKE:-}
@@ -62,12 +63,17 @@ if stage build; then
     exit 1
   fi
   touch "$DATA/state/build.started"
-  rm -rf "$DATA/build" "$DATA"/catalog.ducklake*  # a fresh catalog; files of a failed attempt in R2 are orphans
+  resume=(); log=()
+  if [ "${RESUME:-0}" = 1 ]; then  # go on from a failed build: tables listed in $DATA/build/done.txt are kept
+    resume=(--resume); log=(-a)
+  else
+    rm -rf "$DATA/build" "$DATA"/catalog.ducklake*  # a fresh catalog; files of a failed attempt in R2 are orphans
+  fi
   lance=(); [ "$LANCE" = 1 ] && lance=(--lance "$LAKE/lance")
   consume=(); [ "$CONSUME" = 1 ] && consume=(--consume)
   $M --label build --watch "$DATA/raw" --watch "$DATA/build" -- uv run python -I src/build_lake.py \
     --raw "$DATA/raw" --lake "$DATA/build" --catalog "$DATA/catalog.ducklake" --data-path "$LAKE/data/" \
-    "${lance[@]}" --group-rows "$GROUP_ROWS" --memory-limit "$MEMORY_LIMIT" "${consume[@]}" 2>&1 | tee "$DATA/logs/build.log"
+    "${lance[@]}" --group-rows "$GROUP_ROWS" --memory-limit "$MEMORY_LIMIT" "${consume[@]}" "${resume[@]}" 2>&1 | tee "${log[@]}" "$DATA/logs/build.log"
   done_ build
 fi
 
