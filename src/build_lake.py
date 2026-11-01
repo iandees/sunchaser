@@ -407,7 +407,7 @@ def main():
 
     if args.lance:
         import lancestore
-        lancestore.build(con, args.lance, args.parallel)
+        lancestore.build(con, args.lance, args.parallel, resume=args.resume)
 
     for tbl, files, mb in con.sql("""
             SELECT table_name, file_count, round(file_size_bytes / 1e6, 1)

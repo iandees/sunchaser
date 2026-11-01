@@ -44,6 +44,7 @@ TABLES = {  # lance table -> (lake table, element type, sort key)
 ROWS_PER_GROUP = 16384
 ROWS_PER_FILE = 1 << 23  # 8 M rows per fragment at build (Lance's default 1 M: 10,000 uploads and a
 #                          manifest of 10,000 entries for the planet's untagged nodes)
+SEGMENT_ROWS = 1 << 28  # rows per id-index segment: 268 M sort in memory (300 M took 115 s, no spill)
 
 
 def storage_options():
@@ -102,14 +103,46 @@ class Store:
     __call__ = dataset  # Engine(lance=store)
 
 
-def build(con, base, parallel=None):
+def index_ids(ds, name):
+    """The BTREE id index, trained one segment per group of fragments of about SEGMENT_ROWS rows and
+    the segments merged (a streaming merge of sorted runs), instead of one sort of the whole column:
+    that sort's merge step cannot spill and ran out of a 60 GB pool on the planet's 10.6 B untagged
+    nodes. Should the merge fail, the segments are committed as they are: a lookup then probes each
+    segment's tree. Returns the number of segments trained."""
+    groups, cur, rows = [], [], 0
+    for f in ds.get_fragments():
+        cur.append(f.fragment_id)
+        rows += f.metadata.physical_rows
+        if rows >= SEGMENT_ROWS:
+            groups.append(cur)
+            cur, rows = [], 0
+    if cur:
+        groups.append(cur)
+    t, segments = time.time(), []
+    for i, g in enumerate(groups):
+        segments.append(ds.create_index_uncommitted("id", "BTREE", name="id_idx", fragment_ids=g))
+        if len(groups) > 1 and time.time() - t >= 60:
+            t = time.time()
+            print(f"  lance {name}: {i + 1}/{len(groups)} index segments trained", flush=True)
+    if len(segments) > 1:
+        try:
+            segments = [ds.merge_existing_index_segments(segments)]
+        except Exception as e:  # noqa: BLE001 - Lance raises OSError for its own errors
+            print(f"  lance {name}: segment merge failed ({str(e)[:200]}); committing {len(segments)} segments", flush=True)
+    ds.commit_existing_index_segments("id_idx", "id", segments)
+    return len(groups)
+
+
+def build(con, base, parallel=None, resume=False):
     """Write the Lance tables from the lake's current state and record their versions.
     A table is written as ranges of its leading sort key of about ROWS_PER_FILE rows (cut points from
     a 0.1% sample), `parallel` at a time: each range is sorted by its own DuckDB cursor, in memory,
     and written as fragments without a commit; the fragments are then committed together in key
     order, so the dataset is in the lake table's order as one sorted write would leave it. One
     sorted stream (a global sort spilling 450 GB, then one upload at a time, 60% of a core) took
-    5.7 h for the planet's 10.6 B untagged nodes."""
+    5.7 h for the planet's 10.6 B untagged nodes. The id index is built by `index_ids`.
+    `resume`: a table whose dataset already holds the lake table's row count is kept (indexed if
+    it has no id index yet) rather than written again."""
     from concurrent.futures import ThreadPoolExecutor
     base = base.rstrip("/")
     parallel = parallel or os.cpu_count() or 1
@@ -118,6 +151,19 @@ def build(con, base, parallel=None):
         t = time.time()
         uri, key = f"{base}/{name}.lance", order.split(",")[0]
         n = con.sql(f"SELECT count(*) FROM lake.{tbl}").fetchall()[0][0]
+        if resume:
+            try:
+                ds = lance.dataset(uri, storage_options=storage_options())
+            except ValueError:  # no dataset there
+                ds = None
+            if ds is not None and ds.count_rows() == n:
+                indexed = any(i["name"] == "id_idx" for i in ds.list_indices())
+                segments = 0 if indexed else index_ids(ds, name)
+                ds = lance.dataset(uri, storage_options=storage_options())
+                versions[name] = ds.version
+                print(f"lance {name:<15} rows={n:>10} {time.time() - t:6.1f}s  (kept from the last run"
+                      f"{'' if indexed else f', index {segments} segments'})", flush=True)
+                continue
         parts = max(1, -(-n // ROWS_PER_FILE))
         cuts = []
         if parts > 1:
@@ -151,11 +197,11 @@ def build(con, base, parallel=None):
             fragments = [f for frags in pool.map(write, ranges) for f in frags]  # map keeps the key order
         ds = lance.LanceDataset.commit(uri, lance.LanceOperation.Overwrite(schema, fragments), storage_options=storage_options())
         t_write = time.time() - t
-        ds.create_scalar_index("id", index_type="BTREE")
+        segments = index_ids(ds, name)
         ds = lance.dataset(uri, storage_options=storage_options())
         versions[name] = ds.version
         print(f"lance {name:<15} rows={ds.count_rows():>10} {time.time() - t:6.1f}s  ({len(ranges)} ranges, "
-              f"{len(fragments)} fragments, write {t_write:.0f}s, index {time.time() - t - t_write:.0f}s)", flush=True)
+              f"{len(fragments)} fragments, write {t_write:.0f}s, index {time.time() - t - t_write:.0f}s in {segments} segments)", flush=True)
     con.sql("BEGIN TRANSACTION")
     _set_state(con, base, versions)
     con.sql("COMMIT")
