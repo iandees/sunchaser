@@ -42,6 +42,8 @@ TABLES = {  # lance table -> (lake table, element type, sort key)
     "ways": ("ways", "w", "qt_key31, id"),
 }
 ROWS_PER_GROUP = 16384
+ROWS_PER_FILE = 1 << 23  # 8 M rows per fragment at build (Lance's default 1 M: 10,000 uploads and a
+#                          manifest of 10,000 entries for the planet's untagged nodes)
 
 
 def storage_options():
@@ -100,19 +102,60 @@ class Store:
     __call__ = dataset  # Engine(lance=store)
 
 
-def build(con, base):
-    """Write the Lance tables from the lake's current state and record their versions."""
+def build(con, base, parallel=None):
+    """Write the Lance tables from the lake's current state and record their versions.
+    A table is written as ranges of its leading sort key of about ROWS_PER_FILE rows (cut points from
+    a 0.1% sample), `parallel` at a time: each range is sorted by its own DuckDB cursor, in memory,
+    and written as fragments without a commit; the fragments are then committed together in key
+    order, so the dataset is in the lake table's order as one sorted write would leave it. One
+    sorted stream (a global sort spilling 450 GB, then one upload at a time, 60% of a core) took
+    5.7 h for the planet's 10.6 B untagged nodes."""
+    from concurrent.futures import ThreadPoolExecutor
     base = base.rstrip("/")
+    parallel = parallel or os.cpu_count() or 1
     versions = {}
     for name, (tbl, _, order) in TABLES.items():
         t = time.time()
-        reader = con.sql(f"SELECT * FROM lake.{tbl} ORDER BY {order}").to_arrow_reader(ROWS_PER_GROUP * 8)
-        ds = lance.write_dataset(reader, f"{base}/{name}.lance", mode="overwrite", max_rows_per_group=ROWS_PER_GROUP,
-                                 storage_options=storage_options())
+        uri, key = f"{base}/{name}.lance", order.split(",")[0]
+        n = con.sql(f"SELECT count(*) FROM lake.{tbl}").fetchall()[0][0]
+        parts = max(1, -(-n // ROWS_PER_FILE))
+        cuts = []
+        if parts > 1:
+            con.sql(f"CREATE OR REPLACE TEMP TABLE lance_sample AS SELECT {key} AS x FROM lake.{tbl} USING SAMPLE 0.1% (bernoulli)")
+            cuts = con.sql(f"SELECT quantile_disc(x, {[i / parts for i in range(1, parts)]}) FROM lance_sample").fetchall()[0][0]
+            cuts = sorted(set(c for c in cuts if c is not None))
+        bounds = [None] + cuts + [None]
+        ranges = [(bounds[i], bounds[i + 1]) for i in range(len(bounds) - 1)]  # half-open on the key: no row twice
+        schema = con.sql(f"SELECT * FROM lake.{tbl} LIMIT 0").to_arrow_table().schema
+        done, last_report, lock = [0], [t], threading.Lock()
+
+        def write(rng):
+            lo, hi = rng
+            where = [f"{key} >= {lo}"] * (lo is not None) + [f"{key} < {hi}"] * (hi is not None)
+            cur = con.cursor()
+            try:
+                reader = cur.sql(f"SELECT * FROM lake.{tbl} {'WHERE ' + ' AND '.join(where) if where else ''} "
+                                 f"ORDER BY {order}").to_arrow_reader(ROWS_PER_GROUP * 8)
+                frags = lance.fragment.write_fragments(reader, uri, schema, mode="overwrite", max_rows_per_file=ROWS_PER_FILE,
+                                                       max_rows_per_group=ROWS_PER_GROUP, storage_options=storage_options())
+            finally:
+                cur.close()
+            with lock:
+                done[0] += 1
+                if time.time() - last_report[0] >= 60:
+                    last_report[0] = time.time()
+                    print(f"  lance {name}: {done[0]}/{len(ranges)} ranges written, {last_report[0] - t:.0f}s", flush=True)
+            return frags
+
+        with ThreadPoolExecutor(min(parallel, len(ranges))) as pool:
+            fragments = [f for frags in pool.map(write, ranges) for f in frags]  # map keeps the key order
+        ds = lance.LanceDataset.commit(uri, lance.LanceOperation.Overwrite(schema, fragments), storage_options=storage_options())
+        t_write = time.time() - t
         ds.create_scalar_index("id", index_type="BTREE")
-        ds = lance.dataset(f"{base}/{name}.lance", storage_options=storage_options())
+        ds = lance.dataset(uri, storage_options=storage_options())
         versions[name] = ds.version
-        print(f"lance {name:<15} rows={ds.count_rows():>10} {time.time() - t:6.1f}s", flush=True)
+        print(f"lance {name:<15} rows={ds.count_rows():>10} {time.time() - t:6.1f}s  ({len(ranges)} ranges, "
+              f"{len(fragments)} fragments, write {t_write:.0f}s, index {time.time() - t - t_write:.0f}s)", flush=True)
     con.sql("BEGIN TRANSACTION")
     _set_state(con, base, versions)
     con.sql("COMMIT")
