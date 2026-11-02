@@ -477,7 +477,7 @@ class Updater:
 
     def _archive(self, t, ids, keys):
         """Copy the outgoing versions of ids, with their metadata, into the history table. The rows
-        are read once into the temp table old_{t}; the tag_postings delete prunes by their tags."""
+        are read once into the temp table old_{t}, which the postings rewrite diffs against."""
         if not ids:
             return
         meta = f"(SELECT * FROM lake.{ {'n': 'nodes', 'w': 'ways', 'r': 'relations'}[t]}_meta WHERE {self._where(t, ids, 'k', keys=keys)})"
@@ -493,11 +493,6 @@ class Updater:
             SELECT c.*, x.t AS valid_to, m.version, m.ts, m.changeset, m.uid, m."user"
             FROM old_{t} c JOIN upd_ct x ON x.type = '{t}' AND x.id = c.id
             LEFT JOIN {meta} m ON m.id = c.id""")
-
-    def _old_kvs(self, t):
-        """The distinct key=value strings of the outgoing rows of type t (their tag_postings rows)."""
-        return [kv for (kv,) in self.sql(f"""SELECT DISTINCT k || '=' || v FROM (
-            SELECT unnest(map_keys(tags)) AS k, unnest(map_values(tags)) AS v FROM old_{t})""").fetchall()]
 
     def _log_changes(self, touched, old, direct):
         """lake.changes: one row per element and batch (drives changed / [diff] / [adiff])."""
@@ -574,33 +569,80 @@ class Updater:
         for t, src in (("n", "upd_n"), ("w", "upd_w"), ("r", "upd_r")):
             ids = old[t]
             if ids:
-                # postings are sorted by (type, kv, key, id): the outgoing rows' own tags and keys prune
-                # the delete to their files, where (type, id) alone scans the whole type
-                self.sql(f"DELETE FROM lake.tag_postings WHERE type = '{t}' AND {self.e._points_sql('kv', self._old_kvs(t), quote=True)} "
-                         f"AND {self._where(t, ids, 'qt_key31', keys=list(ids.values()))}")
                 self.sql(f"DELETE FROM lake.elem_locator WHERE type = '{t}' AND {self.e._id_pred('id', sorted(ids))}")
-            self.sql(f"""INSERT INTO lake.tag_postings
-                SELECT '{t}', k || '=' || v, k, v, ov_key31(qt), id FROM (
-                  SELECT unnest(map_keys(tags)) AS k, unnest(map_values(tags)) AS v, qt, id FROM {src})""")
             self.sql(f"INSERT INTO lake.elem_locator SELECT '{t}', id, qt FROM {src}")
+            self._rewrite_postings(t, src, bool(ids))
 
         # reverse indexes: only elements whose refs/members changed (cascade-only rows keep theirs)
-        if old_way_refs:
-            refs = sorted({n for nds in old_way_refs.values() for n in nds})
-            self.sql(f"""DELETE FROM lake.node_parent_ways WHERE {self.e._id_pred('node_id', refs)}
-                         AND way_id IN ({self.ids_sql(old_way_refs)})""")
-        changed_ways = self.ids_sql({i for i, r in ways.items() if not r["deleted"]})
-        self.sql(f"INSERT INTO lake.node_parent_ways SELECT DISTINCT unnest(nds), id FROM upd_w WHERE id IN ({changed_ways})")
-        if old_rel_members:
-            for mt in "nwr":
-                mids = sorted({m["ref"] for ms in old_rel_members.values() for m in ms if m["type"] == mt})
-                if mids:
-                    self.sql(f"""DELETE FROM lake.member_parent_rels WHERE mtype = '{mt}'
-                                 AND {self.e._id_pred('mid', mids)} AND rel_id IN ({self.ids_sql(old_rel_members)})""")
-        changed_rels = self.ids_sql({i for i, r in rels.items() if not r["deleted"]})
-        self.sql(f"""INSERT INTO lake.member_parent_rels
-                     SELECT DISTINCT m.type, m.ref, m.id FROM (SELECT id, unnest(members, recursive := true) FROM upd_r
-                     WHERE id IN ({changed_rels})) m""")
+        self._rewrite_pairs("node_parent_ways", "node_id", "way_id",
+                            {w: set(nds) for w, nds in old_way_refs.items()},
+                            {w: set(r["nds"]) for w, r in ways.items() if not r["deleted"]})
+        self._rewrite_pairs("member_parent_rels", "mid", "rel_id",
+                            {i: {(m["type"], m["ref"]) for m in ms} for i, ms in old_rel_members.items()},
+                            {i: {(m["type"], m["ref"]) for m in r["members"]} for i, r in rels.items() if not r["deleted"]},
+                            type_col="mtype")
+
+    def _rewrite_pairs(self, table, child_col, parent_col, old, new, type_col=None):
+        """Reverse-index rows (child -> parent) of the parents whose membership this batch rewrites;
+        old/new map a parent to its set of children (ids, or (type, id) with type_col). Only the
+        children a parent dropped are deleted and only the ones it gained inserted: the child id is
+        the table's sort key, so the delete is pruned to their files, where deleting every old pair of
+        the planet's edited ways (an edit keeps most of a way's nodes) cost 424 s a minute diff. A
+        child dropped by one parent and kept by another in the batch is deleted with the former and
+        put back for the latter."""
+        removed = set()
+        for p in set(old) | set(new):
+            removed |= old.get(p, set()) - new.get(p, set())
+        rows = [(c, p) for p, kids in new.items() for c in kids if c in removed or c not in old.get(p, set())]
+        if removed:
+            groups = {None: removed} if type_col is None else {}
+            for c in removed if type_col else ():
+                groups.setdefault(c[0], set()).add(c[1])
+            for ty, kids in groups.items():
+                self.sql(f"DELETE FROM lake.{table} WHERE {f'{type_col} = {ty!r} AND ' if ty else ''}"
+                         f"{self.e._id_pred(child_col, kids)} AND {parent_col} IN ({self.ids_sql(old)})")
+        if rows:
+            cols = {child_col: pa.array([c if type_col is None else c[1] for c, _ in rows], pa.int64()),
+                    parent_col: pa.array([p for _, p in rows], pa.int64())}
+            if type_col:
+                cols[type_col] = pa.array([c[0] for c, _ in rows], pa.string())
+            self.con.register("pairs_arrow", pa.table(cols))
+            self.sql(f"INSERT INTO lake.{table} BY NAME SELECT * FROM pairs_arrow")
+            self.con.unregister("pairs_arrow")
+
+    def _rewrite_postings(self, t, src, had_old):
+        """tag_postings rows of the type-t elements this batch rewrites (old_{t} -> {src}): only the
+        postings an element lost (a tag dropped, or all of them when its key changed) are deleted,
+        pruned by their kv strings, keys and ids (the table's sort order), and only the gained ones
+        inserted. Deleting every posting of every touched element scanned the planet's postings for
+        94 s a minute diff. An element that lost some of a batch's kv strings but kept others is
+        deleted with them and gets the kept ones back."""
+        tagset = lambda tags: set((tags or {}).items())
+        old = {i: (qt.key31(q), tagset(tags)) for i, q, tags in self.sql(f"SELECT id, qt, tags FROM old_{t}").fetchall()} if had_old else {}
+        new = {i: (qt.key31(q), tagset(tags)) for i, q, tags in self.sql(f"SELECT id, qt, tags FROM {src}").fetchall()}
+        gone = {}  # id -> (key, lost (k, v) pairs)
+        for i, (key, kvs) in old.items():
+            nk = new.get(i)
+            lost = kvs if nk is None or nk[0] != key else kvs - nk[1]
+            if lost:
+                gone[i] = (key, lost)
+        lost_kv = {f"{k}={v}" for _, l in gone.values() for k, v in l}
+        if gone:
+            self.sql(f"DELETE FROM lake.tag_postings WHERE type = '{t}' AND {self.e._points_sql('kv', lost_kv, quote=True)} "
+                     f"AND {self.e._points_sql('qt_key31', [k for k, _ in gone.values()])} AND {self.e._id_pred('id', gone)}")
+        rows = []
+        for i, (key, kvs) in new.items():
+            o = old.get(i)
+            for k, v in kvs:
+                if o is None or o[0] != key or (k, v) not in o[1] or (i in gone and f"{k}={v}" in lost_kv):
+                    rows.append((f"{k}={v}", k, v, key, i))
+        if rows:
+            self.con.register("postings_arrow", pa.table({
+                "type": pa.array([t] * len(rows), pa.string()), "kv": [r[0] for r in rows], "k": [r[1] for r in rows],
+                "v": [r[2] for r in rows], "qt_key31": pa.array([r[3] for r in rows], pa.uint64()),
+                "id": pa.array([r[4] for r in rows], pa.int64())}))
+            self.sql("INSERT INTO lake.tag_postings BY NAME SELECT * FROM postings_arrow")
+            self.con.unregister("postings_arrow")
 
 
 REWRITE_DELETED_SHARE = 0.2  # rewrite a data file once this share of its rows is deleted
