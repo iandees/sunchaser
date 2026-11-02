@@ -292,7 +292,7 @@ class Updater:
         # (a tags-only way edit leaves its relations alone, as in Overpass)
         self.batch = {"n": nodes}
         self._stage_nodes(nodes)
-        self._stage_ways(ways, cascade_w)
+        self._stage_ways(ways, cascade_w, old=[i for i in ways if i in ex["w"]])
         mod_w = sorted(i for i, r in ways.items() if i in ex["w"] and not r["deleted"])
         new_xy = {i: (la, lo) for i, la, lo in self.sql(
             f"SELECT id, nd_lat, nd_lon FROM upd_w WHERE id IN ({self.ids_sql(mod_w)})").fetchall()} if mod_w else {}
@@ -380,24 +380,35 @@ class Updater:
             "user": [r["user"] for r in live]}, schema)
         self.sql('CREATE OR REPLACE TEMP TABLE upd_n AS SELECT ov_node_idx(lat, lon) AS qt, * FROM upd_n_raw')
 
-    def _coords(self, refs):
-        """node id -> (lat, lon) from the staged nodes, else from the lake."""
+    def _coords(self, refs, known=None):
+        """node id -> (lat, lon): from the staged nodes, else `known` (coordinates the outgoing way
+        rows carry), else the lake."""
         out = dict(((i, (a, b)) for i, a, b in self.sql(
             f"SELECT id, lat, lon FROM upd_n WHERE id IN ({self.ids_sql(refs)})").fetchall()))
+        if known:
+            out.update((i, known[i]) for i in refs if i in known and i not in out)
         rest = sorted(set(refs) - set(out))
         if rest:
             out.update((i, (a, b)) for i, a, b in self.e.elements_by_id("n", rest, ["id", "lat", "lon"]))
         return out
 
-    def _stage_ways(self, ways, cascade):
+    def _stage_ways(self, ways, cascade, old=()):
+        """Stage the batch's ways with their node coordinates. The outgoing rows of the ways the lake
+        already has (`old`, plus the cascade) supply the coordinates of the nodes they keep: a way
+        edit keeps most of its nodes, and a planet batch's 100k node lookups through Lance cost
+        200 s; only nodes the batch moved or added are looked up."""
         rows = [r for r in ways.values() if not r["deleted"]]
-        if cascade:  # geometry-only changes keep tags/meta/refs from the lake
-            meta = self.e.meta("w", sorted(cascade))
-            for i, nds, tags in self.e.elements_by_id("w", sorted(cascade), ["id", "nds", "tags"]):
-                version, ts, changeset, uid, user = meta.get(i, (0, None, 0, 0, ""))
-                rows.append({"id": i, "nds": nds, "tags": list(tags.items()) if isinstance(tags, dict) else tags,
-                             "version": version, "ts": ts, "changeset": changeset, "uid": uid, "user": user})
-        xy = self._coords({n for r in rows for n in r["nds"]})
+        known, dead = {}, {i for i, r in self.batch["n"].items() if r["deleted"]}
+        have = sorted(set(old) | set(cascade))
+        if have:
+            meta = self.e.meta("w", sorted(cascade)) if cascade else {}
+            for i, nds, la, lo, tags in self.e.elements_by_id("w", have, ["id", "nds", "nd_lat", "nd_lon", "tags"]):
+                known.update((n, (a, b)) for n, a, b in zip(nds, la, lo) if a != NO_COORD and n not in dead)
+                if i in cascade:  # geometry-only changes keep tags/meta/refs from the lake
+                    version, ts, changeset, uid, user = meta.get(i, (0, None, 0, 0, ""))
+                    rows.append({"id": i, "nds": nds, "tags": list(tags.items()) if isinstance(tags, dict) else tags,
+                                 "version": version, "ts": ts, "changeset": changeset, "uid": uid, "user": user})
+        xy = self._coords({n for r in rows for n in r["nds"]}, known)
         schema = pa.schema([("id", pa.int64()), ("nds", pa.list_(pa.int64())), ("nd_lat", pa.list_(pa.int32())),
                             ("nd_lon", pa.list_(pa.int32())), ("tags", TAGS_T), *META_T])
         self._register("upd_w_raw", {
