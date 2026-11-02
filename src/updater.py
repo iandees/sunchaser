@@ -46,7 +46,8 @@ MEMBER_T = pa.struct([("type", pa.string()), ("ref", pa.int64()), ("role", pa.st
 
 STOP = threading.Event()  # set by SIGTERM: finish the diff in hand, upload, release the lease, exit
 POLL = 30  # seconds to wait when job --loop finds nothing new
-LOG_SQL = float(os.environ.get("SUNCHASER_LOG_SQL", "0"))  # print every statement slower than this many seconds (0: off)
+LOG_SQL = float(os.environ.get("SUNCHASER_LOG_SQL", "0"))  # print every statement slower than this many seconds (0: off), and the phases of each batch
+MINUTE_BATCH = int(os.environ.get("SUNCHASER_MINUTE_BATCH", "20"))  # minute diffs applied per transaction while catching up
 LEASE_SLACK = 600  # the writer lease lasts --max-seconds + this
 FILE_GRACE = 3600  # seconds before unreferenced files and old snapshots are deleted
 
@@ -176,6 +177,13 @@ class Updater:
         base, versions = lancestore.state_versions(self.con)
         self.e.lance = lancestore.Store(base, versions) if base else None
 
+    def _phase(self, label):
+        """SUNCHASER_LOG_SQL: print the time since the previous phase of this batch."""
+        if LOG_SQL:
+            now = time.time()
+            print(f"  phase {label:<8} {now - self._t_phase:7.2f}s", flush=True)
+            self._t_phase = now
+
     def _timed(self, label, fn):
         """SUNCHASER_LOG_SQL: run a statement (a SELECT to completion) and print it if it was slow."""
         t = time.time()
@@ -217,9 +225,10 @@ class Updater:
         return s * 1e7 <= lat <= n * 1e7 and w * 1e7 <= lon <= e * 1e7
 
     def apply(self, blobs, osm_base=None, sequence=None):
-        t0 = time.time()
+        t0 = self._t_phase = time.time()
         self._refresh_lance()  # the previous batch moved the Lance versions on
         ch = read_osc(blobs)
+        self._phase("parse")
         by = {t: {i: r for (tt, i), r in ch.items() if tt == t} for t in "nwr"}
         ex = {t: self.existing(t, by[t].keys()) for t in "nwr"}
 
@@ -252,6 +261,7 @@ class Updater:
                 break
             rels.update(added)
             present["r"] |= {i for i, r in added.items() if not r["deleted"]}
+        self._phase("lookups")
 
         # 2. cascade: ways using moved nodes, relations using moved nodes/changed ways. Like Overpass, a
         # tags-only node edit leaves its ways and relations alone.
@@ -300,9 +310,11 @@ class Updater:
         for r_, times in rel_moves.items():
             ct[("r", r_)] = max(times + ([ct[("r", r_)]] if ("r", r_) in ct else []))
         self.change_time = ct
+        self._phase("cascade")
 
         # 3. stage the relations (nodes and ways are staged above)
         self._stage_relations(rels, cascade_r)
+        self._phase("stage")
 
         # 4. one transaction rewrites everything touched
         touched = {"n": set(nodes), "w": set(ways) | cascade_w, "r": set(rels) | cascade_r}
@@ -311,12 +323,15 @@ class Updater:
             self.batch_no = int(self.sql("SELECT value FROM lake.state WHERE key = 'batch'").fetchall()[0][0]) + 1
             self.sql(f"UPDATE lake.state SET value = '{self.batch_no}' WHERE key = 'batch'")
             self._rewrite(touched, ex, ways, rels)
+            self._phase("rewrite")
             self._update_lance(touched)
+            self._phase("lance")
             if osm_base:
                 self.sql(f"UPDATE lake.state SET value = '{osm_base}' WHERE key = 'osm_base'")
             if sequence is not None:
                 self.sql(f"UPDATE lake.state SET value = '{sequence}' WHERE key = 'sequence'")
             self.sql("COMMIT")
+            self._phase("commit")
         except Exception:
             try:
                 self.sql("ROLLBACK")
@@ -718,17 +733,27 @@ def follow(up, kinds=("hour", "minute"), until=None, deadline=None):
             continue
         seq = start + 1
         while seq <= cur:
-            s, ts = state_of(kind, seq)
-            if until is not None and ts > until:
-                break  # past the requested point at this granularity: a finer kind may still fit (a lake on
-                # the hour with --until ten minutes later returned here and never tried the minute diffs)
+            # minute diffs go MINUTE_BATCH to a transaction while catching up: a batch costs about the
+            # same as one diff (one delete file per touched data file, one Lance version, one areas
+            # pass), and keeps only the newest version of an element like an hourly diff does
+            batch = []
+            while seq <= cur and len(batch) < (MINUTE_BATCH if kind == "minute" else 1):
+                s, ts = state_of(kind, seq)
+                if until is not None and ts > until:
+                    break  # past the requested point at this granularity: a finer kind may still fit (a lake
+                    # on the hour with --until ten minutes later returned here and never tried the minutes)
+                batch.append((seq, ts))
+                seq += 1
+            if not batch:
+                break
             if STOP.is_set() or (deadline is not None and time.time() > deadline):
                 return applied  # the next job continues from state.osm_base
-            stats = up.apply([osc(kind, seq)], osm_base=ts, sequence=f"{kind}/{seq}")
-            applied += 1
-            print(f"{kind}/{seq} -> {ts} {stats}", flush=True)
+            last, ts = batch[-1]
+            stats = up.apply([osc(kind, s) for s, _ in batch], osm_base=ts, sequence=f"{kind}/{last}")
+            applied += len(batch)
+            span = f"{kind}/{batch[0][0]}" + (f"..{last}" if len(batch) > 1 else "")
+            print(f"{span} -> {ts} {stats}", flush=True)
             base = ts
-            seq += 1
     return applied
 
 
@@ -821,7 +846,8 @@ def _loop(args, lease, ttl):
         t = time.time()
         n, changed, state = _cycle(local, args, t + args.max_seconds)
         dirty, unsent = dirty or changed, unsent + n
-        reached = args.until and state.get("osm_base", "") >= args.until
+        # --until (fixed test windows): done once the lake is at it, or nothing before it is left to apply
+        reached = args.until and (state.get("osm_base", "") >= args.until or not n)
         if dirty and (not args.upload_every or STOP.is_set() or reached
                       or time.time() - last_upload >= args.upload_every):
             etag = _commit(args, local, etag)
