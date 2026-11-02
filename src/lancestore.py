@@ -42,6 +42,7 @@ TABLES = {  # lance table -> (lake table, element type, sort key)
     "ways": ("ways", "w", "qt_key31, id"),
 }
 ROWS_PER_GROUP = 16384
+DELTA_MAX_ROWS = 50_000_000  # an index delta bigger than this is a base segment: new rows start another delta
 ROWS_PER_FILE = 1 << 23  # 8 M rows per fragment at build (Lance's default 1 M: 10,000 uploads and a
 #                          manifest of 10,000 entries for the planet's untagged nodes)
 SEGMENT_ROWS = 1 << 28  # rows per id-index segment: 268 M sort in memory (300 M took 115 s, no spill)
@@ -241,7 +242,11 @@ def maintain(con, grace=3600, tables=None):
         ds = lance.dataset(f"{base}/{name}.lance", storage_options=storage_options())
         ds.optimize.compact_files(target_rows_per_fragment=1 << 20, max_rows_per_group=ROWS_PER_GROUP)
         ds = lance.dataset(ds.uri, storage_options=storage_options())
-        ds.optimize.optimize_indices()
+        # the appended rows join the newest index delta, unless that is a merged base segment (108 GB
+        # for untagged nodes, which an hourly merge would rewrite): then a new delta starts. Lookups
+        # probe every delta, so the planet keeps one base plus one growing hourly delta.
+        deltas = ds.stats.index_stats("id_idx")["num_indexed_rows_per_delta"]
+        ds.optimize.optimize_indices(num_indices_to_merge=0 if deltas and deltas[-1] > DELTA_MAX_ROWS else 1)
         ds = lance.dataset(ds.uri, storage_options=storage_options())
         ds.cleanup_old_versions(older_than=dt.timedelta(seconds=grace))
         new[name] = ds.version

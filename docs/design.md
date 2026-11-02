@@ -219,8 +219,9 @@ OSMF replication minute/*.osc.gz ──► single ingest service ─────
 
 ### 5.2 Notes
 - **Bootstrap input**: DuckDB has no ORC reader. Either convert with PyArrow (`pyarrow.orc` → Parquet) or start from `history-latest.osm.pbf` (164 GB) with osmium or ohsome-planet. The ORC schema has no way geometry, so you build geometry in a batch job: join ways to nodes, then ASOF-join for history.
-- **Minutely writes**: each minute is a small upsert (hundreds to a few thousand elements). DuckLake data inlining keeps those in the Postgres catalog until the hourly flush, so the minute-level cost is a few SQL transactions.
-- **Current tables**: an update is "delete old row + insert new row". Inlined deletes, and deletion vectors after flush, handle that. Compact hourly or daily so sort order and pruning stay tight.
+- **Minutely writes**: the updater applies 20 minute diffs a transaction, each writing small Parquet files that the hourly `merge_adjacent_files` folds. Data inlining is off: flushing an hour of inlined rows (16 files, 5 MB) took 25-30 minutes on the planet lake, and the batches already amortise the per-transaction cost.
+- **Current tables**: an update is "delete old row + insert new row" with DuckLake delete files; a file is rewritten once a fifth of its rows are deleted. The cost that matters on object storage is round trips, not bytes: every scattered row group read is one R2 range request, so the updater runs many more DuckDB threads than cores (`SUNCHASER_THREADS`).
+- **Reverse indexes are insert-only** (`node_parent_ways`, `member_parent_rels`, `tag_postings`): deleting a pair in place means reading the row group it sits in first, one request per element tag. A dropped pair becomes a row of the matching `*_gone` table; readers anti-join the pair tombstones (tag filters are re-applied on the element row anyway, so stale postings only add candidates), and the updater's compaction applies the tombstones in one streaming pass weekly.
 - **Areas, `tag_postings`, and the frozen catalog** can lag by up to one hour or one day. Upstream areas already lag, so this fallback is cheap.
 - **Write ownership**: run exactly one writer, as Overpass does. Many query workers read either the live catalog (minutely freshness) or the latest frozen one (daily freshness, fully serverless).
 

@@ -19,6 +19,30 @@ def env(name, default=None):
     return os.environ.get(f"SUNCHASER_{name}", default)
 
 
+# The reverse indexes (node -> way, member -> relation, tag -> element) are insert-only between
+# compactions: a row they should lose goes into the matching *_gone table instead, because deleting
+# it in place means reading the row group it sits in, one scattered R2 range request per element
+# tag (531 s of a planet batch). Readers anti-join the pair tables' tombstones (tag postings need
+# none: every tag filter is re-applied on the element row); the tombstones are applied in one
+# streaming pass by the updater's compaction (updater.apply_tombstones).
+TOMBSTONE_DDL = """
+    CREATE TABLE IF NOT EXISTS lake.node_parent_ways_gone (node_id BIGINT, way_id BIGINT);
+    CREATE TABLE IF NOT EXISTS lake.member_parent_rels_gone (mtype VARCHAR, mid BIGINT, rel_id BIGINT);
+    CREATE TABLE IF NOT EXISTS lake.tag_postings_gone (type VARCHAR, kv VARCHAR, qt_key31 UBIGINT, id BIGINT);
+"""
+TOMBSTONES = {"node_parent_ways": ("node_id", "way_id"), "member_parent_rels": ("mtype", "mid", "rel_id"),
+              "tag_postings": ("type", "kv", "qt_key31", "id")}
+
+
+def has_tombstones(con):
+    """True once the lake has the *_gone tables (every lake built or updated since they exist)."""
+    try:
+        con.sql("SELECT 1 FROM lake.node_parent_ways_gone LIMIT 0")
+        return True
+    except duckdb.Error:
+        return False
+
+
 def configure_s3(con):
     if env("S3_CREDENTIAL_CHAIN", "false") == "true":
         # AWS: credentials from the environment, instance profile or task/function role

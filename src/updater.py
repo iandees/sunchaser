@@ -166,6 +166,10 @@ class Updater:
         self.region = region  # (s, w, n, e) or None for a planet lake
         if LOG_SQL:
             self.e.trace = self._timed
+        if not lakeconn.has_tombstones(con):  # a lake built before the insert-only indexes
+            con.sql(lakeconn.TOMBSTONE_DDL)
+            con.sql(f"INSERT INTO lake.state VALUES ('tombstones_applied_at', '{time.time():.0f}')")
+            self.e.tombstoned = True
         self._refresh_lance()
 
     def _refresh_lance(self):
@@ -272,8 +276,8 @@ class Updater:
                  (r["deleted"] or (r["lat"], r["lon"]) != old_pos[i])]
         cascade_w = set()
         if moved:
-            pairs = self.sql(f"SELECT DISTINCT node_id, way_id FROM lake.node_parent_ways "
-                             f"WHERE {self.e._id_pred('node_id', sorted(moved))}").fetchall()
+            pairs = self.sql(self.e._parents_sql("node_parent_ways", "DISTINCT node_id, way_id",
+                                                 self.e._id_pred("node_id", sorted(moved)))).fetchall()
             cascade_w = {w for _, w in pairs}
             way_moves = {}
             for n, w in pairs:
@@ -302,8 +306,9 @@ class Updater:
         cascade_r, rel_moves = set(), {}
         for mt, ids in (("n", moved), ("w", sorted(geo_ways))):
             if ids:
-                for mid, rel in self.sql(f"SELECT DISTINCT mid, rel_id FROM lake.member_parent_rels WHERE mtype = '{mt}' "
-                                         f"AND {self.e._id_pred('mid', sorted(ids))}").fetchall():
+                for mid, rel in self.sql(self.e._parents_sql(
+                        "member_parent_rels", "DISTINCT mid, rel_id",
+                        f"mtype = '{mt}' AND {self.e._id_pred('mid', sorted(ids))}")).fetchall():
                     cascade_r.add(rel)
                     if (mt, mid) in ct:
                         rel_moves.setdefault(rel, []).append(ct[(mt, mid)])
@@ -611,72 +616,104 @@ class Updater:
 
     def _rewrite_pairs(self, table, child_col, parent_col, old, new, type_col=None):
         """Reverse-index rows (child -> parent) of the parents whose membership this batch rewrites;
-        old/new map a parent to its set of children (ids, or (type, id) with type_col). Only the
-        children a parent dropped are deleted and only the ones it gained inserted: the child id is
-        the table's sort key, so the delete is pruned to their files, where deleting every old pair of
-        the planet's edited ways (an edit keeps most of a way's nodes) cost 424 s a minute diff. A
-        child dropped by one parent and kept by another in the batch is deleted with the former and
-        put back for the latter."""
-        removed = set()
-        for p in set(old) | set(new):
-            removed |= old.get(p, set()) - new.get(p, set())
-        rows = [(c, p) for p, kids in new.items() for c in kids if c in removed or c not in old.get(p, set())]
-        if removed:
-            # the predicate names only the leading sort columns: a filter on the parent column too
-            # made DuckDB read every row group of the touched files on the planet (2,100 requests and
-            # 30 s for four ids against 20 and 0.7 s), so the dropped children's rows under parents
-            # outside the batch are read first and put back after the delete
-            groups = {None: removed} if type_col is None else {}
-            for c in removed if type_col else ():
-                groups.setdefault(c[0], set()).add(c[1])
-            for ty, kids in groups.items():
-                where = f"{f'{type_col} = {ty!r} AND ' if ty else ''}{self.e._id_pred(child_col, kids)}"
-                kept = self.sql(f"SELECT {child_col}, {parent_col} FROM lake.{table} WHERE {where} "
-                                f"AND {parent_col} NOT IN ({self.ids_sql(old)})").fetchall()
-                rows += [((ty, c) if ty else c, p) for c, p in kept]
-                self.sql(f"DELETE FROM lake.{table} WHERE {where}")
-        if rows:
-            cols = {child_col: pa.array([c if type_col is None else c[1] for c, _ in rows], pa.int64()),
-                    parent_col: pa.array([p for _, p in rows], pa.int64())}
-            if type_col:
-                cols[type_col] = pa.array([c[0] for c, _ in rows], pa.string())
-            self.con.register("pairs_arrow", pa.table(cols))
-            self.sql(f"INSERT INTO lake.{table} BY NAME SELECT * FROM pairs_arrow")
-            self.con.unregister("pairs_arrow")
+        old/new map a parent to its set of children (ids, or (type, id) with type_col). The index is
+        insert-only (lakeconn.TOMBSTONE_DDL): a pair a parent dropped becomes a tombstone, since
+        deleting it means reading the row group it sits in first, and a pair gained is inserted
+        unless its tombstone is still pending, in which case the tombstone goes and the row still
+        there serves again."""
+        cols = (type_col, child_col, parent_col) if type_col else (child_col, parent_col)
+        flat = lambda c, p: (c[0], c[1], p) if type_col else (c, p)
+        removed = {flat(c, p) for p, kids in old.items() for c in kids - new.get(p, set())}
+        gained = {flat(c, p) for p, kids in new.items() for c in kids - old.get(p, set())}
+        self._tombstone(table, cols, removed, gained)
 
     def _rewrite_postings(self, t, src, had_old):
-        """tag_postings rows of the type-t elements this batch rewrites (old_{t} -> {src}): only the
-        postings an element lost (a tag dropped, or all of them when its key changed) are deleted,
-        pruned by their kv strings, keys and ids (the table's sort order), and only the gained ones
-        inserted. Deleting every posting of every touched element scanned the planet's postings for
-        94 s a minute diff. An element that lost some of a batch's kv strings but kept others is
-        deleted with them and gets the kept ones back."""
+        """tag_postings rows of the type-t elements this batch rewrites (old_{t} -> {src}): the
+        postings an element lost (a tag dropped, or all of them when its key changed) become
+        tombstones and only the gained ones are inserted (insert-only index: deleting a posting
+        in place read one row group per element tag, 531 s of a planet batch; readers re-apply
+        every tag filter on the element row, so a stale posting only adds a candidate)."""
         tagset = lambda tags: set((tags or {}).items())
         old = {i: (qt.key31(q), tagset(tags)) for i, q, tags in self.sql(f"SELECT id, qt, tags FROM old_{t}").fetchall()} if had_old else {}
         new = {i: (qt.key31(q), tagset(tags)) for i, q, tags in self.sql(f"SELECT id, qt, tags FROM {src}").fetchall()}
-        gone = {}  # id -> (key, lost (k, v) pairs)
+        gone, gained = set(), set()
         for i, (key, kvs) in old.items():
             nk = new.get(i)
-            lost = kvs if nk is None or nk[0] != key else kvs - nk[1]
-            if lost:
-                gone[i] = (key, lost)
-        lost_kv = {f"{k}={v}" for _, l in gone.values() for k, v in l}
-        if gone:
-            self.sql(f"DELETE FROM lake.tag_postings WHERE type = '{t}' AND {self.e._points_sql('kv', lost_kv, quote=True)} "
-                     f"AND {self.e._points_sql('qt_key31', [k for k, _ in gone.values()])} AND {self.e._id_pred('id', gone)}")
-        rows = []
+            gone |= {(t, f"{k}={v}", key, i) for k, v in (kvs if nk is None or nk[0] != key else kvs - nk[1])}
         for i, (key, kvs) in new.items():
             o = old.get(i)
-            for k, v in kvs:
-                if o is None or o[0] != key or (k, v) not in o[1] or (i in gone and f"{k}={v}" in lost_kv):
-                    rows.append((f"{k}={v}", k, v, key, i))
-        if rows:
-            self.con.register("postings_arrow", pa.table({
-                "type": pa.array([t] * len(rows), pa.string()), "kv": [r[0] for r in rows], "k": [r[1] for r in rows],
-                "v": [r[2] for r in rows], "qt_key31": pa.array([r[3] for r in rows], pa.uint64()),
-                "id": pa.array([r[4] for r in rows], pa.int64())}))
-            self.sql("INSERT INTO lake.tag_postings BY NAME SELECT * FROM postings_arrow")
-            self.con.unregister("postings_arrow")
+            gained |= {(t, f"{k}={v}", key, i) for k, v in (kvs if o is None or o[0] != key else kvs - o[1])}
+        self._tombstone("tag_postings", lakeconn.TOMBSTONES["tag_postings"], gone, gained,
+                        extra=lambda r: {"k": r[1].split("=", 1)[0], "v": r[1].split("=", 1)[1]})
+
+    def _tombstone(self, table, cols, removed, gained, extra=None):
+        """Insert-only index maintenance: `removed` rows go to {table}_gone, `gained` rows are
+        inserted unless a tombstone of theirs is pending (then the tombstone is dropped instead).
+        `extra` derives the index's remaining columns from a row (postings: k and v from kv)."""
+        types = {"node_id": pa.int64(), "way_id": pa.int64(), "mtype": pa.string(), "mid": pa.int64(), "rel_id": pa.int64(),
+                 "type": pa.string(), "kv": pa.string(), "qt_key31": pa.uint64(), "id": pa.int64(), "k": pa.string(), "v": pa.string()}
+        gone_t = f"lake.{table}_gone"
+
+        def rows_table(name, rows, columns):
+            self.con.register(name, pa.table({c: pa.array([r[i] for r in rows], types[c]) for i, c in enumerate(columns)}))
+
+        if gained:
+            # the id column (the one the tombstones are few per value of) narrows the probe; exact pairs in Python
+            idcol = cols[-1] if table == "tag_postings" else cols[-2]
+            pending = {tuple(r) for r in self.sql(
+                f"SELECT {', '.join(cols)} FROM {gone_t} WHERE {self.e._id_pred(idcol, {r[cols.index(idcol)] for r in gained})}").fetchall()}
+            revived = sorted(gained & pending)
+            if revived:
+                rows_table("revived_arrow", revived, cols)
+                on = " AND ".join(f"{table}_gone.{c} = revived_arrow.{c}" for c in cols)
+                self.sql(f"DELETE FROM {gone_t} USING revived_arrow WHERE {on}")
+                self.con.unregister("revived_arrow")
+                gained = gained - pending
+        if removed:
+            rows_table("gone_arrow", sorted(removed), cols)
+            self.sql(f"INSERT INTO {gone_t} BY NAME SELECT * FROM gone_arrow")
+            self.con.unregister("gone_arrow")
+        if gained:
+            rows = sorted(gained)
+            columns = list(cols)
+            full = [list(r) for r in rows]
+            if extra:
+                more = [extra(r) for r in rows]
+                for c in more[0]:
+                    columns.append(c)
+                    for row, m in zip(full, more):
+                        row.append(m[c])
+            rows_table("gained_arrow", full, columns)
+            self.sql(f"INSERT INTO lake.{table} BY NAME SELECT * FROM gained_arrow")
+            self.con.unregister("gained_arrow")
+
+
+def apply_tombstones(con):
+    """Compaction: delete the index rows the tombstones name, one streaming pass per index (every
+    file of the three planet indexes is read once: bandwidth, not round trips), then empty the
+    tombstone tables. Runs when TOMBSTONE_DAYS have passed or TOMBSTONE_ROWS are pending."""
+    state = dict(con.sql("SELECT key, value FROM lake.state").fetchall())
+    pending = {t: con.sql(f"SELECT count(*) FROM lake.{t}_gone").fetchall()[0][0] for t in lakeconn.TOMBSTONES}
+    if not sum(pending.values()):
+        return False
+    if (time.time() - float(state.get("tombstones_applied_at", "0")) < TOMBSTONE_DAYS * 86400
+            and sum(pending.values()) < TOMBSTONE_ROWS):
+        return False
+    con.sql("BEGIN TRANSACTION")
+    for table, cols in lakeconn.TOMBSTONES.items():
+        if pending[table]:
+            on = " AND ".join(f"{table}.{c} = g.{c}" for c in cols)
+            con.sql(f"DELETE FROM lake.{table} USING lake.{table}_gone g WHERE {on}")
+            con.sql(f"DELETE FROM lake.{table}_gone")
+    con.sql("DELETE FROM lake.state WHERE key = 'tombstones_applied_at'")
+    con.sql(f"INSERT INTO lake.state VALUES ('tombstones_applied_at', '{time.time():.0f}')")
+    con.sql("COMMIT")
+    print(f"tombstones applied: {pending}", flush=True)
+    return True
+
+
+TOMBSTONE_DAYS = float(lakeconn.env("TOMBSTONE_DAYS", 7))     # apply the index tombstones this often
+TOMBSTONE_ROWS = int(lakeconn.env("TOMBSTONE_ROWS", 20_000_000))  # or once this many are pending
 
 
 REWRITE_DELETED_SHARE = 0.2  # rewrite a data file once this share of its rows is deleted
@@ -700,7 +737,8 @@ def compaction_steps(grace=FILE_GRACE, since=None):
     import lancestore
     return ([(q, lambda con, q=q: con.sql(q)) for q in sql]
             + [(f"lance maintain {name}", lambda con, name=name: lancestore.maintain(con, grace, [name]))
-               for name in lancestore.TABLES])
+               for name in lancestore.TABLES]
+            + [("apply index tombstones (if due)", apply_tombstones)])
 
 
 def run_step(con, label, run):

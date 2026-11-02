@@ -13,6 +13,7 @@ from dataclasses import dataclass
 
 import duckdb
 
+import lakeconn
 import quadtile as qt
 from geometry import NO_COORD, Bbox, great_circle_dist, ov_lat  # noqa: F401 (Bbox re-exported)
 
@@ -128,6 +129,15 @@ class Engine:
         except duckdb.Error:
             pass
         self.t = {k: f"lake.{v}" for k, v in TABLE.items()}
+        self.tombstoned = lakeconn.has_tombstones(con)  # insert-only reverse indexes with *_gone tables
+
+    def _parents_sql(self, table, cols, where):
+        """A reverse-index lookup (node_parent_ways, member_parent_rels) without the pairs the
+        updater has tombstoned: the indexes are insert-only between compactions (lakeconn.TOMBSTONE_DDL)."""
+        if not self.tombstoned:
+            return f"SELECT {cols} FROM lake.{table} WHERE {where}"
+        using = ", ".join(lakeconn.TOMBSTONES[table])
+        return f"SELECT {cols} FROM lake.{table} ANTI JOIN lake.{table}_gone USING ({using}) WHERE {where}"
 
     # ---- attic ([date:...]) ----------------------------------------------------
 
@@ -755,7 +765,7 @@ class Engine:
             return []
         if self.indexed:
             return self._materialize_ids(
-                f"SELECT way_id FROM lake.node_parent_ways WHERE {self._id_pred('node_id', node_ids)}")
+                self._parents_sql("node_parent_ways", "way_id", self._id_pred("node_id", node_ids)))
         return self._materialize_ids(
             f"SELECT id FROM {self.t['w']} WHERE len(list_intersect(nds, [{','.join(map(str, node_ids))}])) > 0")
 
@@ -766,8 +776,8 @@ class Engine:
             return []
         role_pred = f" AND role = {sq(role)}" if role is not None else ""
         if self.indexed and role is None:
-            return self._materialize_ids(
-                f"SELECT rel_id FROM lake.member_parent_rels WHERE mtype = '{mtype}' AND {self._id_pred('mid', ids)}")
+            return self._materialize_ids(self._parents_sql(
+                "member_parent_rels", "rel_id", f"mtype = '{mtype}' AND {self._id_pred('mid', ids)}"))
         return self._materialize_ids(
             f"SELECT id FROM (SELECT id, unnest(members, recursive := true) FROM {self.t['r']}) "
             f"WHERE type = '{mtype}' AND ref IN ({','.join(map(str, ids))}){role_pred}")
@@ -789,8 +799,8 @@ class Engine:
             for mt in "nwr":
                 ids = self._ids_of(member_set, mt)
                 if ids:
-                    rel_ids |= set(self._materialize_ids(
-                        f"SELECT rel_id FROM lake.member_parent_rels WHERE mtype = '{mt}' AND {self._id_pred('mid', ids)}"))
+                    rel_ids |= set(self._materialize_ids(self._parents_sql(
+                        "member_parent_rels", "rel_id", f"mtype = '{mt}' AND {self._id_pred('mid', ids)}")))
             return f"SELECT 'r' AS type, id FROM {self._ids_table(sorted(rel_ids))}"
         return (f"SELECT DISTINCT 'r' AS type, r.id FROM (SELECT id, unnest(members, recursive := true) FROM {self.t['r']}) r "
                 f"JOIN {member_set} x ON x.type = r.type AND x.id = r.ref")
@@ -811,7 +821,7 @@ class Engine:
         if self.indexed:
             node_ids = self._ids_of(s, "n")
             way_ids = self._materialize_ids(
-                f"SELECT way_id FROM lake.node_parent_ways WHERE {self._id_pred('node_id', node_ids)}") if node_ids else []
+                self._parents_sql("node_parent_ways", "way_id", self._id_pred("node_id", node_ids))) if node_ids else []
             ways_t = self._new(self._fetch("w", way_ids))
         else:
             ways_t = self._new(f"SELECT 'w' AS type, id FROM {self.t['w']} "

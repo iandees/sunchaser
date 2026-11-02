@@ -377,6 +377,7 @@ def main():
                  0::INT AS uid, ''::VARCHAR AS "user" FROM lake.relations r WHERE false;
         CREATE TABLE lake.changes (ts TIMESTAMPTZ, type VARCHAR, id BIGINT, old_version INT, new_version INT,
                                    action VARCHAR, batch BIGINT);""")
+    step("lake.*_gone", lakeconn.TOMBSTONE_DDL)
     if src["history"]:
         hist = f"valid_from, valid_to, {meta}"
         fill("nodes_history", "qt, valid_from", f"qt, id, lat, lon, tags, {hist}", src["nh"], append=True, key="qt")
@@ -402,8 +403,9 @@ def main():
     step("lake.state", f"""
         CREATE TABLE lake.state AS SELECT * FROM (VALUES
           ('osm_base', '{args.osm_base}'), ('sequence', '{args.sequence}'), ('batch', '0')) v(key, value)""")
-    # Minutely updates are small: let them inline into the catalog until the next flush/compaction.
-    con.sql("CALL lake.set_option('data_inlining_row_limit', 100000)")
+    # Updates write small Parquet files straight away (no data inlining): the updater applies 20 minute
+    # diffs a transaction, and flushing an hour of inlined rows (16 files, 5 MB) took 25-30 min on the
+    # planet; merge_adjacent_files folds the small files instead.
 
     if args.lance:
         import lancestore
