@@ -38,7 +38,18 @@ def test_parse_way_bbox_comparisons():
 def test_parse_ignores_what_it_does_not_understand():
     # an unparsed conjunct only weakens the filter (more files survive), it never drops a file wrongly
     assert readbudget.parse_ranges(["id IN (SELECT id FROM s1)", "false", "qt BETWEEN 1 AND 2 OR lat BETWEEN 3 AND 4"]) == []
-    assert readbudget.parse_ranges(["id IN (30, 10, 20)"]) == [("id", [(10, 30)])]
+    assert readbudget.parse_ranges(["id IN (30, 10, 20)"]) == [("id", [(10, 10), (20, 20), (30, 30)])]
+
+
+def test_point_lists_are_probed_by_bisection():
+    # an id list is a set of points: a file whose [min, max] holds none of them is pruned
+    points = [(v, v) for v in range(0, 100000, 10)]
+    assert readbudget._hits(points, 15, 19) is False
+    assert readbudget._hits(points, 15, 20) is True
+    assert readbudget._hits(points, -5, 0) is True
+    assert readbudget._hits(points, 99991, 200000) is False
+    assert readbudget._hits([(1, 5), (4, 9)], 7, 7) is True
+    assert readbudget._hits([(1, 5), (4, 9)], 10, 12) is False
 
 
 # ---- a small synthetic lake ----------------------------------------------------

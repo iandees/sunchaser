@@ -100,7 +100,8 @@ AREA_WAY_OFFSET = 2400000000
 
 
 # Planner limits, each set by measurement:
-MAX_OR_RANGES = 32           # zone-map ranges per predicate: more prune better but cost CPU per row (DuckDB evaluates OR chains per row)
+MAX_OR_RANGES = 32           # zone-map ranges per bbox predicate: more prune better but cost CPU per row (DuckDB evaluates OR chains per row)
+POINTS_MAX = 100000          # exact point sets (ids, keys) go into SQL as literal IN lists up to this size (about 15 us of parsing per value)
 POSTINGS_MAX = 20000         # bbox+tag: drive from tag_postings only if at most this many candidates; beyond it the spatial scan alone is cheaper
 REL_MEMBER_PROBE_MAX = 5000  # bbox relations: test members directly up to this many; beyond it the elements inside the box are fewer
 
@@ -210,6 +211,21 @@ class Engine:
                 out.append([v, v + 1])
         return [tuple(r) for r in out]
 
+    def _points_sql(self, col, values, quote=False):
+        """Exact point set as a literal IN list, which DuckLake prunes files by and DuckDB hashes. A
+        point set coalesced to MAX_OR_RANGES ranges spans the whole planet once the points scatter
+        (an updater diff, a global tag lookup), so every file survives. Past POINTS_MAX values (a few
+        seconds of parsing) the ranges plus a temp-table semi-join take over."""
+        vals = sorted(set(values))
+        if not vals:
+            return "false"
+        if quote:
+            lits = ",".join("'" + v.replace("'", "''") + "'" for v in vals)
+            return f"{col} IN ({lits})"
+        if len(vals) > POINTS_MAX:
+            return f"({self._ranges_sql(col, self._value_ranges(vals))} AND {col} IN (SELECT id FROM {self._ids_table(vals)}))"
+        return f"{col} IN ({','.join(map(str, vals))})"
+
     def _ids_table(self, ids):
         """Temp table of ids, loaded through Arrow: pasting tens of thousands of literals into SQL
         costs about a second of parsing per statement."""
@@ -221,13 +237,8 @@ class Engine:
         return name
 
     def _id_pred(self, col, ids):
-        """Exact membership via a hash semi-join on a temp table, plus coalesced ranges so the
-        Parquet scan can skip row groups (a subquery alone only pushes down min/max)."""
-        if not ids:
-            return "false"
-        name = self._ids_table(ids)
-        pred = f"{col} IN (SELECT id FROM {name})"
-        return f"{self._ranges_sql(col, self._value_ranges(ids))} AND {pred}"
+        """Exact membership of an id set (a temp-table semi-join alone only pushes min/max down)."""
+        return self._points_sql(col, ids)
 
     def id_set(self, t, ids):
         """A set table holding the given ids of type t."""
@@ -531,8 +542,7 @@ class Engine:
             return [f"id IN ({','.join(map(str, ids))})"], []
         keycol = "qt" if t == "n" else "qt_key31"
         keys = [k >> 1 for k, _ in rows] if t == "n" else [k for k, _ in rows]
-        name = self._ids_table(ids)
-        return [self._ranges_sql(keycol, self._value_ranges(keys))], [f"id IN (SELECT id FROM {name})"]
+        return [self._points_sql(keycol, keys)], [self._points_sql("id", ids)]
 
     def _locator_pred(self, t, ids, col=None):
         """.map-file equivalent: id -> spatial key, then a key-range predicate on the clustered table.
@@ -547,7 +557,7 @@ class Engine:
         keys = [memo[i] for i in ids if memo[i] is not None]
         if t != "n":
             keys = [qt.key31(q) for q in keys]
-        return self._ranges_sql(col or ("qt" if t == "n" else "qt_key31"), self._value_ranges(keys))
+        return self._points_sql(col or ("qt" if t == "n" else "qt_key31"), keys)
 
     # ---- payload for output --------------------------------------------------
 

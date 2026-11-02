@@ -46,6 +46,7 @@ MEMBER_T = pa.struct([("type", pa.string()), ("ref", pa.int64()), ("role", pa.st
 
 STOP = threading.Event()  # set by SIGTERM: finish the diff in hand, upload, release the lease, exit
 POLL = 30  # seconds to wait when job --loop finds nothing new
+LOG_SQL = float(os.environ.get("SUNCHASER_LOG_SQL", "0"))  # print every statement slower than this many seconds (0: off)
 LEASE_SLACK = 600  # the writer lease lasts --max-seconds + this
 FILE_GRACE = 3600  # seconds before unreferenced files and old snapshots are deleted
 
@@ -87,24 +88,31 @@ def osc(kind, seq):
 
 
 def find_seq(kind, ts):
-    """Largest sequence of `kind` whose state timestamp is <= ts (ISO strings compare correctly)."""
+    """Largest sequence of `kind` whose state timestamp is <= ts (ISO strings compare correctly): an
+    estimate from the diff interval brackets it, then a binary search (one state file per probe).
+    Sequence numbers drift from the clock by hundreds of minute diffs over a month; walking from
+    the estimate one state file at a time took 13 minutes."""
     step = {"minute": 60, "hour": 3600, "day": 86400}[kind]
     cur, cur_ts = state_of(kind)
     if cur_ts <= ts:
         return cur, cur_ts
     import datetime as dt
     p = lambda s: dt.datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ")
-    seq = cur - int((p(cur_ts) - p(ts)).total_seconds() // step)
-    while True:
-        s, s_ts = state_of(kind, seq)
-        if s_ts > ts:
-            seq -= 1
+    behind = lambda s_ts: max(int((p(s_ts) - p(ts)).total_seconds() // step), 1)
+    hi = cur  # state(hi) > ts
+    lo = max(cur - behind(cur_ts) - 1, 1)
+    lo_ts = state_of(kind, lo)[1]
+    while lo_ts > ts and lo > 1:
+        hi, lo = lo, max(lo - 2 * behind(lo_ts), 1)
+        lo_ts = state_of(kind, lo)[1]
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        mid_ts = state_of(kind, mid)[1]
+        if mid_ts <= ts:
+            lo, lo_ts = mid, mid_ts
         else:
-            nxt_ts = state_of(kind, seq + 1)[1] if seq + 1 <= cur else "9999"
-            if nxt_ts <= ts:
-                seq += 1
-            else:
-                return seq, s_ts
+            hi = mid
+    return lo, lo_ts
 
 
 # ---- diff parsing ----------------------------------------------------------------------
@@ -136,25 +144,71 @@ def read_osc(blobs):
 
 # ---- applying ----------------------------------------------------------------------------
 
+class _Fetched:
+    """Rows of a SELECT run eagerly for timing (SUNCHASER_LOG_SQL); the fetchall() callers expect."""
+
+    def __init__(self, rows):
+        self.rows = rows
+
+    def fetchall(self):
+        return self.rows
+
+    def fetchone(self):
+        return self.rows[0] if self.rows else None
+
+
 class Updater:
     def __init__(self, con, region=None):
         self.con = con
         con.sql(MACROS)
         self.e = Engine(con, "lake")
         self.region = region  # (s, w, n, e) or None for a planet lake
+        if LOG_SQL:
+            self.e.trace = self._timed
+        self._refresh_lance()
+
+    def _refresh_lance(self):
+        """Point the engine at the Lance store as recorded in lake.state (the versions this batch
+        starts from): node and way rows are then fetched by id through the BTree, not by scanning
+        the key-sorted tables (a planet hour's 67k scattered ids: 51-118 s against 111-245 s, and
+        the locator table is not read at all)."""
+        import lancestore
+        base, versions = lancestore.state_versions(self.con)
+        self.e.lance = lancestore.Store(base, versions) if base else None
+
+    def _timed(self, label, fn):
+        """SUNCHASER_LOG_SQL: run a statement (a SELECT to completion) and print it if it was slow."""
+        t = time.time()
+        out = fn()
+        if isinstance(out, duckdb.DuckDBPyRelation) and label.lstrip().upper().startswith(("SELECT", "WITH")):
+            out = _Fetched(out.fetchall())
+        if time.time() - t >= LOG_SQL:
+            print(f"    {time.time() - t:7.2f}s {' '.join(label.split())[:160]}", flush=True)
+        return out
 
     def sql(self, q):
+        if LOG_SQL:
+            return self._timed(q, lambda: self.con.sql(q))
         return self.con.sql(q)
 
     def ids_sql(self, ids):
         return ",".join(map(str, sorted(ids))) or "NULL"
 
     def existing(self, t, ids):
-        """id -> current Overpass index for elements present in the lake."""
+        """id -> current Overpass index for elements present in the lake: the element rows through
+        Lance for nodes and ways, the locator table otherwise. The engine's locator memo is seeded
+        with the answer (misses included), so its own key lookups for these ids read nothing."""
         if not ids:
             return {}
-        rows = self.sql(f"SELECT id, qt FROM lake.elem_locator WHERE type = '{t}' AND {self.e._id_pred('id', sorted(ids))}").fetchall()
-        return dict(rows)
+        ids = sorted(ids)
+        if self.e._lance_route(t):
+            found = dict(self.e.elements_by_id(t, ids, ["id", "qt"]))
+        else:
+            found = dict(self.sql(f"SELECT id, qt FROM lake.elem_locator WHERE type = '{t}' AND {self.e._id_pred('id', ids)}").fetchall())
+        memo = self.e._locator_memo.setdefault(t, {})
+        memo.update(found)
+        memo.update((i, None) for i in ids if i not in found)
+        return found
 
     def in_region(self, lat, lon):
         if self.region is None:
@@ -164,6 +218,7 @@ class Updater:
 
     def apply(self, blobs, osm_base=None, sequence=None):
         t0 = time.time()
+        self._refresh_lance()  # the previous batch moved the Lance versions on
         ch = read_osc(blobs)
         by = {t: {i: r for (tt, i), r in ch.items() if tt == t} for t in "nwr"}
         ex = {t: self.existing(t, by[t].keys()) for t in "nwr"}
@@ -279,12 +334,12 @@ class Updater:
         base, versions = lancestore.state_versions(self.con)
         if not base:
             return
-        rows = {
-            "nodes_tagged": self.sql("SELECT qt, id, lat, lon, tags, ts AS valid_from FROM upd_n "
-                                     "WHERE cardinality(tags) > 0").arrow().read_all(),
-            "nodes_untagged": self.sql("SELECT qt, id, lat, lon, tags, ts AS valid_from FROM upd_n "
-                                       "WHERE cardinality(tags) = 0").arrow().read_all(),
-            "ways": self.sql("""SELECT ov_key31(w.qt) AS qt_key31, ov_level(w.qt) AS qt_level, w.qt, w.id, w.min_lat,
+        rows = {  # staged rows as Arrow (con.sql: these are read, not timed)
+            "nodes_tagged": self.con.sql("SELECT qt, id, lat, lon, tags, ts AS valid_from FROM upd_n "
+                                         "WHERE cardinality(tags) > 0").arrow().read_all(),
+            "nodes_untagged": self.con.sql("SELECT qt, id, lat, lon, tags, ts AS valid_from FROM upd_n "
+                                           "WHERE cardinality(tags) = 0").arrow().read_all(),
+            "ways": self.con.sql("""SELECT ov_key31(w.qt) AS qt_key31, ov_level(w.qt) AS qt_level, w.qt, w.id, w.min_lat,
                                 w.max_lat, w.min_lon, w.max_lon, w.tags, w.nds, w.nd_lat, w.nd_lon,
                                 coalesce(x.t, w.ts) AS valid_from
                                 FROM upd_w w LEFT JOIN upd_ct x ON x.type = 'w' AND x.id = w.id""").arrow().read_all(),
@@ -413,7 +468,7 @@ class Updater:
         pred = self.e._id_pred(idcol, sorted(ids))
         if keys:
             vals = [qt.key31(k) if keycol == "qt_key31" or (keycol == "k" and t != "n") else k for k in keys]
-            pred = self.e._ranges_sql(keycol, self.e._value_ranges(vals)) + " AND " + pred
+            pred = self.e._points_sql(keycol, vals) + " AND " + pred
         return pred
 
     def _del(self, table, t, ids, keycol, idcol="id", keys=None):
@@ -421,21 +476,28 @@ class Updater:
             self.sql(f"DELETE FROM lake.{table} WHERE {self._where(t, ids, keycol, idcol, keys)}")
 
     def _archive(self, t, ids, keys):
-        """Copy the outgoing versions of ids, with their metadata, into the history table."""
+        """Copy the outgoing versions of ids, with their metadata, into the history table. The rows
+        are read once into the temp table old_{t}; the tag_postings delete prunes by their tags."""
         if not ids:
             return
         meta = f"(SELECT * FROM lake.{ {'n': 'nodes', 'w': 'ways', 'r': 'relations'}[t]}_meta WHERE {self._where(t, ids, 'k', keys=keys)})"
         if t == "n":
-            cur = (f"(SELECT * FROM lake.nodes_tagged WHERE {self._where('n', ids, 'qt', keys=keys)} UNION ALL "
-                   f"SELECT * FROM lake.nodes_untagged WHERE {self._where('n', ids, 'qt', keys=keys)})")
+            cur = (f"SELECT * FROM lake.nodes_tagged WHERE {self._where('n', ids, 'qt', keys=keys)} UNION ALL "
+                   f"SELECT * FROM lake.nodes_untagged WHERE {self._where('n', ids, 'qt', keys=keys)}")
             hist = "nodes_history"
         else:
             hist = {"w": "ways_history", "r": "relations_history"}[t]
-            cur = f"(SELECT * FROM lake.{ {'w': 'ways', 'r': 'relations'}[t]} WHERE {self._where(t, ids, 'qt_key31', keys=keys)})"
+            cur = f"SELECT * FROM lake.{ {'w': 'ways', 'r': 'relations'}[t]} WHERE {self._where(t, ids, 'qt_key31', keys=keys)}"
+        self.sql(f"CREATE OR REPLACE TEMP TABLE old_{t} AS {cur}")
         self.sql(f"""INSERT INTO lake.{hist}
             SELECT c.*, x.t AS valid_to, m.version, m.ts, m.changeset, m.uid, m."user"
-            FROM {cur} c JOIN upd_ct x ON x.type = '{t}' AND x.id = c.id
+            FROM old_{t} c JOIN upd_ct x ON x.type = '{t}' AND x.id = c.id
             LEFT JOIN {meta} m ON m.id = c.id""")
+
+    def _old_kvs(self, t):
+        """The distinct key=value strings of the outgoing rows of type t (their tag_postings rows)."""
+        return [kv for (kv,) in self.sql(f"""SELECT DISTINCT k || '=' || v FROM (
+            SELECT unnest(map_keys(tags)) AS k, unnest(map_values(tags)) AS v FROM old_{t})""").fetchall()]
 
     def _log_changes(self, touched, old, direct):
         """lake.changes: one row per element and batch (drives changed / [diff] / [adiff])."""
@@ -512,7 +574,10 @@ class Updater:
         for t, src in (("n", "upd_n"), ("w", "upd_w"), ("r", "upd_r")):
             ids = old[t]
             if ids:
-                self.sql(f"DELETE FROM lake.tag_postings WHERE type = '{t}' AND {self.e._id_pred('id', sorted(ids))}")
+                # postings are sorted by (type, kv, key, id): the outgoing rows' own tags and keys prune
+                # the delete to their files, where (type, id) alone scans the whole type
+                self.sql(f"DELETE FROM lake.tag_postings WHERE type = '{t}' AND {self.e._points_sql('kv', self._old_kvs(t), quote=True)} "
+                         f"AND {self._where(t, ids, 'qt_key31', keys=list(ids.values()))}")
                 self.sql(f"DELETE FROM lake.elem_locator WHERE type = '{t}' AND {self.e._id_pred('id', sorted(ids))}")
             self.sql(f"""INSERT INTO lake.tag_postings
                 SELECT '{t}', k || '=' || v, k, v, ov_key31(qt), id FROM (
@@ -538,13 +603,21 @@ class Updater:
                      WHERE id IN ({changed_rels})) m""")
 
 
-def compaction_steps(grace=FILE_GRACE):
+REWRITE_DELETED_SHARE = 0.2  # rewrite a data file once this share of its rows is deleted
+
+
+def compaction_steps(grace=FILE_GRACE, since=None):
     """The compaction as (label, run(con)) steps: inlined rows -> sorted Parquet, small files merged,
     old snapshots dropped, Lance fragments merged. Files are deleted only `grace` seconds after they
     stop being referenced, so readers still on an older catalog (or a frozen copy) keep working;
-    orphans from discarded job runs go the same way."""
-    sql = ("CALL ducklake_flush_inlined_data('lake')", "CALL ducklake_merge_adjacent_files('lake')",
-           "CALL ducklake_rewrite_data_files('lake')",
+    orphans from discarded job runs go the same way.
+    Only files written since `since` (epoch seconds: the previous compaction) are merged, and a file
+    is rewritten only once REWRITE_DELETED_SHARE of its rows is deleted: with no bounds, the first
+    hourly compaction of the planet lake merged the build's files for 9 hours (and wrote them back
+    50% larger), and a handful of deleted rows would have had their 60 MB files rewritten."""
+    newer = f", newer_than => to_timestamp({since:.0f})" if since else ""
+    sql = ("CALL ducklake_flush_inlined_data('lake')", f"CALL ducklake_merge_adjacent_files('lake'{newer})",
+           f"CALL ducklake_rewrite_data_files('lake', delete_threshold => {REWRITE_DELETED_SHARE})",
            f"CALL ducklake_expire_snapshots('lake', older_than => now() - INTERVAL {int(grace)} SECOND)",
            f"CALL ducklake_cleanup_old_files('lake', older_than => now() - INTERVAL {int(grace)} SECOND)",
            f"CALL ducklake_delete_orphaned_files('lake', older_than => now() - INTERVAL {int(grace)} SECOND)")
@@ -576,7 +649,8 @@ def compact_due(con, args, state):
     if COMPACTION is None:
         if not args.compact_every or time.time() - float(state.get("compacted_at", "0")) < args.compact_every:
             return False
-        COMPACTION = compaction_steps()
+        # merge only what was written since the last compaction (a fresh lake: since the job began)
+        COMPACTION = compaction_steps(since=float(state.get("compacted_at", "0")) or time.time() - args.compact_every)
     for _ in range(1 if args.loop else len(COMPACTION)):
         label, run = COMPACTION.pop(0)
         run_step(con, label, run)
@@ -604,7 +678,8 @@ def follow(up, kinds=("hour", "minute"), until=None, deadline=None):
         while seq <= cur:
             s, ts = state_of(kind, seq)
             if until is not None and ts > until:
-                return applied  # reached the requested point (tests replay a fixed window, not up to now)
+                break  # past the requested point at this granularity: a finer kind may still fit (a lake on
+                # the hour with --until ten minutes later returned here and never tried the minute diffs)
             if STOP.is_set() or (deadline is not None and time.time() > deadline):
                 return applied  # the next job continues from state.osm_base
             stats = up.apply([osc(kind, seq)], osm_base=ts, sequence=f"{kind}/{seq}")
@@ -644,6 +719,9 @@ def _cycle(local, args, deadline):
     Returns (diffs applied, catalog changed, state)."""
     import build_areas
     con = duckdb.connect()
+    for setting, var in (("memory_limit", "MEMORY_LIMIT"), ("threads", "THREADS")):
+        if lakeconn.env(var):  # SUNCHASER_MEMORY_LIMIT (e.g. 6GB on a small host), SUNCHASER_THREADS
+            con.sql(f"SET {setting} = '{lakeconn.env(var)}'")
     lakeconn.attach(con, catalog=local, data_path="")  # the catalog knows its data path
     try:
         region = tuple(map(float, args.region.split(","))) if args.region else None

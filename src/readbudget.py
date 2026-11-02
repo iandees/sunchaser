@@ -12,6 +12,7 @@ parser does not understand is ignored (more files survive, never fewer), and any
 
 Cost: one catalog query per table per request (a few ms on a local SQLite catalog), then arithmetic.
 """
+import bisect
 import re
 
 import duckdb
@@ -65,30 +66,38 @@ def _balanced(s):
 
 
 def _leaf(s):
-    """One comparison -> (column, lo, hi), or None."""
+    """One comparison -> (column, [(lo, hi), ...]), or None."""
     s = _strip(s)
     if m := _BTW1.match(s):
-        return m[1], int(m[2]), int(m[3])
+        return m[1], [(int(m[2]), int(m[3]))]
     if m := _CMP.match(s):
         v = int(m[3])
-        return (m[1], v, INF) if m[2] == ">=" else (m[1], -INF, v) if m[2] == "<=" else (m[1], v, v)
+        return m[1], [(v, INF) if m[2] == ">=" else (-INF, v) if m[2] == "<=" else (v, v)]
     if m := _IDLIST.match(s):
-        vals = [int(x) for x in m[2].split(",")]
-        return m[1], min(vals), max(vals)
+        return m[1], sorted((v, v) for v in {int(x) for x in m[2].split(",")})
     return None
 
 
 def parse_ranges(preds):
     """Conjunctive SQL predicates -> [(column, [(lo, hi), ...])]: the column must fall in one of the
-    intervals. Anything not understood is dropped (a weaker, still valid, filter)."""
+    intervals (sorted by lo). Anything not understood is dropped (a weaker, still valid, filter)."""
     out = []
     for p in preds:
         p = _BETWEEN.sub(r"\1 BETWEEN \2 ~ \3", p)
         for conj in _split(p, " AND "):
             terms = [_leaf(t) for t in _split(_strip(conj), " OR ")]
             if terms and all(terms) and len({t[0] for t in terms}) == 1:
-                out.append((terms[0][0], [(t[1], t[2]) for t in terms]))
+                out.append((terms[0][0], sorted(iv for t in terms for iv in t[1])))
     return out
+
+
+def _hits(intervals, lo, hi, points=None):
+    """Whether any of the lo-sorted intervals meets [lo, hi]: a point list (an id or key set of tens
+    of thousands) is probed by bisection, overlapping ranges by a scan."""
+    if all(a == b for a, b in intervals) if points is None else points:
+        i = bisect.bisect_left(intervals, (lo, lo))
+        return i < len(intervals) and intervals[i][0] <= hi
+    return any(a <= hi and lo <= b for a, b in intervals)
 
 
 class ReadBudget:
@@ -157,7 +166,7 @@ class ReadBudget:
 
     def estimate(self, tbl, preds, sql):
         """Bytes the scan `sql` of `tbl` (a lake table, view or expression) may read, or None if unknown."""
-        constraints = parse_ranges(preds)
+        constraints = [(c, iv, all(a == b for a, b in iv)) for c, iv in parse_ranges(preds)]
         text = _STR.sub("''", sql)
         total, known = 0, False
         for table in self.tables_of(tbl):
@@ -166,8 +175,7 @@ class ReadBudget:
                 continue
             known = True
             kept = [f for f in files if all(
-                c not in f["ranges"] or any(f["ranges"][c][0] <= hi and lo <= f["ranges"][c][1] for lo, hi in iv)
-                for c, iv in constraints)]
+                c not in f["ranges"] or _hits(iv, *f["ranges"][c], points) for c, iv, points in constraints)]
             names = {c for f in files for c in f["cols"]}
             used = {c for c in names if re.search(rf"\b{re.escape(c)}\b", text)} or names
             nbytes = sum(f["cols"].get(c, 0) for f in kept for c in used)
