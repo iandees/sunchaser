@@ -1,7 +1,9 @@
 """Overpass-compatible HTTP API over the lake.
 
   GET/POST /api/interpreter   data=<Overpass QL> (form, query string, or raw POST body)
-  GET      /api/status        plain-text status, like Overpass
+  GET      /api/status        plain-text status, like Overpass; ?format=json (or Accept: application/json)
+                              for the lake's state (data timestamp and lag, replication sequence, catalog
+                              snapshot and ETag, Lance versions, last compaction) and the server's counters
   GET      /api/timestamp     timestamp of the newest applied OSM data
 
 Configuration (environment):
@@ -43,7 +45,7 @@ from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
-from starlette.responses import PlainTextResponse, Response, StreamingResponse
+from starlette.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
@@ -66,16 +68,20 @@ WORKERS = concurrent.futures.ThreadPoolExecutor(int(env("MAX_QUERIES", "16")))  
 
 CATALOGS = tempfile.mkdtemp(prefix="sunchaser-catalog-")  # local copies of an s3:// catalog, newest last
 CATALOG_ETAG = None  # ETag of the copy the current connection was opened on
+CATALOG_LOADED = 0.0  # when that connection was opened
+STARTED = time.time()
+STATS = {"running": 0, "served": 0, "outcomes": {}}  # query counters for /api/status, under DB_LOCK
 
 
 def open_lake():
     """A connection on the lake. An s3:// catalog is downloaded and attached as a local file: DuckDB reads a
     catalog lazily, and a block read after the updater has replaced the object fails on its ETag in the
     middle of a query. The data files it points at are immutable, so they are read from R2 as before."""
-    global CATALOG_ETAG
+    global CATALOG_ETAG, CATALOG_LOADED
     con = duckdb.connect()
     con.sql("SET parquet_metadata_cache = true")
     catalog, url = None, remote_catalog()
+    CATALOG_LOADED = time.time()
     if url:
         catalog = os.path.join(CATALOGS, f"catalog-{time.time_ns()}.ducklake")
         CATALOG_ETAG = objcatalog.fetch(url, catalog)
@@ -235,6 +241,8 @@ def _execute(script, callback, sink):
     propagate (error page / catalog retry); later ones become Overpass runtime-error remarks."""
     started, ran, steps, outcome = time.time(), None, [], "ok"
     cur = db().cursor()
+    with DB_LOCK:
+        STATS["running"] += 1
     try:
         st = script.settings
         timeout = min(int(st.get("timeout", 180)), int(env("MAX_TIMEOUT", "180")))
@@ -286,6 +294,10 @@ def _execute(script, callback, sink):
         sink.flush()
     finally:
         cur.close()
+        with DB_LOCK:
+            STATS["running"] -= 1
+            STATS["served"] += 1
+            STATS["outcomes"][outcome] = STATS["outcomes"].get(outcome, 0) + 1
         if LOG_QUERIES:
             _log_query(sink, started, ran, outcome, steps)
 
@@ -380,9 +392,49 @@ async def interpreter(request):
     return StreamingResponse(body(), media_type=f"{content_type}; charset=utf-8")
 
 
+def _iso(epoch):
+    return dt.datetime.fromtimestamp(epoch, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if epoch else None
+
+
+def lake_status(cur):
+    """What the lake records about itself: the updater's state keys, the catalog snapshot, Lance."""
+    out = {}
+    try:
+        state = dict(cur.sql("SELECT key, value FROM lake.state").fetchall())
+    except duckdb.Error:
+        return out
+    base = state.get("osm_base", "")
+    out["osm_base"] = base
+    try:
+        out["lag_seconds"] = int(time.time() - dt.datetime.strptime(base, "%Y-%m-%dT%H:%M:%SZ")
+                                 .replace(tzinfo=dt.timezone.utc).timestamp())
+    except ValueError:
+        out["lag_seconds"] = None
+    out["sequence"] = state.get("sequence") or None
+    out["batch"] = int(state.get("batch") or 0)
+    out["compacted_at"] = _iso(float(state.get("compacted_at") or 0))
+    try:
+        sid, stime = cur.sql("SELECT max(snapshot_id), max(snapshot_time) FROM __ducklake_metadata_lake.ducklake_snapshot").fetchall()[0]
+        out["snapshot"] = {"id": sid, "time": stime.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if stime else None}
+    except duckdb.Error:
+        pass
+    base, versions = lancestore.state_versions(cur)
+    out["lance"] = {"base": base, "versions": versions, "used": env("LANCE", "on") != "off"} if base else None
+    return out
+
+
 async def status(request):
     cur = db().cursor()
     try:
+        if request.query_params.get("format") == "json" or "application/json" in request.headers.get("accept", ""):
+            lake = await run_in_threadpool(lake_status, cur)
+            with DB_LOCK:
+                stats = {"running": STATS["running"], "served": STATS["served"], "outcomes": dict(STATS["outcomes"])}
+            return JSONResponse({
+                "time": _iso(time.time()), **lake,
+                "catalog": {"url": env("CATALOG", ""), "etag": CATALOG_ETAG, "loaded_at": _iso(CATALOG_LOADED)},
+                "server": {"started_at": _iso(STARTED), "uptime_seconds": int(time.time() - STARTED),
+                           "max_queries": int(env("MAX_QUERIES", "16")), "queries": stats}})
         ts = await run_in_threadpool(osm_base, cur)
     finally:
         cur.close()
