@@ -236,8 +236,10 @@ class Updater:
         nodes = {i: r for i, r in by["n"].items()
                  if i in ex["n"] or (not r["deleted"] and self.in_region(r["lat"], r["lon"]))}
         node_kept = {i for i, r in nodes.items() if not r["deleted"]}
+        # a planet lake holds every element a diff refers to; only a regional one needs to ask
+        has = (lambda t, ids: set(ids)) if self.region is None else (lambda t, ids: set(self.existing(t, ids)))
         way_refs = {i for r in by["w"].values() if not r["deleted"] for i in r["nds"]}
-        ref_exist = set(self.existing("n", way_refs - set(by["n"]))) | node_kept
+        ref_exist = has("n", way_refs - set(by["n"])) | node_kept
         ways = {i: r for i, r in by["w"].items()
                 if i in ex["w"] or (not r["deleted"] and any(n in ref_exist for n in r["nds"]))}
         # nodes a newly kept way needs, that the diff touched but the filter dropped, come along too
@@ -250,8 +252,7 @@ class Updater:
         mem_n = {m["ref"] for r in by["r"].values() if not r["deleted"] for m in r["members"] if m["type"] == "n"}
         mem_w = {m["ref"] for r in by["r"].values() if not r["deleted"] for m in r["members"] if m["type"] == "w"}
         mem_r = {m["ref"] for r in by["r"].values() if not r["deleted"] for m in r["members"] if m["type"] == "r"}
-        present = {"n": set(self.existing("n", mem_n)) | node_kept, "w": set(self.existing("w", mem_w)) | way_kept,
-                   "r": set(self.existing("r", mem_r))}
+        present = {"n": has("n", mem_n) | node_kept, "w": has("w", mem_w) | way_kept, "r": has("r", mem_r)}
         # fixpoint: a new relation is kept if it has a kept member, including relations kept this round
         rels = {}
         while True:
@@ -610,12 +611,19 @@ class Updater:
             removed |= old.get(p, set()) - new.get(p, set())
         rows = [(c, p) for p, kids in new.items() for c in kids if c in removed or c not in old.get(p, set())]
         if removed:
+            # the predicate names only the leading sort columns: a filter on the parent column too
+            # made DuckDB read every row group of the touched files on the planet (2,100 requests and
+            # 30 s for four ids against 20 and 0.7 s), so the dropped children's rows under parents
+            # outside the batch are read first and put back after the delete
             groups = {None: removed} if type_col is None else {}
             for c in removed if type_col else ():
                 groups.setdefault(c[0], set()).add(c[1])
             for ty, kids in groups.items():
-                self.sql(f"DELETE FROM lake.{table} WHERE {f'{type_col} = {ty!r} AND ' if ty else ''}"
-                         f"{self.e._id_pred(child_col, kids)} AND {parent_col} IN ({self.ids_sql(old)})")
+                where = f"{f'{type_col} = {ty!r} AND ' if ty else ''}{self.e._id_pred(child_col, kids)}"
+                kept = self.sql(f"SELECT {child_col}, {parent_col} FROM lake.{table} WHERE {where} "
+                                f"AND {parent_col} NOT IN ({self.ids_sql(old)})").fetchall()
+                rows += [((ty, c) if ty else c, p) for c, p in kept]
+                self.sql(f"DELETE FROM lake.{table} WHERE {where}")
         if rows:
             cols = {child_col: pa.array([c if type_col is None else c[1] for c, _ in rows], pa.int64()),
                     parent_col: pa.array([p for _, p in rows], pa.int64())}

@@ -284,7 +284,8 @@ class Engine:
         tables = {"lake.nodes": ("nodes_tagged", "nodes_untagged"), "lake.nodes_tagged": ("nodes_tagged",),
                   "lake.ways": ("ways",)}[tbl]
         flt = " AND ".join(f"({p})" for p in push) if push else None
-        parts = [self.lance(name).to_table(columns=list(cols), filter=flt) for name in tables]
+        parts = [self.trace(f"lance {name}: {flt}", lambda n=name: self.lance(n).to_table(columns=list(cols), filter=flt))
+                 for name in tables]
         name = f"lt{next(self._ids)}"
         arrow = parts[0] if len(parts) == 1 else __import__("pyarrow").concat_tables(parts)
         self.con.register(f"{name}_arrow", arrow)
