@@ -102,6 +102,8 @@ AREA_WAY_OFFSET = 2400000000
 # Planner limits, each set by measurement:
 MAX_OR_RANGES = 32           # zone-map ranges per bbox predicate: more prune better but cost CPU per row (DuckDB evaluates OR chains per row)
 POINTS_MAX = 100000          # exact point sets (ids, keys) go into SQL as literal IN lists up to this size (about 15 us of parsing per value)
+LANCE_CHUNK = 200            # ids per Lance filter: a BTree probe per chunk, far cheaper than one filter of thousands
+LANCE_WORKERS = 8            # Lance chunks fetched concurrently (Lance releases the GIL)
 POSTINGS_MAX = 20000         # bbox+tag: drive from tag_postings only if at most this many candidates; beyond it the spatial scan alone is cheaper
 REL_MEMBER_PROBE_MAX = 5000  # bbox relations: test members directly up to this many; beyond it the elements inside the box are fewer
 
@@ -283,15 +285,31 @@ class Engine:
     def _lance_fetch(self, tbl, push, cols):
         tables = {"lake.nodes": ("nodes_tagged", "nodes_untagged"), "lake.nodes_tagged": ("nodes_tagged",),
                   "lake.ways": ("ways",)}[tbl]
-        flt = " AND ".join(f"({p})" for p in push) if push else None
-        parts = [self.trace(f"lance {name}: {flt}", lambda n=name: self.lance(n).to_table(columns=list(cols), filter=flt))
-                 for name in tables]
+        flts = [" AND ".join(f"({p})" for p in push)] if push else [None]
+        if len(push) == 1 and push[0].startswith(self.LANCE_ID):
+            ids = push[0][len(self.LANCE_ID):-1].split(",")
+            if len(ids) > LANCE_CHUNK:
+                flts = [f"id IN ({','.join(ids[i:i + LANCE_CHUNK])})" for i in range(0, len(ids), LANCE_CHUNK)]
+        label = f"{len(flts)} chunks of {LANCE_CHUNK} ids" if len(flts) > 1 else flts[0]
+        parts = [self.trace(f"lance {name}: {label}", lambda n=name: self._lance_take(n, cols, flts)) for name in tables]
         name = f"lt{next(self._ids)}"
         arrow = parts[0] if len(parts) == 1 else __import__("pyarrow").concat_tables(parts)
         self.con.register(f"{name}_arrow", arrow)
         self._sql(f"CREATE OR REPLACE TEMP TABLE {name} AS SELECT * FROM {name}_arrow")
         self.con.unregister(f"{name}_arrow")
         return name
+
+    def _lance_take(self, name, cols, flts):
+        """Rows of Lance table `name` matching any of the filters, fetched concurrently: a BTree probe
+        per chunk of LANCE_CHUNK ids costs a fraction of one filter listing thousands (2,000 planet
+        way ids: 13.7 s in one filter, 0.6 s in ten of 200)."""
+        import concurrent.futures
+        import pyarrow as pa
+        ds = self.lance(name)
+        if len(flts) == 1:
+            return ds.to_table(columns=list(cols), filter=flts[0])
+        with concurrent.futures.ThreadPoolExecutor(LANCE_WORKERS) as ex:
+            return pa.concat_tables(list(ex.map(lambda f: ds.to_table(columns=list(cols), filter=f), flts)))
 
     def _id_parts(self, t, ids):
         """(push, local) predicates selecting ids of type t."""
