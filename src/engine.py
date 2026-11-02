@@ -8,6 +8,7 @@ oracle for correctness is a reference Overpass (tools/compare_overpass.py), not 
 """
 import itertools
 import math
+import os
 from dataclasses import dataclass
 
 import duckdb
@@ -103,7 +104,7 @@ AREA_WAY_OFFSET = 2400000000
 MAX_OR_RANGES = 32           # zone-map ranges per bbox predicate: more prune better but cost CPU per row (DuckDB evaluates OR chains per row)
 POINTS_MAX = 100000          # exact point sets (ids, keys) go into SQL as literal IN lists up to this size (about 15 us of parsing per value)
 LANCE_CHUNK = 200            # ids per Lance filter: a BTree probe per chunk, far cheaper than one filter of thousands
-LANCE_WORKERS = 8            # Lance chunks fetched concurrently (Lance releases the GIL)
+LANCE_WORKERS = int(os.environ.get("SUNCHASER_LANCE_WORKERS", 8))  # Lance chunks fetched concurrently (Lance releases the GIL); like SUNCHASER_THREADS, the cost is R2 round trips, so more than the core count pays
 POSTINGS_MAX = 20000         # bbox+tag: drive from tag_postings only if at most this many candidates; beyond it the spatial scan alone is cheaper
 REL_MEMBER_PROBE_MAX = 5000  # bbox relations: test members directly up to this many; beyond it the elements inside the box are fewer
 
