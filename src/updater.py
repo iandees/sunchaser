@@ -159,11 +159,12 @@ class _Fetched:
 
 
 class Updater:
-    def __init__(self, con, region=None):
+    def __init__(self, con, region=None, only_missing=False):
         self.con = con
         con.sql(MACROS)
         self.e = Engine(con, "lake")
         self.region = region  # (s, w, n, e) or None for a planet lake
+        self.only_missing = only_missing  # replay: insert what an earlier pass dropped, touch nothing else
         # said every cycle: the planet updater inherited the Minnesota --region from its unit file and
         # silently dropped 40% of each batch (new elements outside the region) for two days
         print(f"regional filter: {region}" if region else "planet lake: every element kept", flush=True)
@@ -225,6 +226,15 @@ class Updater:
         memo.update((i, None) for i in ids if i not in found)
         return found
 
+    @staticmethod
+    def missing_only(by, ex):
+        """--only-missing: the newest versions of the elements the lake lacks and the diffs do not
+        delete. A replay of the window a mistaken regional filter dropped standalone new elements
+        from (the planet updater ran two days with the Minnesota --region): the elements the lake has
+        were applied correctly then and are left alone, so no history or change rows are written
+        for them; the missing ones go in as plain inserts (nothing to archive, delete or cascade)."""
+        return {t: {i: r for i, r in by[t].items() if i not in ex[t] and not r["deleted"]} for t in "nwr"}
+
     def in_region(self, lat, lon):
         if self.region is None:
             return True
@@ -238,6 +248,8 @@ class Updater:
         self._phase("parse")
         by = {t: {i: r for (tt, i), r in ch.items() if tt == t} for t in "nwr"}
         ex = {t: self.existing(t, by[t].keys()) for t in "nwr"}
+        if self.only_missing:
+            by = self.missing_only(by, ex)
 
         # 1. regional filter (the lake keeps what it already has, plus new elements in the region)
         nodes = {i: r for i, r in by["n"].items()
@@ -858,7 +870,7 @@ def _cycle(local, args, deadline):
     lakeconn.attach(con, catalog=local, data_path="")  # the catalog knows its data path
     try:
         region = tuple(map(float, args.region.split(","))) if args.region else None
-        up = Updater(con, region)
+        up = Updater(con, region, only_missing=args.only_missing)
         n = follow(up, until=args.until, deadline=deadline)
         if n:
             build_areas.build(con)
@@ -939,6 +951,8 @@ def main():
     ap.add_argument("--workdir", help="job: local scratch for the catalog (default: system temp; with --loop, .)")
     ap.add_argument("--region", help="s,w,n,e: keep a regional extract consistent (omit for a planet lake)")
     ap.add_argument("--until", help="stop before the first diff ending after this timestamp (fixed test windows)")
+    ap.add_argument("--only-missing", action="store_true",
+                    help="replay: insert only the elements the lake lacks (after a pass that dropped some), touch nothing else")
     ap.add_argument("--max-seconds", type=float, default=240, help="job: stop applying diffs after this long")
     ap.add_argument("--loop", action="store_true",
                     help="job: keep running with the catalog on local disk (always-on host; --workdir keeps it)")
@@ -956,7 +970,7 @@ def main():
     con = duckdb.connect()
     lakeconn.attach(con)
     region = tuple(map(float, args.region.split(","))) if args.region else None
-    up = Updater(con, region)
+    up = Updater(con, region, only_missing=args.only_missing)
     print(up.apply([pathlib.Path(f).read_bytes() for f in args.files]))
 
 
