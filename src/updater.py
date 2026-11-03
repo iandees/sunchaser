@@ -168,7 +168,7 @@ class Updater:
             self.e.trace = self._timed
         if not lakeconn.has_tombstones(con):  # a lake built before the insert-only indexes
             con.sql(lakeconn.TOMBSTONE_DDL)
-            con.sql(f"INSERT INTO lake.state VALUES ('tombstones_applied_at', '{time.time():.0f}')")
+            con.sql(f"INSERT INTO lake.state VALUES ('tombstones_applied_at', '{int(time.time())}')")
             self.e.tombstoned = True
         self._refresh_lance()
 
@@ -706,7 +706,7 @@ def apply_tombstones(con):
             con.sql(f"DELETE FROM lake.{table} USING lake.{table}_gone g WHERE {on}")
             con.sql(f"DELETE FROM lake.{table}_gone")
     con.sql("DELETE FROM lake.state WHERE key = 'tombstones_applied_at'")
-    con.sql(f"INSERT INTO lake.state VALUES ('tombstones_applied_at', '{time.time():.0f}')")
+    con.sql(f"INSERT INTO lake.state VALUES ('tombstones_applied_at', '{int(time.time())}')")
     con.sql("COMMIT")
     print(f"tombstones applied: {pending}", flush=True)
     return True
@@ -771,7 +771,7 @@ def compact_due(con, args, state):
     if not COMPACTION:
         COMPACTION = None
         con.sql("DELETE FROM lake.state WHERE key = 'compacted_at'")
-        con.sql(f"INSERT INTO lake.state VALUES ('compacted_at', '{time.time():.0f}')")
+        con.sql(f"INSERT INTO lake.state VALUES ('compacted_at', '{int(time.time())}')")
     return True
 
 

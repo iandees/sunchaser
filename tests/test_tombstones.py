@@ -80,7 +80,7 @@ def test_apply_tombstones_deletes_in_one_pass(lake, monkeypatch):
     updater.Updater._rewrite_pairs(up, "node_parent_ways", "node_id", "way_id", {10: {1, 2, 3}, 20: {2}}, {10: {1}, 20: set()})
     assert gone(con) == [(2, 10), (2, 20), (3, 10)]
     monkeypatch.setattr(updater, "TOMBSTONE_DAYS", 7)
-    con.sql(f"INSERT INTO lake.state VALUES ('tombstones_applied_at', '{time.time():.0f}')")
+    con.sql(f"INSERT INTO lake.state VALUES ('tombstones_applied_at', '{int(time.time())}')")
     assert updater.apply_tombstones(con) is False  # not due
     monkeypatch.setattr(updater, "TOMBSTONE_DAYS", 0)
     assert updater.apply_tombstones(con) is True
