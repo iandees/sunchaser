@@ -164,6 +164,9 @@ class Updater:
         con.sql(MACROS)
         self.e = Engine(con, "lake")
         self.region = region  # (s, w, n, e) or None for a planet lake
+        # said every cycle: the planet updater inherited the Minnesota --region from its unit file and
+        # silently dropped 40% of each batch (new elements outside the region) for two days
+        print(f"regional filter: {region}" if region else "planet lake: every element kept", flush=True)
         if LOG_SQL:
             self.e.trace = self._timed
         if not lakeconn.has_tombstones(con):  # a lake built before the insert-only indexes
