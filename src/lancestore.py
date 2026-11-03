@@ -240,7 +240,12 @@ def maintain(con, grace=3600, tables=None):
     for name in tables or TABLES:
         t = time.time()
         ds = lance.dataset(f"{base}/{name}.lance", storage_options=storage_options())
-        ds.optimize.compact_files(target_rows_per_fragment=1 << 20, max_rows_per_group=ROWS_PER_GROUP)
+        # defer_index_remap: compacting a fragment an index covers otherwise rewrites that whole index
+        # (the planet's untagged-node base, 108 GB, when the run of small fragments after a batch
+        # pulled in the base's last fragment: R2's 10,000-part limit failed the upload); deferred,
+        # the index keeps serving the moved rows through Lance's fragment-reuse map and the next
+        # optimize_indices covers the new fragments
+        ds.optimize.compact_files(target_rows_per_fragment=1 << 20, max_rows_per_group=ROWS_PER_GROUP, defer_index_remap=True)
         ds = lance.dataset(ds.uri, storage_options=storage_options())
         # the appended rows join the newest index delta, unless that is a merged base segment (108 GB
         # for untagged nodes, which an hourly merge would rewrite): then a new delta starts. Lookups
