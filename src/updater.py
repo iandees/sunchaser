@@ -846,8 +846,11 @@ def _cycle(local, args, deadline):
     Returns (diffs applied, catalog changed, state)."""
     import build_areas
     con = duckdb.connect()
-    for setting, var in (("memory_limit", "MEMORY_LIMIT"), ("threads", "THREADS")):
-        if lakeconn.env(var):  # SUNCHASER_MEMORY_LIMIT (e.g. 6GB on a small host), SUNCHASER_THREADS
+    # SUNCHASER_MEMORY_LIMIT, _THREADS, _TEMP_DIRECTORY: DuckDB's default limit is 80% of RAM, and a
+    # day-sized planet batch (full scans of the big tables on 128 threads) filled it on top of the
+    # Lance pool and the parsed diffs: the kernel killed the updater at 130 GB on a 125 GB host
+    for setting, var in (("memory_limit", "MEMORY_LIMIT"), ("threads", "THREADS"), ("temp_directory", "TEMP_DIRECTORY")):
+        if lakeconn.env(var):
             con.sql(f"SET {setting} = '{lakeconn.env(var)}'")
     lakeconn.attach(con, catalog=local, data_path="")  # the catalog knows its data path
     try:
