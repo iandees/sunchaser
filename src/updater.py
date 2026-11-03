@@ -776,9 +776,12 @@ def compact_due(con, args, state):
 
 
 def follow(up, kinds=("hour", "minute"), until=None, deadline=None):
-    """Catch up with coarse diffs (hourly by default: a planet day diff is ~100 MB, too much to hold
-    in one batch), then minute diffs, and return the number of diffs applied. `deadline` (epoch
-    seconds) ends a scheduled job's run between diffs."""
+    """Catch up with coarse diffs (hourly by default, when the lake sits on an hour boundary), then
+    minute diffs MINUTE_BATCH to a transaction, and return the number of diffs applied. A batch costs
+    about the same whatever its span (one delete file per touched data file, the metadata scans, one
+    Lance version: a planet batch is ~900 s plus 5 ms a change), so catching up runs day-sized
+    batches of minute diffs; a day of planet changes is ~100 MB of XML and a few GB parsed. `deadline`
+    (epoch seconds) ends a scheduled job's run between batches."""
     applied = 0
     base = up.sql("SELECT value FROM lake.state WHERE key = 'osm_base'").fetchall()[0][0]
     for kind in kinds:
