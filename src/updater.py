@@ -870,6 +870,12 @@ def _cycle(local, args, deadline):
     lakeconn.attach(con, catalog=local, data_path="")  # the catalog knows its data path
     try:
         region = tuple(map(float, args.region.split(","))) if args.region else None
+        import lancestore
+        # the previous batch's appended rows are indexed before this batch looks ids up, whatever the
+        # compaction rotation's turn: lookups scan unindexed rows (see lancestore.stale)
+        stale = lancestore.stale(con)
+        if stale:
+            lancestore.maintain(con, FILE_GRACE, stale)
         up = Updater(con, region, only_missing=args.only_missing)
         n = follow(up, until=args.until, deadline=deadline)
         if n:
@@ -877,7 +883,7 @@ def _cycle(local, args, deadline):
         state = dict(con.sql("SELECT key, value FROM lake.state").fetchall())
         compacted = compact_due(con, args, state)
         con.sql("DETACH lake")  # the file is complete and closed before it is uploaded
-        return n, bool(n) or compacted, state
+        return n, bool(n) or compacted or bool(stale), state
     finally:
         con.close()
 

@@ -43,6 +43,7 @@ TABLES = {  # lance table -> (lake table, element type, sort key)
 }
 ROWS_PER_GROUP = 16384
 DELTA_MAX_ROWS = 50_000_000  # an index delta bigger than this is a base segment: new rows start another delta
+UNINDEXED_MAX = int(lakeconn.env("LANCE_UNINDEXED_MAX", 1_000_000))  # appended rows a lookup may scan
 ROWS_PER_FILE = 1 << 23  # 8 M rows per fragment at build (Lance's default 1 M: 10,000 uploads and a
 #                          manifest of 10,000 entries for the planet's untagged nodes)
 SEGMENT_ROWS = 1 << 28  # rows per id-index segment: 268 M sort in memory (300 M took 115 s, no spill)
@@ -73,6 +74,22 @@ def state_versions(con):
                         "OR key LIKE 'lance_version:%'").fetchall())
     base = rows.pop("lance_base", None)
     return base, {k.split(":", 1)[1]: int(v) for k, v in rows.items()}
+
+
+def unindexed(ds):
+    """Rows appended since the id index last covered the dataset: every lookup scans them all."""
+    return ds.stats.index_stats("id_idx")["num_unindexed_rows"]
+
+
+def stale(con, limit=None):
+    """The tables with more than `limit` (UNINDEXED_MAX) rows outside their id index. A day-sized
+    planet batch appends 3 M untagged nodes, and with maintenance waiting its turn in the compaction
+    rotation (once in nine cycles) seven batches piled up 16 M unindexed rows: each 200-id lookup
+    chunk scanned them all, and a batch took 17 hours instead of 7."""
+    base, _ = state_versions(con)
+    limit = UNINDEXED_MAX if limit is None else limit
+    return [name for name in (TABLES if base else ())
+            if unindexed(lance.dataset(f"{base}/{name}.lance", storage_options=storage_options())) > limit]
 
 
 def _set_state(con, base, versions):

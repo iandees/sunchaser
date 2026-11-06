@@ -136,7 +136,7 @@ Lance fits these roles:
 
 Caveats:
 - The DuckDB `lance` extension is a core extension. Pushdown of scalar filters and `take` was still described as work in progress in the [DuckDB May 2026 post](https://duckdb.org/2026/05/21/test-driving-lance). Plan to call Lance's own Rust or Python API for id lookups and pass results into DuckDB as Arrow, rather than relying on SQL pushdown.
-- Lance indexes go stale on append, so you need `optimize_indices` and compaction jobs. That's fine on an hourly cadence and awkward on a minutely one.
+- Lance indexes go stale on append, so you need `optimize_indices` and compaction jobs. That's fine on an hourly cadence and awkward on a minutely one. Every lookup scans the rows outside the index, so the updater checks `num_unindexed_rows` at the start of each cycle and maintains any table over `LANCE_UNINDEXED_MAX` (1 M) before the batch's lookups, instead of waiting for the maintenance steps' turn in the compaction rotation (seven day-sized batches piled up 16 M unindexed untagged nodes, and batches went from 7 to 17 hours).
 
 **Recommendation**: start with **Parquet / DuckLake everywhere**. Benchmark id lookups and global tag lookups. Bring in Lance for those two access paths **only if** the id-sorted Parquet tables (§4) don't meet the latency target. Keep the canonical history in DuckLake either way.
 
